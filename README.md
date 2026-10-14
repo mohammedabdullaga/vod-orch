@@ -1,6 +1,6 @@
 # Media Ingestion Engine
 
-A headless FastAPI service polls configured provider categories, stores discovered work in SQLite, and dispatches one download at a time per enabled provider account to a remote storage server over SSH. Downloads go to a remote staging directory, are checked with `ffprobe`, then moved into the watch folder. A React dashboard manages accounts, categories, proxies, the SSH node, and the queue.
+A headless FastAPI service polls configured provider categories, stores discovered work in SQLite, and dispatches one download at a time per enabled provider account to a remote storage server over SSH. Downloads go to a remote staging directory, are checked with `ffprobe`, then moved into the watch folder. A React dashboard manages accounts, categories, proxies, the SSH node, and the queue. The dashboard/API require the configured admin login.
 
 Use this software only with media you own or are authorized to access, and with provider-approved APIs and download methods. Provider API paths and stream URL formats vary; the built-in adapter assumes an Xtream-style `player_api.php` API and may need adapting for your provider.
 
@@ -39,8 +39,38 @@ setup.sh                    Install axel, aria2 and ffmpeg on the storage server
 | `22/tcp` (outbound from daemon) | SSH from the orchestration VPS to the storage server; set another port in the SSH settings if needed |
 | `443/tcp` (outbound) | HTTPS to the provider and, when testing a proxy, to the IP-check service |
 | Remote staging and watch paths | Both must be on the same filesystem for the final rename to be atomic |
+| Session cookie | `HttpOnly`, `SameSite=Strict`, `SESSION_TTL_SECONDS`; set `SESSION_COOKIE_SECURE=true` when served over HTTPS |
 
-Do not expose port 8000 directly to the public internet. The API currently has **no user authentication**. Keep it bound to localhost and place an authenticated reverse proxy/VPN in front of any remote dashboard access. If serving the frontend and `/api` from the same origin, the browser does not need CORS.
+Port 8000 is bound to localhost by the supplied systemd unit. API endpoints (except health and login/session bootstrap) require an authenticated admin session. Keep the API bound to localhost and place TLS and, preferably, an additional authenticated reverse proxy/VPN in front of remote dashboard access. If serving the frontend and `/api` from the same origin, the browser does not need CORS.
+
+## Admin login and sessions
+
+Set `ADMIN_USERNAME`, `ADMIN_PASSWORD` (at least 12 characters), and a random `SESSION_SECRET_KEY` of at least 32 characters in `backend/.env`. The admin username/password are server-side environment credentials; no default password is shipped. Login uses a signed, time-limited, HTTP-only, SameSite=Strict cookie. Mutating API requests also require a CSRF header. Login attempts are rate limited per client address.
+
+Generate a session signing key:
+
+```bash
+/opt/media-ingestion/venv/bin/python -c \
+  'import secrets; print(secrets.token_urlsafe(48))'
+```
+
+Use a unique administrator password and protect `.env` with mode `0600`. In production behind HTTPS set `SESSION_COOKIE_SECURE=true`; it is `false` in the example only for local HTTP development. `SESSION_TTL_SECONDS` defaults to `28800` (8 hours). Changing the session signing key invalidates current sessions. The same-origin reverse proxy pattern below keeps cookies and API calls on one origin.
+
+## Storage paths and content organization
+
+In **Settings & Accounts → Remote storage node**, set the remote **staging directory** and **default storage root** (absolute Linux paths, such as `/srv/media/staging` and `/srv/media/library`). Use **Test connection & save** to create/verify those directories and check write access. Staging and each final destination must be on the same filesystem for atomic promotion.
+
+Each watched category can inherit the default root (leave its override blank) or set a category-specific absolute remote path in **Category Watcher**. Category and default roots are read when each queued job starts, so changing them routes pending/retried jobs to the new path; already-running and completed jobs are not moved automatically. Category paths must be absolute Linux paths, cannot be `/` or contain `..`, and are created remotely as needed.
+
+The dispatcher does not match items by title alone. It sanitizes names and uses the provider's stable IDs and metadata to create paths like:
+
+```text
+<destination root>/
+  Series/<series name> [<series id>-<source digest>]/Season 01/<series - S01E01 [episode id].mkv>
+  Movies/<movie name> [<stream id>-<source digest>]/<movie name>.mkv
+```
+
+Series and movies are separated, and same-named shows/movies with different provider IDs get separate directories. Queue deduplication keys include provider base URL, content type, and stream ID so a movie ID cannot suppress a series episode with the same ID. A no-clobber atomic move prevents an existing final file from being silently overwritten. The app does not infer identity from a title or merge folders with similar names.
 
 ## VPS setup
 
@@ -113,6 +143,10 @@ Configure at minimum:
 
 ```dotenv
 APP_ENCRYPTION_KEY=<generated-fernet-key>
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=<unique-password-of-at-least-12-characters>
+SESSION_SECRET_KEY=<random-session-signing-key>
+SESSION_COOKIE_SECURE=true
 DATABASE_URL=sqlite:///./ingestion.db
 CORS_ORIGINS=https://dashboard.example.com
 SSH_KNOWN_HOSTS=/var/lib/media-ingestion/ssh/known_hosts
@@ -125,7 +159,7 @@ sudo chown media-ingestion:media-ingestion /opt/media-ingestion/backend/.env
 sudo chmod 0600 /opt/media-ingestion/backend/.env
 ```
 
-Other supported settings are `POLL_INTERVAL_SECONDS` (default `300`), `WORKER_POLL_SECONDS` (default `2`), `MAX_RETRIES` (default `5`), `REQUEST_TIMEOUT_SECONDS` (default `30`), and `REMOTE_JOB_TIMEOUT_SECONDS` (default `86400`).
+Other supported settings are `SESSION_TTL_SECONDS` (default `28800`), `POLL_INTERVAL_SECONDS` (default `300`), `WORKER_POLL_SECONDS` (default `2`), `MAX_RETRIES` (default `5`), `REQUEST_TIMEOUT_SECONDS` (default `30`), and `REMOTE_JOB_TIMEOUT_SECONDS` (default `86400`).
 
 ### 5. Install and start systemd service
 
@@ -184,11 +218,11 @@ If the dashboard and API are served from different browser origins, set `CORS_OR
 
 ## First-time application configuration
 
-1. Open the dashboard through the trusted local/VPN/authenticated reverse-proxy endpoint.
+1. Open the dashboard through the trusted local/VPN/authenticated reverse-proxy endpoint and sign in using `ADMIN_USERNAME` and `ADMIN_PASSWORD`.
 2. Add an authorized provider account. The password is encrypted at rest.
-3. In **Remote storage node**, enter the storage server host, SSH port, username, private-key path on the VPS, and staging/watch paths. Use **Test connection & save**.
+3. In **Remote storage node**, enter the storage server host, SSH port, username, private-key path on the VPS, staging directory, and default storage root. Use **Test connection & save**.
 4. Add optional HTTP(S) or SOCKS5 proxies. Proxy URLs are encrypted at rest.
-5. In **Category Watcher**, enable only categories you are authorized to ingest.
+5. In **Category Watcher**, enable only categories you are authorized to ingest and optionally set a distinct remote destination path for each.
 6. Monitor **Overview & Queue** for download, verification, completion, and retry status.
 
 ## API routes
@@ -196,9 +230,12 @@ If the dashboard and API are served from different browser origins, set `CORS_OR
 | Method | Route | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Liveness check |
+| `POST` | `/api/auth/login` | Start an admin session |
+| `GET` | `/api/auth/session` | Check current session / CSRF token |
+| `POST` | `/api/auth/logout` | End the admin session |
 | `GET` | `/api/status` | Worker, SSH, and queue counters |
 | `GET` | `/api/categories` | Provider categories and monitoring state |
-| `POST` | `/api/categories/toggle` | Enable or disable a monitored category |
+| `POST` | `/api/categories/toggle` | Enable/disable monitoring and set an optional destination override |
 | `GET` | `/api/queue` | List queue items |
 | `POST` | `/api/queue/retry` | Retry a failed item |
 | `GET` / `POST` / `DELETE` | `/api/accounts` | Provider account management |

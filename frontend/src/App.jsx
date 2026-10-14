@@ -1,11 +1,26 @@
 import { useCallback, useEffect, useState } from "react";
 import axios from "axios";
 import {
-  Activity, Check, CircleAlert, Clapperboard, Film, Gauge,
+  Activity, Check, CircleAlert, Clapperboard, Film, Gauge, LogOut, LockKeyhole,
   Play, Plus, Radio, RefreshCw, Server, Settings2, Trash2, Tv, Wifi,
 } from "lucide-react";
 
-const api = axios.create({ baseURL: "/api" });
+const api = axios.create({ baseURL: "/api", withCredentials: true });
+let csrfToken = null;
+api.interceptors.request.use((config) => {
+  if (csrfToken) config.headers["X-CSRF-Token"] = csrfToken;
+  return config;
+});
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401 && !["/auth/login", "/auth/session"].includes(error.config?.url)) {
+      csrfToken = null;
+      window.dispatchEvent(new Event("admin-session-expired"));
+    }
+    return Promise.reject(error);
+  },
+);
 const tabs = ["Overview & Queue", "Category Watcher", "Settings & Accounts"];
 
 function Pill({ children, tone = "slate" }) {
@@ -18,6 +33,8 @@ function Pill({ children, tone = "slate" }) {
 }
 
 function App() {
+  const [authenticated, setAuthenticated] = useState(null);
+  const [adminUsername, setAdminUsername] = useState("");
   const [tab, setTab] = useState(tabs[0]);
   const [status, setStatus] = useState(null);
   const [queue, setQueue] = useState([]);
@@ -30,6 +47,22 @@ function App() {
   const [accountForm, setAccountForm] = useState({ provider_url: "", username: "", password: "", user_agent: "Mozilla/5.0" });
   const [proxyUrl, setProxyUrl] = useState("");
 
+  useEffect(() => {
+    api.get("/auth/session")
+      .then(({ data }) => {
+        csrfToken = data.csrf_token || null;
+        setAdminUsername(data.username || "");
+        setAuthenticated(data.authenticated);
+      })
+      .catch(() => setAuthenticated(false));
+    const onExpired = () => {
+      setAuthenticated(false);
+      setAdminUsername("");
+    };
+    window.addEventListener("admin-session-expired", onExpired);
+    return () => window.removeEventListener("admin-session-expired", onExpired);
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       const [s, q] = await Promise.all([api.get("/status"), api.get("/queue")]);
@@ -37,10 +70,11 @@ function App() {
     } catch (error) { setNotice(error.response?.data?.detail || "Could not reach the backend API."); }
   }, []);
   useEffect(() => {
+    if (!authenticated) return undefined;
     refresh();
     const timer = setInterval(refresh, 3000);
     return () => clearInterval(timer);
-  }, [refresh]);
+  }, [authenticated, refresh]);
 
   const loadSettings = async () => {
     try {
@@ -49,13 +83,20 @@ function App() {
     } catch (error) { setNotice(error.response?.data?.detail || "Unable to load settings."); }
   };
   const loadCategories = async () => {
-    try { setCategories((await api.get("/categories")).data); }
+    try {
+      const [categoryResponse, nodeResponse] = await Promise.all([
+        api.get("/categories"), api.get("/settings/ssh"),
+      ]);
+      setCategories(categoryResponse.data);
+      if (nodeResponse.data) setSsh(nodeResponse.data);
+    }
     catch (error) { setNotice(error.response?.data?.detail || "Unable to load categories."); }
   };
   useEffect(() => {
+    if (!authenticated) return;
     if (tab === tabs[1]) loadCategories();
     if (tab === tabs[2]) loadSettings();
-  }, [tab]);
+  }, [authenticated, tab]);
 
   const act = async (operation, success) => {
     setBusy(true); setNotice("");
@@ -71,10 +112,34 @@ function App() {
   const toggleCategory = async (category) => {
     const next = !category.monitored;
     await act(async () => {
-      await api.post("/categories/toggle", { category_id: category.category_id, name: category.name, kind: category.kind, monitored: next });
-      setCategories((items) => items.map((item) => item.category_id === category.category_id ? { ...item, monitored: next } : item));
+      await api.post("/categories/toggle", {
+        category_id: category.category_id, name: category.name, kind: category.kind,
+        monitored: next, destination_path: category.destination_path || null,
+      });
+      setCategories((items) => items.map((item) =>
+        item.category_id === category.category_id && item.kind === category.kind
+          ? { ...item, monitored: next }
+          : item
+      ));
     }, next ? "Category monitoring enabled." : "Category monitoring disabled.");
   };
+  const saveCategoryPath = (category) => act(
+    async () => {
+      const response = await api.post("/categories/toggle", {
+        category_id: category.category_id,
+        name: category.name,
+        kind: category.kind,
+        monitored: category.monitored,
+        destination_path: category.destination_path?.trim() || null,
+      });
+      setCategories((items) => items.map((item) =>
+        item.category_id === category.category_id && item.kind === category.kind
+          ? { ...item, destination_path: response.data.destination_path }
+          : item
+      ));
+    },
+    "Category destination saved. Pending watched content will use the updated path.",
+  );
   const retry = (id) => act(() => api.post("/queue/retry", { item_id: id }), "Task queued for retry.");
   const addAccount = (event) => {
     event.preventDefault();
@@ -97,6 +162,37 @@ function App() {
     async () => (await api.post(`/proxies/${id}/test`)).data,
     (result) => `Proxy reachable: ${result.ip || "IP unavailable"} · ${result.latency_ms} ms`,
   );
+  const signIn = async (username, password) => {
+    setBusy(true);
+    setNotice("");
+    try {
+      const { data } = await api.post("/auth/login", { username, password });
+      csrfToken = data.csrf_token;
+      setAdminUsername(data.username);
+      setAuthenticated(true);
+      setNotice("Signed in.");
+    } catch (error) {
+      setNotice(error.response?.data?.detail || "Sign in failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const signOut = async () => {
+    try { await api.post("/auth/logout"); }
+    catch (error) { setNotice(error.response?.data?.detail || "Could not confirm sign out; the local session was cleared."); }
+    finally {
+      csrfToken = null;
+      setAdminUsername("");
+      setAuthenticated(false);
+    }
+  };
+
+  if (authenticated === null) {
+    return <div className="grid min-h-screen place-items-center bg-[#090d16] text-slate-400">Checking admin session…</div>;
+  }
+  if (!authenticated) {
+    return <LoginScreen busy={busy} notice={notice} onLogin={signIn} />;
+  }
 
   const counts = status?.queue || {};
   const statCards = [
@@ -118,6 +214,7 @@ function App() {
             <Pill tone={status?.daemon_running ? "green" : "red"}><span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-current" />Daemon {status?.daemon_running ? "Running" : "Offline"}</Pill>
             <Pill tone={status?.ssh_connected ? "green" : "yellow"}><Wifi size={13} className="mr-1.5" />SSH {status?.ssh_connected ? "Connected" : "Not verified"}</Pill>
             <Pill><Activity size={13} className="mr-1.5" />{status?.active_workers || 0} workers</Pill>
+            <button onClick={signOut} className="ml-1 flex items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800"><LogOut size={14} />{adminUsername || "Sign out"}</button>
           </div>
         </div>
       </header>
@@ -148,10 +245,23 @@ function App() {
         </>}
 
         {tab === tabs[1] && <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
-          <div className="border-b border-slate-800 px-5 py-4"><h2 className="font-semibold text-white">Category watcher</h2><p className="mt-1 text-xs text-slate-500">Only monitored categories are polled for new content.</p></div>
-          <div className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-3">{categories.map((category) => <div key={`${category.kind}-${category.category_id}`} className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-900/40 p-4">
-            <div className="flex min-w-0 items-center gap-3"><div className="rounded-lg bg-slate-800 p-2 text-indigo-300">{category.kind === "series" ? <Tv size={17} /> : <Film size={17} />}</div><div className="min-w-0"><div className="truncate text-sm font-medium text-slate-200">{category.name}</div><div className="mt-1 text-xs uppercase text-slate-500">{category.kind}</div></div></div>
-            <button role="switch" aria-checked={category.monitored} aria-label={`Watch ${category.name}`} disabled={busy} onClick={() => toggleCategory(category)} className={`relative h-6 w-11 shrink-0 rounded-full transition ${category.monitored ? "bg-indigo-500" : "bg-slate-700"}`}><span className={`absolute top-1 h-4 w-4 rounded-full bg-white transition ${category.monitored ? "left-6" : "left-1"}`} /></button>
+          <div className="border-b border-slate-800 px-5 py-4"><h2 className="font-semibold text-white">Category watcher</h2><p className="mt-1 text-xs text-slate-500">Watched items inherit the storage root unless this category has its own remote path. Provider IDs keep same-named shows and movies separate.</p>
+            <p className="mt-2 text-xs text-slate-400">Storage root: <code className="text-indigo-300">{ssh.watch_path || "Configure in Settings & Accounts"}</code></p>
+          </div>
+          <div className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-3">{categories.map((category) => <div key={`${category.kind}-${category.category_id}`} className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-3"><div className="rounded-lg bg-slate-800 p-2 text-indigo-300">{category.kind === "series" ? <Tv size={17} /> : <Film size={17} />}</div><div className="min-w-0"><div className="truncate text-sm font-medium text-slate-200">{category.name}</div><div className="mt-1 text-xs uppercase text-slate-500">{category.kind} · ID {category.category_id}</div></div></div>
+              <button role="switch" aria-checked={category.monitored} aria-label={`Watch ${category.name}`} disabled={busy} onClick={() => toggleCategory(category)} className={`relative h-6 w-11 shrink-0 rounded-full transition ${category.monitored ? "bg-indigo-500" : "bg-slate-700"}`}><span className={`absolute top-1 h-4 w-4 rounded-full bg-white transition ${category.monitored ? "left-6" : "left-1"}`} /></button>
+            </div>
+            <form className="mt-4 space-y-2" onSubmit={(event) => { event.preventDefault(); saveCategoryPath(category); }}>
+              <label className="block text-xs text-slate-400">Category destination override</label>
+              <input value={category.destination_path || ""} onChange={(event) => setCategories((items) => items.map((item) =>
+                item.category_id === category.category_id && item.kind === category.kind
+                  ? { ...item, destination_path: event.target.value }
+                  : item
+              ))} placeholder={ssh.watch_path ? `${ssh.watch_path} (inherit default)` : "/storage/library"} className="field" />
+              <button disabled={busy} className="secondary w-full">Save path · blank uses root</button>
+            </form>
           </div>)}{!categories.length && <div className="col-span-full py-12 text-center text-sm text-slate-500">Add an enabled provider account to load categories.</div>}</div>
         </section>}
 
@@ -178,7 +288,7 @@ function App() {
             <form onSubmit={(event) => saveSsh(event)} className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-3">
               {[
                 ["host", "SSH host"], ["port", "Port"], ["username", "SSH username"],
-                ["private_key_path", "Private key path on daemon"], ["staging_path", "Remote staging directory"], ["watch_path", "Final watch directory"],
+                ["private_key_path", "Private key path on daemon"], ["staging_path", "Remote staging directory"], ["watch_path", "Default storage root on remote server"],
               ].map(([key, placeholder]) => <input key={key} required placeholder={placeholder} type={key === "port" ? "number" : "text"} value={ssh[key] ?? ""} onChange={(e) => setSsh({ ...ssh, [key]: e.target.value })} className="field" />)}
               <div className="flex flex-wrap gap-2 sm:col-span-2 lg:col-span-3"><button disabled={busy} className="primary"><Settings2 size={15} />Save node</button><button type="button" disabled={busy} onClick={(event) => saveSsh(event, true)} className="secondary"><Wifi size={15} />Test connection &amp; save</button></div>
             </form>
@@ -187,6 +297,37 @@ function App() {
       </main>
       <style>{`.field{width:100%;border:1px solid #263244;background:#090d16;color:#e2e8f0;border-radius:.6rem;padding:.65rem .8rem;font-size:.8rem;outline:none}.field:focus{border-color:#818cf8}.primary,.secondary{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;border-radius:.6rem;padding:.65rem 1rem;font-size:.8rem;font-weight:600}.primary{background:#4f46e5;color:white}.primary:hover{background:#6366f1}.secondary{border:1px solid #334155;color:#cbd5e1}.secondary:hover{background:#1e293b}`}</style>
     </div>
+  );
+}
+
+function LoginScreen({ busy, notice, onLogin }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const submit = (event) => {
+    event.preventDefault();
+    onLogin(username, password);
+  };
+  return (
+    <main className="grid min-h-screen place-items-center bg-[#090d16] px-5">
+      <section className="w-full max-w-md rounded-2xl border border-slate-800 bg-[#0d1320] p-8 shadow-2xl shadow-black/20">
+        <div className="mb-7 flex items-center gap-3">
+          <div className="rounded-xl bg-indigo-500/15 p-3 text-indigo-300"><LockKeyhole size={21} /></div>
+          <div><h1 className="text-lg font-semibold text-white">Admin sign in</h1><p className="mt-1 text-xs text-slate-500">Media Ingestion control panel</p></div>
+        </div>
+        {notice && <div role="alert" className="mb-4 rounded-lg border border-rose-900/60 bg-rose-950/30 px-3 py-2 text-sm text-rose-200">{notice}</div>}
+        <form onSubmit={submit} className="space-y-4">
+          <label className="block text-sm text-slate-300">Username
+            <input autoComplete="username" required value={username} onChange={(event) => setUsername(event.target.value)} className="field mt-2" />
+          </label>
+          <label className="block text-sm text-slate-300">Password
+            <input type="password" autoComplete="current-password" required value={password} onChange={(event) => setPassword(event.target.value)} className="field mt-2" />
+          </label>
+          <button disabled={busy} className="primary w-full">{busy ? "Signing in…" : "Sign in"}</button>
+        </form>
+        <p className="mt-5 text-xs leading-relaxed text-slate-500">Admin credentials are configured on the server. Sessions use an HTTP-only, signed cookie.</p>
+        <style>{`.field{width:100%;border:1px solid #263244;background:#090d16;color:#e2e8f0;border-radius:.6rem;padding:.65rem .8rem;font-size:.8rem;outline:none}.field:focus{border-color:#818cf8}.primary,.secondary{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;border-radius:.6rem;padding:.65rem 1rem;font-size:.8rem;font-weight:600}.primary{background:#4f46e5;color:white}.primary:hover{background:#6366f1}`}</style>
+      </section>
+    </main>
   );
 }
 

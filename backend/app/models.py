@@ -1,6 +1,18 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    event,
+    inspect,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from app.config import settings
@@ -62,6 +74,7 @@ class MonitoredCategory(Base):
     name: Mapped[str] = mapped_column(String(512))
     kind: Mapped[str] = mapped_column(String(16))
     monitored: Mapped[bool] = mapped_column(Boolean, default=False)
+    destination_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 
@@ -70,8 +83,12 @@ class QueueItem(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     stream_id: Mapped[str] = mapped_column(String(512), unique=True, index=True)
+    provider_stream_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     title: Mapped[str] = mapped_column(String(1024))
     kind: Mapped[str] = mapped_column(String(16))
+    category_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    category_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    series_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     stream_url_encrypted: Mapped[str] = mapped_column(Text)
     file_name: Mapped[str] = mapped_column(String(1024))
     series_title: Mapped[str | None] = mapped_column(String(1024), nullable=True)
@@ -108,3 +125,23 @@ class Node(Base):
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    with engine.begin() as connection:
+        migrations = {
+            "monitored_categories": {
+                "destination_path": "TEXT",
+            },
+            "queue": {
+                "provider_stream_id": "VARCHAR(512)",
+                "category_id": "VARCHAR(255)",
+                "category_name": "VARCHAR(512)",
+                "series_id": "VARCHAR(512)",
+            },
+        }
+        inspector = inspect(connection)
+        for table_name, columns in migrations.items():
+            existing = {column["name"] for column in inspector.get_columns(table_name)}
+            for column_name, column_type in columns.items():
+                if column_name not in existing:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+                    )

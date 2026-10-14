@@ -2,16 +2,29 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
+from starlette.responses import JSONResponse
 
 from app.config import settings
+from app.auth import (
+    COOKIE_NAME,
+    authenticate,
+    check_login_limit,
+    clear_login_failures,
+    create_session,
+    read_session,
+    record_login_failure,
+    safe_csrf_match,
+    validate_auth_settings,
+)
 from app.models import Account, MonitoredCategory, Node, Proxy, QueueItem, SessionLocal, init_db, utc_now
 from app.provider import provider_action
 from app.security import decrypt_secret, encrypt_secret, mask_secret
@@ -33,6 +46,7 @@ worker_pool = WorkerPool(dispatcher)
 async def lifespan(_app: FastAPI):
     if not settings.encryption_key:
         raise RuntimeError("Set APP_ENCRYPTION_KEY before starting the API.")
+    validate_auth_settings()
     init_db()
     await poller.start()
     await worker_pool.start()
@@ -46,8 +60,89 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=list(settings.cors_origins),
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "X-CSRF-Token"],
+    allow_credentials=True,
 )
+
+
+@app.middleware("http")
+async def require_admin_session(request: Request, call_next):
+    if request.method == "OPTIONS" or not request.url.path.startswith("/api/") or request.url.path in (
+        "/api/auth/login",
+        "/api/auth/session",
+    ):
+        return await call_next(request)
+
+    session = read_session(request.cookies.get(COOKIE_NAME))
+    if not session:
+        return JSONResponse(status_code=401, content={"detail": "Admin login required."})
+    if request.method not in ("GET", "HEAD", "OPTIONS") and not safe_csrf_match(
+        session["csrf"], request.headers.get("X-CSRF-Token")
+    ):
+        return JSONResponse(status_code=403, content={"detail": "CSRF token is missing or invalid."})
+    return await call_next(request)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=255)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+@app.get("/api/auth/session")
+def get_auth_session(request: Request):
+    session = read_session(request.cookies.get(COOKIE_NAME))
+    if not session:
+        return {"authenticated": False}
+    return {
+        "authenticated": True,
+        "username": session["username"],
+        "csrf_token": session["csrf"],
+    }
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginRequest, request: Request):
+    client_key = request.client.host if request.client else "unknown"
+    retry_after = check_login_limit(client_key)
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts. Try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    if not authenticate(payload.username, payload.password):
+        record_login_failure(client_key)
+        raise HTTPException(status_code=401, detail="Invalid admin username or password.")
+    clear_login_failures(client_key)
+    token, csrf_token = create_session()
+    response = JSONResponse({
+        "authenticated": True,
+        "username": settings.admin_username,
+        "csrf_token": csrf_token,
+    })
+    response.set_cookie(
+        COOKIE_NAME,
+        token,
+        max_age=settings.session_ttl_seconds,
+        httponly=True,
+        secure=settings.session_cookie_secure,
+        samesite="strict",
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+def logout():
+    response = JSONResponse({"authenticated": False})
+    response.delete_cookie(
+        COOKIE_NAME,
+        path="/",
+        secure=settings.session_cookie_secure,
+        httponly=True,
+        samesite="strict",
+    )
+    return response
 
 
 class AccountCreate(BaseModel):
@@ -62,10 +157,11 @@ class ProxyCreate(BaseModel):
 
 
 class CategoryToggle(BaseModel):
-    category_id: str
-    name: str
+    category_id: str = Field(min_length=1, max_length=255)
+    name: str = Field(min_length=1, max_length=512)
     kind: Literal["series", "vod"]
     monitored: bool
+    destination_path: str | None = Field(default=None, max_length=4096)
 
 
 class SSHSettings(BaseModel):
@@ -77,6 +173,24 @@ class SSHSettings(BaseModel):
     watch_path: str
     proxy_id: int | None = None
     test: bool = False
+
+
+def _validated_remote_path(
+    path: str | None, field_name: str, allow_none: bool = False
+) -> str | None:
+    if path is None or not path.strip():
+        if allow_none:
+            return None
+        raise HTTPException(status_code=422, detail=f"{field_name} must be an absolute remote path.")
+    if "\x00" in path:
+        raise HTTPException(status_code=422, detail=f"{field_name} contains an invalid character.")
+    normalized = PurePosixPath(path.strip())
+    if not normalized.is_absolute() or ".." in normalized.parts or normalized == PurePosixPath("/"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field_name} must be an absolute path other than / and cannot contain '..'.",
+        )
+    return str(normalized)
 
 
 def _account_json(account: Account) -> dict:
@@ -133,6 +247,7 @@ async def get_categories():
                 result.append({
                     "category_id": category_id, "name": row.get("category_name", row.get("name", "Unknown")),
                     "kind": kind, "monitored": bool(state.monitored) if state else False,
+                    "destination_path": state.destination_path if state else None,
                 })
         return result
     except Exception as exc:
@@ -153,8 +268,17 @@ def toggle_category(payload: CategoryToggle):
         item.name = payload.name
         item.kind = payload.kind
         item.monitored = payload.monitored
+        if "destination_path" in payload.model_fields_set:
+            item.destination_path = _validated_remote_path(
+                payload.destination_path, "Category destination", allow_none=True
+            )
         db.commit()
-    return {"ok": True, "category_id": payload.category_id, "monitored": payload.monitored}
+    return {
+        "ok": True,
+        "category_id": payload.category_id,
+        "monitored": payload.monitored,
+        "destination_path": item.destination_path,
+    }
 
 
 @app.get("/api/queue")
@@ -167,7 +291,10 @@ def get_queue():
             .limit(500)
         ).all()
     return [{
-        "id": item.id, "stream_id": item.stream_id, "title": item.title, "kind": item.kind,
+        "id": item.id, "stream_id": item.provider_stream_id or item.stream_id,
+        "title": item.title, "kind": item.kind,
+        "category_id": item.category_id, "category_name": item.category_name,
+        "series_id": item.series_id,
         "series_title": item.series_title, "season": item.season, "episode": item.episode,
         "status": item.status, "progress": item.progress, "account": username,
         "error": item.error, "retries": item.retries,
@@ -296,19 +423,21 @@ def get_ssh_settings():
 
 @app.post("/api/settings/ssh")
 def save_ssh_settings(payload: SSHSettings):
+    staging_path = _validated_remote_path(payload.staging_path, "Staging directory")
+    watch_path = _validated_remote_path(payload.watch_path, "Storage root")
     with SessionLocal() as db:
         node = db.scalar(select(Node).order_by(Node.id).limit(1))
         if not node:
             node = Node(
                 host=payload.host, port=payload.port, username=payload.username,
-                private_key_path=payload.private_key_path, staging_path=payload.staging_path,
-                watch_path=payload.watch_path, proxy_id=payload.proxy_id,
+                private_key_path=payload.private_key_path, staging_path=staging_path,
+                watch_path=watch_path, proxy_id=payload.proxy_id,
             )
             db.add(node)
         else:
             node.host, node.port, node.username = payload.host, payload.port, payload.username
             node.private_key_path = payload.private_key_path
-            node.staging_path, node.watch_path = payload.staging_path, payload.watch_path
+            node.staging_path, node.watch_path = staging_path, watch_path
             node.proxy_id = payload.proxy_id
         if payload.test:
             try:

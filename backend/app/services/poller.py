@@ -1,6 +1,7 @@
 import asyncio
+import hashlib
 import logging
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.config import settings
 from app.models import Account, MonitoredCategory, QueueItem, SessionLocal, utc_now
@@ -69,13 +70,15 @@ class CategoryPoller:
             if category.kind == "series":
                 series_list = await provider_action(account, "get_series", category_id=category.category_id)
                 for series in series_list:
-                    await self._enqueue_series(account, series)
+                    await self._enqueue_series(account, category, series)
             else:
                 streams = await provider_action(account, "get_vod_streams", category_id=category.category_id)
                 for stream in streams:
-                    await self._enqueue_vod(account, stream)
+                    await self._enqueue_vod(account, category, stream)
 
-    async def _enqueue_series(self, account: Account, series: dict) -> None:
+    async def _enqueue_series(
+        self, account: Account, category: MonitoredCategory, series: dict
+    ) -> None:
         series_id = series.get("series_id", series.get("id"))
         if series_id is None:
             return
@@ -88,51 +91,98 @@ class CategoryPoller:
                 if stream_id is None:
                     continue
                 extension = episode.get("container_extension", "mkv")
-                series_title = series.get("name", "Series")
+                series_title = str(series.get("name") or "Series")
                 season = _int_or_none(episode.get("season")) or season_key_number
                 episode_number = _int_or_none(episode.get("episode_num"))
-                title = episode.get("title") or f"{series_title} S{season or 0:02d}E{episode_number or 0:02d}"
-                file_name = _safe_filename(f"{series_title} - S{season or 0:02d}E{episode_number or 0:02d}.{extension}")
+                episode_title = _safe_filename(
+                    f"{series_title} - S{season or 0:02d}E{episode_number or 0:02d}",
+                    max_length=140,
+                )
+                title = episode.get("title") or episode_title
+                file_name = (
+                    f"Series/{_identity_segment(series_title, str(series_id), account.provider_url)}"
+                    f"/Season {season or 0:02d}/"
+                    f"{episode_title} [{_safe_provider_id(str(stream_id), account.provider_url)}]."
+                    f"{_safe_extension(extension)}"
+                )
                 self._insert_item(
-                    str(stream_id), title, "series", stream_url(account, "series", str(stream_id), extension),
+                    account, str(stream_id), title, "series",
+                    stream_url(account, "series", str(stream_id), extension),
                     file_name, str(series_title), season, episode_number,
+                    category.category_id, category.name, str(series_id),
                 )
 
-    async def _enqueue_vod(self, account: Account, stream: dict) -> None:
+    async def _enqueue_vod(
+        self, account: Account, category: MonitoredCategory, stream: dict
+    ) -> None:
         stream_id = stream.get("stream_id", stream.get("id"))
         if stream_id is None:
             return
         extension = stream.get("container_extension", "mkv")
-        title = stream.get("name") or f"Movie {stream_id}"
-        file_name = _safe_filename(f"{title}.{extension}")
+        title = str(stream.get("name") or f"Movie {stream_id}")
+        file_name = (
+            f"Movies/{_identity_segment(title, str(stream_id), account.provider_url)}/"
+            f"{_safe_filename(title, max_length=160)}.{_safe_extension(extension)}"
+        )
         self._insert_item(
-            str(stream_id), title, "vod", stream_url(account, "vod", str(stream_id), extension),
-            file_name, None, None, None,
+            account, str(stream_id), title, "vod",
+            stream_url(account, "vod", str(stream_id), extension),
+            file_name, None, None, None, category.category_id, category.name, None,
         )
 
     @staticmethod
     def _insert_item(
-        stream_id: str, title: str, kind: str, url: str, file_name: str,
+        account: Account, provider_stream_id: str, title: str, kind: str, url: str, file_name: str,
         series_title: str | None, season: int | None, episode: int | None,
+        category_id: str, category_name: str, series_id: str | None,
     ) -> None:
+        identity = hashlib.sha256(
+            f"{account.provider_url.rstrip('/')}\0{kind}\0{provider_stream_id}".encode("utf-8")
+        ).hexdigest()
         with SessionLocal() as db:
-            if db.scalar(select(QueueItem.id).where(QueueItem.stream_id == stream_id)):
+            if db.scalar(select(QueueItem.id).where(or_(
+                QueueItem.stream_id == identity,
+                (QueueItem.provider_stream_id.is_(None))
+                & (QueueItem.stream_id == provider_stream_id),
+            ))):
                 return
             db.add(QueueItem(
-                stream_id=stream_id, title=title, kind=kind, stream_url_encrypted=encrypt_secret(url),
+                stream_id=identity, provider_stream_id=provider_stream_id,
+                title=title, kind=kind, stream_url_encrypted=encrypt_secret(url),
                 file_name=file_name, series_title=series_title, season=season,
-                episode=episode, status="PENDING", created_at=utc_now(),
+                episode=episode, category_id=category_id, category_name=category_name,
+                series_id=series_id, status="PENDING", created_at=utc_now(),
             ))
             try:
                 db.commit()
             except Exception:
                 db.rollback()
-                logger.exception("Could not enqueue provider stream %s", stream_id)
+                logger.exception("Could not enqueue provider stream %s", provider_stream_id)
 
 
-def _safe_filename(value: str) -> str:
+def _safe_filename(value: str, max_length: int = 240) -> str:
     cleaned = "".join(char for char in value if char.isalnum() or char in " ._-()[]")
-    return cleaned.strip(" .")[:240] or "media.mkv"
+    return cleaned.strip(" .")[:max_length].rstrip(" .") or "media.mkv"
+
+
+def _identity_segment(title: str, provider_id: str, provider_url: str) -> str:
+    return (
+        f"{_safe_filename(title, max_length=130)} "
+        f"[{_safe_provider_id(provider_id, provider_url)}]"
+    )
+
+
+def _safe_provider_id(provider_id: str, provider_url: str) -> str:
+    safe_id = "".join(char for char in provider_id if char.isalnum() or char in "_-")[:48]
+    digest = hashlib.sha256(
+        f"{provider_url.rstrip('/')}\0{provider_id}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{safe_id}-{digest}" if safe_id else digest
+
+
+def _safe_extension(value: str) -> str:
+    extension = "".join(char for char in value.lstrip(".") if char.isalnum())[:12]
+    return extension or "mkv"
 
 
 def _int_or_none(value) -> int | None:

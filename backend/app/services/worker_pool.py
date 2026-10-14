@@ -5,7 +5,7 @@ from datetime import timedelta
 from sqlalchemy import select, update
 
 from app.config import settings
-from app.models import Account, Node, Proxy, QueueItem, SessionLocal, utc_now
+from app.models import Account, MonitoredCategory, Node, Proxy, QueueItem, SessionLocal, utc_now
 from app.security import decrypt_secret
 from app.services.dispatcher import RemoteDispatcher
 
@@ -121,6 +121,12 @@ class WorkerPool:
             item = db.get(QueueItem, item_id)
             account = db.get(Account, account_id)
             node = db.scalar(select(Node).order_by(Node.id).limit(1))
+            category = db.scalar(
+                select(MonitoredCategory).where(
+                    MonitoredCategory.kind == item.kind,
+                    MonitoredCategory.category_id == item.category_id,
+                )
+            ) if item and item.category_id else None
             proxy_records = db.scalars(
                 select(Proxy).where(Proxy.enabled.is_(True)).order_by(Proxy.id)
             ).all()
@@ -129,6 +135,7 @@ class WorkerPool:
                 return
             stream_url, file_name = decrypt_secret(item.stream_url_encrypted), item.file_name
             user_agent = account.user_agent
+            destination_root = category.destination_path if category and category.destination_path else node.watch_path
             proxy_record = proxy_records[item_id % len(proxy_records)] if proxy_records else None
             proxy_url = decrypt_secret(proxy_record.url_encrypted) if proxy_record else None
 
@@ -141,6 +148,8 @@ class WorkerPool:
                 file_name,
                 user_agent,
                 proxy_url,
+                item_id,
+                destination_root,
                 lambda value: loop.call_soon_threadsafe(
                     asyncio.create_task, self._set_progress(item_id, value)
                 ),

@@ -16,6 +16,11 @@ class Settings:
     request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
     remote_job_timeout_seconds: int = int(os.getenv("REMOTE_JOB_TIMEOUT_SECONDS", "86400"))
     known_hosts_path: str = os.getenv("SSH_KNOWN_HOSTS", "")
+    admin_username: str = os.getenv("ADMIN_USERNAME", "")
+    admin_password: str = os.getenv("ADMIN_PASSWORD", "")
+    session_secret_key: str = os.getenv("SESSION_SECRET_KEY", "")
+    session_ttl_seconds: int = int(os.getenv("SESSION_TTL_SECONDS", "28800"))
+    session_cookie_secure: bool = os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true"
     cors_origins: tuple[str, ...] = tuple(
         origin.strip()
         for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")

@@ -83,6 +83,14 @@ class RemoteDispatcher:
         client = self._connect(node)
         try:
             self._run(client, "printf 'connection-ok'")
+            self._run(
+                client,
+                f"mkdir -p {shlex.quote(node.staging_path)} {shlex.quote(node.watch_path)} "
+                f"&& test -w {shlex.quote(node.staging_path)} "
+                f"&& test -w {shlex.quote(node.watch_path)} "
+                f"&& [ \"$(stat -c %d {shlex.quote(node.staging_path)})\" = "
+                f"\"$(stat -c %d {shlex.quote(node.watch_path)})\" ]",
+            )
         finally:
             client.close()
 
@@ -93,26 +101,43 @@ class RemoteDispatcher:
         file_name: str,
         user_agent: str,
         proxy_url: str | None,
+        job_id: int,
+        destination_root: str | None = None,
         on_progress: Callable[[float], None] | None = None,
         on_verifying: Callable[[], None] | None = None,
     ) -> DispatchResult:
-        staging_file = str(PurePosixPath(node.staging_path) / file_name)
-        final_path = str(PurePosixPath(node.watch_path) / file_name)
+        relative_path = PurePosixPath(file_name)
+        if (
+            relative_path.is_absolute()
+            or not relative_path.parts
+            or any(part in ("", ".", "..") for part in relative_path.parts)
+            or "\\" in file_name
+        ):
+            raise ValueError("Content destination must be a safe relative POSIX path.")
+        final_root = destination_root or node.watch_path
+        staging_job_dir = str(PurePosixPath(node.staging_path) / str(job_id))
+        staging_file = str(PurePosixPath(staging_job_dir) / relative_path.name)
+        final_path = str(PurePosixPath(final_root) / relative_path)
         stage_dir = str(PurePosixPath(node.staging_path))
-        final_dir = str(PurePosixPath(node.watch_path))
+        final_dir = str(PurePosixPath(final_path).parent)
         q_stage = shlex.quote(staging_file)
         q_url = shlex.quote(stream_url)
         q_ua = shlex.quote(user_agent)
         client = self._connect(node)
         try:
-            self._run(client, f"mkdir -p {shlex.quote(stage_dir)}")
+            self._run(
+                client,
+                f"mkdir -p {shlex.quote(staging_job_dir)} {shlex.quote(final_dir)} "
+                f"&& rm -f -- {q_stage}",
+            )
             proxy_scheme = urlsplit(proxy_url).scheme.lower() if proxy_url else ""
             if proxy_scheme == "socks5":
                 download = (
                     f"aria2c --split=3 --max-connection-per-server=3 --allow-overwrite=true "
                     f"--auto-file-renaming=false --file-allocation=none --summary-interval=1 "
                     f"--all-proxy={shlex.quote(proxy_url)} --user-agent={q_ua} "
-                    f"--dir={shlex.quote(stage_dir)} --out={shlex.quote(file_name)} {q_url}"
+                    f"--dir={shlex.quote(staging_job_dir)} "
+                    f"--out={shlex.quote(relative_path.name)} {q_url}"
                 )
             elif proxy_url and proxy_scheme in ("http", "https"):
                 safe_proxy = shlex.quote(proxy_url)
@@ -137,22 +162,32 @@ class RemoteDispatcher:
                 if not self._run(client, probe).strip():
                     raise RuntimeError("ffprobe found no video codec in the downloaded stream.")
                 same_filesystem = (
-                    f"mkdir -p {shlex.quote(final_dir)} && "
+                    f"test -w {shlex.quote(final_dir)} && "
+                    f"test -w {shlex.quote(staging_job_dir)} && "
                     f"[ \"$(stat -c %d {shlex.quote(stage_dir)})\" = "
                     f"\"$(stat -c %d {shlex.quote(final_dir)})\" ]"
                 )
                 self._run(client, same_filesystem)
-                move = f"mv -T -- {q_stage} {shlex.quote(final_path)}"
+                move = f"mv -Tn -- {q_stage} {shlex.quote(final_path)} && test ! -e {q_stage}"
                 self._run(client, move)
+                self._run(client, f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}")
                 return DispatchResult(final_path=final_path)
             except Exception as original_error:
                 try:
-                    self._run(client, f"rm -f {q_stage}")
+                    self._run(
+                        client,
+                        f"rm -f -- {q_stage} && "
+                        f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}",
+                    )
                 except Exception as first_cleanup_error:
                     cleanup_client = None
                     try:
                         cleanup_client = self._connect(node)
-                        self._run(cleanup_client, f"rm -f {q_stage}")
+                        self._run(
+                            cleanup_client,
+                            f"rm -f -- {q_stage} && "
+                            f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}",
+                        )
                     except Exception as reconnect_cleanup_error:
                         raise RuntimeError(
                             f"{original_error}; staging cleanup failed after reconnect "
