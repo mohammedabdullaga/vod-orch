@@ -26,7 +26,7 @@ backend/
   requirements.txt          Python dependencies
 frontend/
   src/App.jsx               Authenticated dashboard and tab navigation
-  src/ContentBrowser.jsx    Category, title, series and episode browser
+  src/ContentBrowser.jsx    Grid/list browser, selection, episode inspection and batch actions
   src/index.css             Tailwind and global styles
   package.json              Frontend scripts and dependencies
   vite.config.js            Development API proxy
@@ -68,11 +68,15 @@ Existing single-server installations are migrated automatically: the existing se
 
 Each watched category can inherit its assigned server's storage root (leave its override blank) or set a category-specific absolute remote path in **Category Watcher**. Category and server roots are read when each queued job starts, so changing them routes pending/retried jobs to the new path; already-running and completed jobs are not moved automatically. Category paths must be absolute Linux paths, cannot be `/` or contain `..`, and are created on the assigned server as needed. Jobs with no server assigned remain pending until a route is configured.
 
+The **Browse & Ingest** tab supports poster-grid and compact-list views. Clicking a title card or row selects it; use **Inspect / Episodes** to inspect series seasons and choose individual episodes. **Ingest Selected via Workers** queues content immediately through the configured type-to-server route. **Export / Run as Direct Bash Script** downloads a standalone script for execution on that storage server (for example inside `tmux`); it is not executed by the VPS. The export contains provider stream URLs with account credentials, so confirm the warning, store the file securely, and delete it after use.
+
+In **Settings & Accounts**, each storage server can use 1–12 Axel connections (default 4) and an explicitly assigned proxy. A proxy is used only when it is assigned to that node and enabled; otherwise the worker connects directly, clearing inherited proxy environment variables. SOCKS5 uses `aria2c`, while direct and HTTP(S)-proxy jobs use Axel.
+
 The dispatcher does not match items by title alone. It sanitizes names and uses the provider's stable IDs and metadata to create paths like:
 
 ```text
 <destination root>/
-  Series/<series name> [<series id>-<source digest>]/Season 01/<series - S01E01 [episode id].mkv>
+  Series/<series name> [<series id>-<source digest>]/Season 01/S01E01.mkv
   Movies/<movie name> [<stream id>-<source digest>]/<movie name>.mkv
 ```
 
@@ -250,8 +254,10 @@ If the dashboard and API are served from different browser origins, set `CORS_OR
 | `GET` | `/api/content/items?type=series\|movie&category_ids=1,2` | Titles in selected categories |
 | `GET` | `/api/content/series/{series_id}/details` | Seasons and normalized episode metadata |
 | `POST` | `/api/queue/manual-batch` | Queue selected movies or episodes immediately |
+| `POST` | `/api/content/generate-script` | Download a standalone credential-bearing Bash script for selected titles/episodes |
 | `GET` / `POST` / `DELETE` | `/api/accounts` | Provider account management |
 | `GET` / `POST` / `DELETE` | `/api/proxies` | Proxy pool management |
+| `PUT` | `/api/proxies/{proxy_id}/enabled` | Enable/disable a proxy assigned to a storage node |
 | `POST` | `/api/proxies/{proxy_id}/test` | Test proxy IP and latency |
 | `GET` / `POST` | `/api/settings/ssh` | Legacy single-node settings compatibility |
 | `GET` / `POST` / `PUT` / `DELETE` | `/api/nodes` | List, add, update, or remove storage servers |

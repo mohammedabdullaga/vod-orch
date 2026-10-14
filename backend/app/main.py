@@ -170,6 +170,10 @@ class ProxyCreate(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
 
 
+class ProxyEnabled(BaseModel):
+    enabled: bool
+
+
 class CategoryToggle(BaseModel):
     category_id: str = Field(min_length=1, max_length=255)
     name: str = Field(min_length=1, max_length=512)
@@ -186,7 +190,8 @@ class SSHSettings(BaseModel):
     private_key_path: str
     staging_path: str
     watch_path: str
-    proxy_id: int | None = None
+    proxy_id: int | None = Field(default=None, ge=1)
+    axel_connections: int = Field(default=4, ge=1, le=12)
     test: bool = False
 
 
@@ -226,6 +231,7 @@ def _node_json(node: Node) -> dict:
         "id": node.id, "name": node.name, "host": node.host, "port": node.port, "username": node.username,
         "private_key_path": node.private_key_path, "staging_path": node.staging_path,
         "watch_path": node.watch_path, "proxy_id": node.proxy_id,
+        "axel_connections": node.axel_connections,
         "last_connected_at": node.last_connected_at.isoformat() if node.last_connected_at else None,
     }
 
@@ -411,6 +417,17 @@ def add_proxy(payload: ProxyCreate):
         return {"id": proxy.id, "url": mask_secret(payload.url), "enabled": proxy.enabled}
 
 
+@app.put("/api/proxies/{proxy_id}/enabled")
+def set_proxy_enabled(proxy_id: int, payload: ProxyEnabled):
+    with SessionLocal() as db:
+        proxy = db.get(Proxy, proxy_id)
+        if not proxy:
+            raise HTTPException(status_code=404, detail="Proxy not found.")
+        proxy.enabled = payload.enabled
+        db.commit()
+    return {"ok": True, "id": proxy_id, "enabled": payload.enabled}
+
+
 @app.delete("/api/proxies/{proxy_id}")
 def delete_proxy(proxy_id: int):
     with SessionLocal() as db:
@@ -453,6 +470,8 @@ def save_ssh_settings(payload: SSHSettings):
     staging_path = _validated_remote_path(payload.staging_path, "Staging directory")
     watch_path = _validated_remote_path(payload.watch_path, "Storage root")
     with SessionLocal() as db:
+        if payload.proxy_id is not None and not db.get(Proxy, payload.proxy_id):
+            raise HTTPException(status_code=404, detail="Selected proxy not found.")
         node = db.scalar(select(Node).order_by(Node.id).limit(1))
         if not node:
             node = Node(
@@ -460,6 +479,7 @@ def save_ssh_settings(payload: SSHSettings):
                 host=payload.host, port=payload.port, username=payload.username,
                 private_key_path=payload.private_key_path, staging_path=staging_path,
                 watch_path=watch_path, proxy_id=payload.proxy_id,
+                axel_connections=payload.axel_connections,
             )
             db.add(node)
         else:
@@ -468,6 +488,7 @@ def save_ssh_settings(payload: SSHSettings):
             node.private_key_path = payload.private_key_path
             node.staging_path, node.watch_path = staging_path, watch_path
             node.proxy_id = payload.proxy_id
+            node.axel_connections = payload.axel_connections
         db.flush()
         for kind in ("series", "vod"):
             route = db.get(StorageRoute, kind)
@@ -496,6 +517,8 @@ def add_storage_node(payload: SSHSettings):
     staging_path = _validated_remote_path(payload.staging_path, "Staging directory")
     watch_path = _validated_remote_path(payload.watch_path, "Storage root")
     with SessionLocal() as db:
+        if payload.proxy_id is not None and not db.get(Proxy, payload.proxy_id):
+            raise HTTPException(status_code=404, detail="Selected proxy not found.")
         node = Node(
             name=payload.name,
             host=payload.host,
@@ -505,6 +528,7 @@ def add_storage_node(payload: SSHSettings):
             staging_path=staging_path,
             watch_path=watch_path,
             proxy_id=payload.proxy_id,
+            axel_connections=payload.axel_connections,
         )
         if payload.test:
             try:
@@ -527,11 +551,14 @@ def update_storage_node(node_id: int, payload: SSHSettings):
         node = db.get(Node, node_id)
         if not node:
             raise HTTPException(status_code=404, detail="Storage node not found.")
+        if payload.proxy_id is not None and not db.get(Proxy, payload.proxy_id):
+            raise HTTPException(status_code=404, detail="Selected proxy not found.")
         node.name = payload.name
         node.host, node.port, node.username = payload.host, payload.port, payload.username
         node.private_key_path = payload.private_key_path
         node.staging_path, node.watch_path = staging_path, watch_path
         node.proxy_id = payload.proxy_id
+        node.axel_connections = payload.axel_connections
         if payload.test:
             try:
                 dispatcher.test_connection(node)

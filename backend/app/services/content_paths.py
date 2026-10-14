@@ -67,14 +67,11 @@ def normalized_episode_path(
         actual_series_name = series_name or title
         actual_series_id = series_id or provider_stream_id
         season_name = f"Season {season_value or 0:02d}"
-        if not filename:
-            stem = safe_filename(
-                f"{actual_series_name} - S{season_value or 0:02d}E{episode_value or 0:02d}",
-                max_length=140,
-            )
+        if season_value is not None and episode_value is not None:
+            stem = f"S{season_value:02d}E{episode_value:02d}"
         path = (
             f"Series/{identity_segment(actual_series_name, actual_series_id, provider_url)}/"
-            f"{season_name}/{stem} [{safe_provider_id(provider_stream_id, provider_url)}].{ext}"
+            f"{season_name}/{stem}.{ext}"
         )
     else:
         actual_title = title or f"Movie {provider_stream_id}"

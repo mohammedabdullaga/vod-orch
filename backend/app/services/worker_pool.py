@@ -154,9 +154,6 @@ class WorkerPool:
                     MonitoredCategory.category_id == item.category_id,
                 )
             ) if item and item.category_id else None
-            proxy_records = db.scalars(
-                select(Proxy).where(Proxy.enabled.is_(True)).order_by(Proxy.id)
-            ).all()
             if not item or not account or not node:
                 content_type = "series" if item and item.kind == "series" else "movie"
                 self._fail(
@@ -167,8 +164,11 @@ class WorkerPool:
             stream_url, file_name = decrypt_secret(item.stream_url_encrypted), item.file_name
             user_agent = account.user_agent
             destination_root = category.destination_path if category and category.destination_path else node.watch_path
-            proxy_record = proxy_records[item_id % len(proxy_records)] if proxy_records else None
+            proxy_record = db.get(Proxy, node.proxy_id) if node.proxy_id else None
+            if proxy_record and not proxy_record.enabled:
+                proxy_record = None
             proxy_url = decrypt_secret(proxy_record.url_encrypted) if proxy_record else None
+            axel_connections = node.axel_connections
 
         loop = asyncio.get_running_loop()
         try:
@@ -187,6 +187,7 @@ class WorkerPool:
                 lambda: loop.call_soon_threadsafe(
                     asyncio.create_task, self._set_status(item_id, "VERIFYING")
                 ),
+                axel_connections,
             )
         except Exception as exc:
             logger.error("Download job %s failed (%s)", item_id, type(exc).__name__)

@@ -47,6 +47,7 @@ function App() {
   const [editingNodeId, setEditingNodeId] = useState(null);
   const [nodeForm, setNodeForm] = useState({
     name: "", host: "", port: 22, username: "", private_key_path: "", staging_path: "", watch_path: "",
+    proxy_id: "", axel_connections: 4,
   });
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
@@ -158,10 +159,20 @@ function App() {
     event.preventDefault();
     act(async () => { await api.post("/proxies", { url: proxyUrl }); setProxyUrl(""); await loadSettings(); }, "Proxy added.");
   };
+  const toggleProxy = (proxy) => act(async () => {
+    await api.put(`/proxies/${proxy.id}/enabled`, { enabled: !proxy.enabled });
+    await loadSettings();
+  }, `Proxy ${proxy.enabled ? "disabled" : "enabled"}.`);
   const saveNode = (event, test = false) => {
     event?.preventDefault();
     act(async () => {
-      const payload = { ...nodeForm, port: Number(nodeForm.port), test };
+      const payload = {
+        ...nodeForm,
+        port: Number(nodeForm.port),
+        proxy_id: nodeForm.proxy_id ? Number(nodeForm.proxy_id) : null,
+        axel_connections: Number(nodeForm.axel_connections || 4),
+        test,
+      };
       const response = editingNodeId
         ? await api.put(`/nodes/${editingNodeId}`, payload)
         : await api.post("/nodes", payload);
@@ -172,11 +183,19 @@ function App() {
   };
   const editNode = (node) => {
     setEditingNodeId(node.id);
-    setNodeForm({ ...node, port: Number(node.port) });
+    setNodeForm({
+      ...node,
+      port: Number(node.port),
+      proxy_id: node.proxy_id ? String(node.proxy_id) : "",
+      axel_connections: Number(node.axel_connections || 4),
+    });
   };
   const resetNodeForm = () => {
     setEditingNodeId(null);
-    setNodeForm({ name: "", host: "", port: 22, username: "", private_key_path: "", staging_path: "", watch_path: "" });
+    setNodeForm({
+      name: "", host: "", port: 22, username: "", private_key_path: "", staging_path: "", watch_path: "",
+      proxy_id: "", axel_connections: 4,
+    });
   };
   const saveRouting = (event) => {
     event.preventDefault();
@@ -316,7 +335,7 @@ function App() {
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
             <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Gauge size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Proxy pool</h2><p className="text-xs text-slate-500">Proxy URLs are encrypted at rest</p></div></div>
-            <div className="space-y-2 p-5">{proxies.map((proxy) => <div key={proxy.id} className="flex items-center justify-between rounded-lg bg-slate-900/70 px-3 py-2.5"><span className="font-mono text-xs text-slate-300">{proxy.url}</span><div className="flex items-center"><button onClick={() => testProxy(proxy.id)} disabled={busy} className="px-2 text-xs text-indigo-300 hover:text-indigo-200">Test latency/IP</button><button onClick={() => remove("/proxies", proxy.id)} className="p-2 text-slate-500 hover:text-rose-300" aria-label="Remove proxy"><Trash2 size={15} /></button></div></div>)}
+            <div className="space-y-2 p-5">{proxies.map((proxy) => <div key={proxy.id} className="flex items-center justify-between rounded-lg bg-slate-900/70 px-3 py-2.5"><div><span className="font-mono text-xs text-slate-300">{proxy.url}</span><span className={`ml-2 text-[10px] ${proxy.enabled ? "text-emerald-300" : "text-slate-500"}`}>{proxy.enabled ? "Enabled" : "Disabled"}</span></div><div className="flex items-center"><button onClick={() => toggleProxy(proxy)} disabled={busy} className="px-2 text-xs text-slate-300 hover:text-white">{proxy.enabled ? "Disable" : "Enable"}</button><button onClick={() => testProxy(proxy.id)} disabled={busy} className="px-2 text-xs text-indigo-300 hover:text-indigo-200">Test latency/IP</button><button onClick={() => remove("/proxies", proxy.id)} className="p-2 text-slate-500 hover:text-rose-300" aria-label="Remove proxy"><Trash2 size={15} /></button></div></div>)}
               <form onSubmit={addProxy} className="mt-4 flex gap-2 border-t border-slate-800 pt-4"><input required placeholder="http://user:pass@host:port" value={proxyUrl} onChange={(e) => setProxyUrl(e.target.value)} className="field" /><button disabled={busy} className="primary"><Plus size={15} />Add</button></form>
             </div>
           </section>
@@ -340,7 +359,7 @@ function App() {
               <div className="space-y-3">
                 <h3 className="text-sm font-medium text-slate-200">Configured servers ({nodes.length})</h3>
                 {nodes.map((node) => <div key={node.id} className="flex items-center justify-between gap-3 rounded-lg bg-slate-900/70 px-3 py-3">
-                  <div className="min-w-0"><div className="truncate text-sm text-slate-200">{node.name}</div><div className="truncate text-xs text-slate-500">{node.username}@{node.host}:{node.port} · {node.watch_path}</div><div className="mt-1 text-[10px] text-indigo-300">{[routing.series_node_id === node.id && "Series", routing.movie_node_id === node.id && "Movies"].filter(Boolean).join(" · ") || "Not assigned"}</div></div>
+                  <div className="min-w-0"><div className="truncate text-sm text-slate-200">{node.name}</div><div className="truncate text-xs text-slate-500">{node.username}@{node.host}:{node.port} · {node.watch_path}</div><div className="mt-1 text-[10px] text-slate-400">{node.axel_connections || 4} download connections · {proxies.find((proxy) => proxy.id === node.proxy_id)?.enabled ? `Proxy #${node.proxy_id}` : "Direct connection"}</div><div className="mt-1 text-[10px] text-indigo-300">{[routing.series_node_id === node.id && "Series", routing.movie_node_id === node.id && "Movies"].filter(Boolean).join(" · ") || "Not assigned"}</div></div>
                   <div className="flex shrink-0 items-center"><button onClick={() => editNode(node)} className="px-2 text-xs text-indigo-300 hover:text-indigo-200">Edit</button><button onClick={() => remove("/nodes", node.id)} className="p-2 text-slate-500 hover:text-rose-300" aria-label={`Remove ${node.name}`}><Trash2 size={15} /></button></div>
                 </div>)}
                 {!nodes.length && <p className="rounded-lg border border-dashed border-slate-700 px-3 py-6 text-center text-xs text-slate-500">Add a storage server, then assign it to Movies, Series, or both.</p>}
@@ -351,6 +370,15 @@ function App() {
                   ["name", "Server name"], ["host", "SSH host"], ["port", "Port"], ["username", "SSH username"],
                   ["private_key_path", "Private key path on daemon"], ["staging_path", "Remote staging directory"], ["watch_path", "Storage root on this server"],
                 ].map(([key, placeholder]) => <input key={key} required placeholder={placeholder} type={key === "port" ? "number" : "text"} value={nodeForm[key] ?? ""} onChange={(event) => setNodeForm({ ...nodeForm, [key]: event.target.value })} className="field" />)}
+                <label className="block text-xs text-slate-400">Axel connections (1–12)
+                  <input required min="1" max="12" type="number" value={nodeForm.axel_connections ?? 4} onChange={(event) => setNodeForm({ ...nodeForm, axel_connections: event.target.value })} className="field mt-2" />
+                </label>
+                <label className="block text-xs text-slate-400">Worker proxy
+                  <select value={nodeForm.proxy_id ?? ""} onChange={(event) => setNodeForm({ ...nodeForm, proxy_id: event.target.value })} className="field mt-2">
+                    <option value="">Direct connection</option>
+                    {proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>Proxy #{proxy.id} · {proxy.url}{proxy.enabled ? "" : " (disabled; direct)"}</option>)}
+                  </select>
+                </label>
                 <div className="flex flex-wrap gap-2 sm:col-span-2 lg:col-span-3">
                   <button disabled={busy} className="primary"><Plus size={15} />{editingNodeId ? "Save server" : "Add server"}</button>
                   <button type="button" disabled={busy} onClick={(event) => saveNode(event, true)} className="secondary"><Wifi size={15} />Test connection &amp; save</button>

@@ -117,6 +117,7 @@ class Node(Base):
     private_key_path: Mapped[str] = mapped_column(Text)
     staging_path: Mapped[str] = mapped_column(Text)
     watch_path: Mapped[str] = mapped_column(Text)
+    axel_connections: Mapped[int] = mapped_column(Integer, default=4)
     proxy_id: Mapped[int | None] = mapped_column(
         ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True
     )
@@ -151,6 +152,7 @@ def init_db() -> None:
             },
             "nodes": {
                 "name": "VARCHAR(255) NOT NULL DEFAULT 'Storage server'",
+                "axel_connections": "INTEGER NOT NULL DEFAULT 4",
             },
         }
         inspector = inspect(connection)

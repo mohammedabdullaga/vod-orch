@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  ChevronDown, Download, Film, LoaderCircle, Search, Tv, X,
+  Check, ChevronDown, Download, Film, LayoutGrid, List, LoaderCircle, Search, Tv, X,
 } from "lucide-react";
 
 const kindFor = (type) => type === "series" ? "series" : "vod";
@@ -21,6 +21,7 @@ export default function ContentBrowser({ api, routing, onQueued }) {
   const [categorySearch, setCategorySearch] = useState("");
   const [items, setItems] = useState([]);
   const [selectedItems, setSelectedItems] = useState(new Set());
+  const [viewMode, setViewMode] = useState("grid");
   const [itemSearch, setItemSearch] = useState("");
   const [details, setDetails] = useState(null);
   const [selectedEpisodes, setSelectedEpisodes] = useState(new Map());
@@ -47,6 +48,17 @@ export default function ContentBrowser({ api, routing, onQueued }) {
   const visibleItems = useMemo(() => items.filter((item) =>
     `${item.name} ${item.category_name}`.toLocaleLowerCase().includes(itemSearch.toLocaleLowerCase())
   ), [items, itemSearch]);
+  const selectedTitles = useMemo(
+    () => items.filter((item) => selectedItems.has(item.id)),
+    [items, selectedItems],
+  );
+  const knownEpisodeCount = selectedTitles.reduce(
+    (total, item) => total + (Number(item.total_episodes) || 0),
+    0,
+  );
+  const unknownEpisodeCount = selectedTitles.filter(
+    (item) => type === "series" && item.total_episodes == null,
+  ).length;
   const nodeId = type === "series" ? routing?.series_node_id : routing?.movie_node_id;
   const nodeLabel = type === "series" ? "Series" : "Movies";
 
@@ -125,6 +137,10 @@ export default function ContentBrowser({ api, routing, onQueued }) {
     });
   };
 
+  const selectAllVisible = () => {
+    setSelectedItems((current) => new Set([...current, ...visibleItems.map((item) => item.id)]));
+  };
+
   const fetchDetails = async (item) => {
     setBusy(true);
     setNotice("");
@@ -191,6 +207,28 @@ export default function ContentBrowser({ api, routing, onQueued }) {
     })
   );
 
+  const entriesForTitles = async (chosen) => {
+    if (type === "movie") {
+      return chosen.map((item) => ({
+        stream_id: item.id,
+        title: item.name,
+        filename: `${item.name}.${item.container_ext || "mkv"}`,
+        container_ext: item.container_ext || "mkv",
+        category_id: item.category_id,
+        category_name: item.category_name,
+      }));
+    }
+    const entries = [];
+    for (let start = 0; start < chosen.length; start += 8) {
+      const batch = await Promise.all(chosen.slice(start, start + 8).map(async (item) => {
+        const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`);
+        return detailsEntries(item, data);
+      }));
+      entries.push(...batch.flat());
+    }
+    return entries;
+  };
+
   const queueFullSeries = async (item) => {
     setBusy(true);
     setNotice("");
@@ -204,28 +242,50 @@ export default function ContentBrowser({ api, routing, onQueued }) {
   };
 
   const queueSelectedTitles = async () => {
-    const chosen = items.filter((item) => selectedItems.has(item.id));
-    if (type === "movie") {
-      return queueEntries(chosen.map((item) => ({
-        stream_id: item.id,
-        title: item.name,
-        filename: `${item.name}.${item.container_ext || "mkv"}`,
-        container_ext: item.container_ext || "mkv",
-        category_id: item.category_id,
-        category_name: item.category_name,
-      })));
-    }
+    if (!selectedTitles.length) return setNotice("Select at least one title to queue.");
     setBusy(true);
     setNotice("");
     try {
-      const allEntries = [];
-      for (const item of chosen) {
-        const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`);
-        allEntries.push(...detailsEntries(item, data));
-      }
-      await queueEntries(allEntries);
+      await queueEntries(await entriesForTitles(selectedTitles));
     } catch (error) {
-      setNotice(error.response?.data?.detail || "Could not load selected series.");
+      setNotice(error.response?.data?.detail || "Could not load selected titles.");
+      setBusy(false);
+    }
+  };
+
+  const exportSelectedScript = async () => {
+    if (!selectedTitles.length) return setNotice("Select at least one title to export.");
+    if (!window.confirm("The generated shell script contains provider stream URLs with account credentials. Only save it to a trusted location, and delete it after use. Continue?")) return;
+    setBusy(true);
+    setNotice("");
+    try {
+      const entries = await entriesForTitles(selectedTitles);
+      if (!entries.length) throw new Error("No downloadable episodes or movies were found.");
+      const { data } = await api.post("/content/generate-script", {
+        content_type: type === "series" ? "SERIES" : "MOVIE",
+        items: entries,
+      }, { responseType: "blob" });
+      const content = new Blob([data], { type: "text/x-shellscript;charset=utf-8" });
+      const url = URL.createObjectURL(content);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `media-ingest-${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}.sh`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setNotice("Script downloaded. Treat it as a secret: it contains credential-bearing stream URLs.");
+    } catch (error) {
+      let detail = error.response?.data?.detail;
+      if (error.response?.data instanceof Blob) {
+        try {
+          detail = JSON.parse(await error.response.data.text()).detail;
+        } catch {
+          detail = null;
+        }
+      }
+      setNotice(detail || error.message || "Could not generate the download script.");
+    } finally {
       setBusy(false);
     }
   };
@@ -308,42 +368,82 @@ export default function ContentBrowser({ api, routing, onQueued }) {
           <div className="min-w-0 rounded-xl border border-slate-800 bg-slate-900/40">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 p-4">
               <div><h3 className="text-sm font-medium text-slate-200">2. Select {type === "series" ? "series" : "movies"}</h3><p className="mt-1 text-xs text-slate-500">{items.length} results</p></div>
-              <div className="flex flex-wrap items-center gap-2">
-                {selectedItems.size > 0 && <button disabled={busy} onClick={queueSelectedTitles} className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/25 disabled:opacity-40"><Download size={14} />Queue {selectedItems.size} selected</button>}
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="inline-flex rounded-lg border border-slate-700 bg-[#090d16] p-1" aria-label="Items view">
+                  <button type="button" aria-pressed={viewMode === "grid"} onClick={() => setViewMode("grid")} className={`rounded-md px-2.5 py-1.5 text-xs ${viewMode === "grid" ? "bg-indigo-500 text-white" : "text-slate-400 hover:text-white"}`}><LayoutGrid size={14} className="mr-1.5 inline" />Grid</button>
+                  <button type="button" aria-pressed={viewMode === "list"} onClick={() => setViewMode("list")} className={`rounded-md px-2.5 py-1.5 text-xs ${viewMode === "list" ? "bg-indigo-500 text-white" : "text-slate-400 hover:text-white"}`}><List size={14} className="mr-1.5 inline" />List</button>
+                </div>
                 <div className="relative">
                   <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
                   <input value={itemSearch} onChange={(event) => setItemSearch(event.target.value)} placeholder="Search titles…" className="w-44 rounded-lg border border-slate-700 bg-[#090d16] py-2 pl-8 pr-3 text-xs outline-none focus:border-indigo-400" />
                 </div>
               </div>
             </div>
-            {!items.length ? <div className="grid min-h-64 place-items-center px-4 text-center text-sm text-slate-500">Choose categories and select <span className="text-indigo-300">Browse selected</span> to see provider content.</div> :
-              <div className="grid max-h-[660px] gap-3 overflow-y-auto p-4 sm:grid-cols-2 xl:grid-cols-3">
-                {visibleItems.map((item) => (
-                  <article key={`${item.kind}-${item.id}`} className="overflow-hidden rounded-xl border border-slate-800 bg-[#0b111d]">
-                    <div className="relative grid h-40 place-items-center bg-slate-900">
-                      {item.cover ? <img src={item.cover} alt="" className="h-full w-full object-cover" loading="lazy" onError={(event) => { event.currentTarget.style.display = "none"; }} /> : (type === "series" ? <Tv className="text-slate-700" size={36} /> : <Film className="text-slate-700" size={36} />)}
-                      <label className="absolute left-3 top-3 flex cursor-pointer items-center gap-2 rounded-md bg-black/70 px-2 py-1.5 text-xs text-white">
-                        <input type="checkbox" checked={selectedItems.has(item.id)} onChange={() => toggleItemSelection(item.id)} className="accent-indigo-500" />Select
-                      </label>
-                    </div>
-                    <div className="p-4">
-                      <h4 className="line-clamp-2 min-h-10 text-sm font-semibold text-slate-100">{item.name}</h4>
-                      <p className="mt-1 truncate text-xs text-slate-500">{item.category_name}</p>
-                      <p className="mt-2 text-xs text-slate-400">{type === "series" ? `${item.total_seasons || "—"} seasons · ${item.total_episodes || "—"} episodes` : `Stream ID ${item.id}`}</p>
-                      <div className="mt-4 flex gap-2">
-                        {type === "series" ? <>
-                          <button disabled={busy} onClick={() => fetchDetails(item)} className="flex-1 rounded-lg border border-slate-700 px-2 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40">View seasons</button>
-                          <button disabled={busy} onClick={() => queueFullSeries(item)} title="Queue full series" className="rounded-lg bg-indigo-500/15 px-3 text-indigo-300 hover:bg-indigo-500/25 disabled:opacity-40"><Download size={15} /></button>
-                        </> : <button disabled={busy} onClick={() => queueEntries([{
-                          stream_id: item.id, title: item.name, filename: `${item.name}.${item.container_ext || "mkv"}`,
-                          container_ext: item.container_ext || "mkv", category_id: item.category_id, category_name: item.category_name,
-                        }])} className="flex w-full items-center justify-center gap-2 rounded-lg bg-indigo-500/15 px-3 py-2 text-xs text-indigo-300 hover:bg-indigo-500/25 disabled:opacity-40"><Download size={14} />Queue movie</button>}
-                      </div>
-                    </div>
-                  </article>
-                ))}
-                {!visibleItems.length && <p className="col-span-full py-12 text-center text-sm text-slate-500">No titles match your search.</p>}
+            {items.length > 0 && <div className="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 bg-[#101827]/95 px-4 py-3 backdrop-blur">
+              <div className="flex flex-wrap items-center gap-2">
+                <button type="button" onClick={selectAllVisible} disabled={!visibleItems.length} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40">Select All ({visibleItems.length} items)</button>
+                <button type="button" onClick={() => setSelectedItems(new Set())} disabled={!selectedItems.size} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40">Deselect All</button>
+                <span className="text-xs text-slate-400">Selected: {selectedTitles.length} {type === "series" ? `shows · ${knownEpisodeCount} known episodes${unknownEpisodeCount ? ` · ${unknownEpisodeCount} count${unknownEpisodeCount === 1 ? "" : "s"} unavailable` : ""}` : "movies"}</span>
               </div>
+              <div className="flex flex-wrap gap-2">
+                <button type="button" disabled={busy || !selectedTitles.length} onClick={queueSelectedTitles} className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/25 disabled:opacity-40"><Download size={14} />Ingest Selected via Workers</button>
+                <button type="button" disabled={busy || !selectedTitles.length} onClick={exportSelectedScript} className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-400/40 bg-indigo-500/10 px-3 py-2 text-xs font-medium text-indigo-200 hover:bg-indigo-500/20 disabled:opacity-40"><Download size={14} />Export / Run as Direct Bash Script</button>
+              </div>
+            </div>}
+            {!items.length ? <div className="grid min-h-64 place-items-center px-4 text-center text-sm text-slate-500">Choose categories and select <span className="text-indigo-300">Browse selected</span> to see provider content.</div> :
+              !visibleItems.length ? <div className="grid min-h-64 place-items-center px-4 text-center text-sm text-slate-500">No titles match your search.</div> :
+                viewMode === "list" ? <div className="max-h-[660px] overflow-auto">
+                  <table className="w-full min-w-[760px] text-left text-sm">
+                    <thead className="sticky top-0 z-[1] bg-slate-900 text-xs uppercase tracking-wide text-slate-500"><tr><th className="w-12 px-4 py-3">Select</th><th className="px-4 py-3">Title</th><th className="px-4 py-3">Category</th><th className="px-4 py-3">Season Count</th><th className="px-4 py-3">Episode Count</th><th className="px-4 py-3">Actions</th></tr></thead>
+                    <tbody className="divide-y divide-slate-800/80">
+                      {visibleItems.map((item) => {
+                        const isSelected = selectedItems.has(item.id);
+                        return <tr key={`${item.kind}-${item.id}`} role="button" tabIndex={0} aria-pressed={isSelected} onClick={() => toggleItemSelection(item.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggleItemSelection(item.id); } }} className={`cursor-pointer transition ${isSelected ? "bg-indigo-950/40 outline outline-1 -outline-offset-1 outline-indigo-500" : "hover:bg-slate-800/40"}`}>
+                          <td className="px-4 py-3"><span className={`grid h-5 w-5 place-items-center rounded border ${isSelected ? "border-indigo-400 bg-indigo-500 text-white" : "border-slate-600 text-transparent"}`}><Check size={13} /></span></td>
+                          <td className="max-w-[280px] truncate px-4 py-3 font-medium text-slate-200">{item.name}{item.year && <span className="ml-2 text-xs font-normal text-slate-500">{item.year}</span>}</td>
+                          <td className="max-w-[180px] truncate px-4 py-3 text-slate-400">{item.category_name}</td>
+                          <td className="px-4 py-3 text-slate-400">{type === "series" ? item.total_seasons ?? "—" : "—"}</td>
+                          <td className="px-4 py-3 text-slate-400">{type === "series" ? item.total_episodes ?? "—" : "—"}</td>
+                          <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>{type === "series" ? <div className="flex gap-2">
+                            <button type="button" disabled={busy} onClick={() => fetchDetails(item)} className="whitespace-nowrap rounded-lg border border-slate-700 px-2.5 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40">Inspect / Episodes</button>
+                            <button type="button" disabled={busy} onClick={() => queueFullSeries(item)} title="Queue full series" className="rounded-lg bg-indigo-500/15 px-2.5 text-indigo-300 hover:bg-indigo-500/25 disabled:opacity-40"><Download size={15} /></button>
+                          </div> : <button type="button" disabled={busy} onClick={() => queueEntries([{
+                            stream_id: item.id, title: item.name, filename: `${item.name}.${item.container_ext || "mkv"}`,
+                            container_ext: item.container_ext || "mkv", category_id: item.category_id, category_name: item.category_name,
+                          }])} className="rounded-lg bg-indigo-500/15 px-3 py-2 text-xs text-indigo-300 hover:bg-indigo-500/25 disabled:opacity-40"><Download size={14} /></button>}</td>
+                        </tr>;
+                      })}
+                    </tbody>
+                  </table>
+                </div> : <div className="grid max-h-[660px] gap-3 overflow-y-auto p-4 sm:grid-cols-2 xl:grid-cols-3">
+                  {visibleItems.map((item) => {
+                    const isSelected = selectedItems.has(item.id);
+                    return <article key={`${item.kind}-${item.id}`} role="button" tabIndex={0} aria-pressed={isSelected} onClick={() => toggleItemSelection(item.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggleItemSelection(item.id); } }} className={`group cursor-pointer overflow-hidden rounded-xl border transition ${isSelected ? "border-indigo-500 bg-indigo-950/40" : "border-slate-800 bg-[#0b111d] hover:border-slate-600"}`}>
+                      <div className="relative grid h-40 place-items-center bg-slate-900">
+                        {item.cover ? <img src={item.cover} alt="" className="h-full w-full object-cover" loading="lazy" onError={(event) => { event.currentTarget.style.display = "none"; }} /> : (type === "series" ? <Tv className="text-slate-700" size={36} /> : <Film className="text-slate-700" size={36} />)}
+                        <span className={`absolute right-3 top-3 grid h-7 w-7 place-items-center rounded-full border ${isSelected ? "border-indigo-300 bg-indigo-500 text-white" : "border-white/30 bg-black/60 text-transparent"}`}><Check size={16} /></span>
+                        {item.year && <span className="absolute bottom-3 left-3 rounded-md bg-black/70 px-2 py-1 text-xs text-white">{item.year}</span>}
+                      </div>
+                      <div className="p-4">
+                        <h4 className="line-clamp-2 min-h-10 text-sm font-semibold text-slate-100">{item.name}</h4>
+                        <p className="mt-1 truncate text-xs text-slate-500">{item.category_name}</p>
+                        {type === "series" ? <div className="mt-2 flex gap-2">
+                          <span className="rounded-full bg-slate-800 px-2 py-1 text-[10px] text-slate-300">{item.total_seasons ?? "—"} seasons</span>
+                          <span className="rounded-full bg-slate-800 px-2 py-1 text-[10px] text-slate-300">{item.total_episodes ?? "—"} episodes</span>
+                        </div> : <p className="mt-2 text-xs text-slate-400">Stream ID {item.id}</p>}
+                        <div className="mt-4 flex gap-2" onClick={(event) => event.stopPropagation()}>
+                          {type === "series" ? <>
+                            <button type="button" disabled={busy} onClick={() => fetchDetails(item)} className="flex-1 rounded-lg border border-slate-700 px-2 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40">Inspect / Episodes</button>
+                            <button type="button" disabled={busy} onClick={() => queueFullSeries(item)} title="Queue full series" className="rounded-lg bg-indigo-500/15 px-3 text-indigo-300 hover:bg-indigo-500/25 disabled:opacity-40"><Download size={15} /></button>
+                          </> : <button type="button" disabled={busy} onClick={() => queueEntries([{
+                            stream_id: item.id, title: item.name, filename: `${item.name}.${item.container_ext || "mkv"}`,
+                            container_ext: item.container_ext || "mkv", category_id: item.category_id, category_name: item.category_name,
+                          }])} className="flex w-full items-center justify-center gap-2 rounded-lg bg-indigo-500/15 px-3 py-2 text-xs text-indigo-300 hover:bg-indigo-500/25 disabled:opacity-40"><Download size={14} />Queue movie</button>}
+                        </div>
+                      </div>
+                    </article>;
+                  })}
+                </div>
             }
           </div>
         </div>

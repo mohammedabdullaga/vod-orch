@@ -105,7 +105,10 @@ class RemoteDispatcher:
         destination_root: str | None = None,
         on_progress: Callable[[float], None] | None = None,
         on_verifying: Callable[[], None] | None = None,
+        axel_connections: int = 4,
     ) -> DispatchResult:
+        if not 1 <= axel_connections <= 12:
+            raise ValueError("Axel connections must be between 1 and 12.")
         relative_path = PurePosixPath(file_name)
         if (
             relative_path.is_absolute()
@@ -127,15 +130,23 @@ class RemoteDispatcher:
         q_ua = shlex.quote(user_agent)
         client = self._connect(node)
         try:
+            prepare = (
+                f"mkdir -p {shlex.quote(staging_job_dir)} {shlex.quote(final_dir)} "
+                f"&& chmod 0755 {shlex.quote(final_dir)} "
+                f"&& rm -f -- {q_stage}"
+            )
             self._run(
                 client,
-                f"mkdir -p {shlex.quote(staging_job_dir)} {shlex.quote(final_dir)} "
-                f"&& rm -f -- {q_stage}",
+                prepare,
             )
             proxy_scheme = urlsplit(proxy_url).scheme.lower() if proxy_url else ""
             if proxy_scheme == "socks5":
                 download = (
-                    f"aria2c --split=3 --max-connection-per-server=3 --allow-overwrite=true "
+                    "env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy "
+                    "-u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY "
+                    "-u no_proxy -u NO_PROXY "
+                    f"aria2c --split={axel_connections} "
+                    f"--max-connection-per-server={axel_connections} --allow-overwrite=true "
                     f"--auto-file-renaming=false --file-allocation=none --summary-interval=1 "
                     f"--all-proxy={shlex.quote(proxy_url)} --user-agent={q_ua} "
                     f"--dir={shlex.quote(staging_job_dir)} "
@@ -144,13 +155,23 @@ class RemoteDispatcher:
             elif proxy_url and proxy_scheme in ("http", "https"):
                 safe_proxy = shlex.quote(proxy_url)
                 download = (
+                    "env -u ftp_proxy -u all_proxy -u FTP_PROXY -u ALL_PROXY "
+                    "-u no_proxy -u NO_PROXY "
                     f"http_proxy={safe_proxy} https_proxy={safe_proxy} "
-                    f"axel -n 3 -a -o {q_stage} --user-agent={q_ua} {q_url}"
+                    f"HTTP_PROXY={safe_proxy} HTTPS_PROXY={safe_proxy} "
+                    f"axel -n {axel_connections} -a -o {q_stage} "
+                    f"--user-agent={q_ua} {q_url}"
                 )
             elif proxy_url:
                 raise RuntimeError("Proxy URL scheme must be http, https, or socks5.")
             else:
-                download = f"axel -n 3 -a -o {q_stage} --user-agent={q_ua} {q_url}"
+                download = (
+                    "env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy "
+                    "-u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY "
+                    "-u no_proxy -u NO_PROXY "
+                    f"axel -n {axel_connections} -a -o {q_stage} "
+                    f"--user-agent={q_ua} {q_url}"
+                )
             try:
                 self._run(client, download, on_progress)
                 if on_verifying:
