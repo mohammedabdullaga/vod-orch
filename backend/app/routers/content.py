@@ -6,7 +6,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from app.models import Account, MonitoredCategory, Node, QueueItem, SessionLocal, utc_now
+from app.models import (
+    Account,
+    MonitoredCategory,
+    Node,
+    QueueItem,
+    SessionLocal,
+    StorageRoute,
+    utc_now,
+)
 from app.provider import provider_action, stream_url
 from app.security import encrypt_secret
 from app.services.content_paths import (
@@ -245,11 +253,21 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
     kind = "series" if payload.content_type == "SERIES" else "vod"
     account = _primary_account()
     with SessionLocal() as db:
-        node = db.scalar(select(Node).order_by(Node.id).limit(1))
+        kind = "series" if payload.content_type == "SERIES" else "vod"
+        route = db.get(StorageRoute, kind)
+        node = db.get(Node, route.node_id) if route else None
         if not node:
-            raise HTTPException(status_code=409, detail="Configure a remote storage node before queueing.")
-        if payload.target_node_id not in (None, str(node.id), "series_node"):
-            raise HTTPException(status_code=404, detail="The requested storage node is not configured.")
+            label = "series" if kind == "series" else "movie"
+            raise HTTPException(
+                status_code=409,
+                detail=f"Assign a storage node for {label} content before queueing.",
+            )
+        legacy_target = "series_node" if kind == "series" else "movie_node"
+        if payload.target_node_id not in (None, str(node.id), legacy_target):
+            raise HTTPException(
+                status_code=409,
+                detail="The requested node does not match the configured content-type route.",
+            )
 
         queued: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []

@@ -25,7 +25,17 @@ from app.auth import (
     safe_csrf_match,
     validate_auth_settings,
 )
-from app.models import Account, MonitoredCategory, Node, Proxy, QueueItem, SessionLocal, init_db, utc_now
+from app.models import (
+    Account,
+    MonitoredCategory,
+    Node,
+    Proxy,
+    QueueItem,
+    SessionLocal,
+    StorageRoute,
+    init_db,
+    utc_now,
+)
 from app.provider import provider_action
 from app.security import decrypt_secret, encrypt_secret, mask_secret
 from app.services.dispatcher import RemoteDispatcher
@@ -169,6 +179,7 @@ class CategoryToggle(BaseModel):
 
 
 class SSHSettings(BaseModel):
+    name: str = Field(default="Storage server", min_length=1, max_length=255)
     host: str
     port: int = Field(default=22, ge=1, le=65535)
     username: str
@@ -177,6 +188,11 @@ class SSHSettings(BaseModel):
     watch_path: str
     proxy_id: int | None = None
     test: bool = False
+
+
+class StorageRouting(BaseModel):
+    series_node_id: int | None = Field(default=None, ge=1)
+    movie_node_id: int | None = Field(default=None, ge=1)
 
 
 def _validated_remote_path(
@@ -207,7 +223,7 @@ def _account_json(account: Account) -> dict:
 
 def _node_json(node: Node) -> dict:
     return {
-        "id": str(node.id), "host": node.host, "port": node.port, "username": node.username,
+        "id": node.id, "name": node.name, "host": node.host, "port": node.port, "username": node.username,
         "private_key_path": node.private_key_path, "staging_path": node.staging_path,
         "watch_path": node.watch_path, "proxy_id": node.proxy_id,
         "last_connected_at": node.last_connected_at.isoformat() if node.last_connected_at else None,
@@ -218,10 +234,17 @@ def _node_json(node: Node) -> dict:
 def get_status():
     with SessionLocal() as db:
         counts = dict(db.query(QueueItem.status, func.count(QueueItem.id)).group_by(QueueItem.status).all())
-        node = db.scalar(select(Node).order_by(Node.id).limit(1))
+        routed_nodes = db.scalars(
+            select(Node)
+            .join(StorageRoute, StorageRoute.node_id == Node.id)
+            .distinct()
+        ).all()
         accounts = db.scalar(select(func.count(Account.id)).where(Account.enabled.is_(True))) or 0
-    ssh_connected = bool(node and node.last_connected_at and
-                         (utc_now() - node.last_connected_at.replace(tzinfo=timezone.utc)).total_seconds() < 300)
+    ssh_connected = bool(routed_nodes) and all(
+        node.last_connected_at
+        and (utc_now() - node.last_connected_at.replace(tzinfo=timezone.utc)).total_seconds() < 300
+        for node in routed_nodes
+    )
     return {
         "daemon_running": True, "ssh_connected": ssh_connected, "active_workers": worker_pool.active_count,
         "available_accounts": accounts, "queue": {
@@ -433,16 +456,23 @@ def save_ssh_settings(payload: SSHSettings):
         node = db.scalar(select(Node).order_by(Node.id).limit(1))
         if not node:
             node = Node(
+                name=payload.name,
                 host=payload.host, port=payload.port, username=payload.username,
                 private_key_path=payload.private_key_path, staging_path=staging_path,
                 watch_path=watch_path, proxy_id=payload.proxy_id,
             )
             db.add(node)
         else:
+            node.name = payload.name
             node.host, node.port, node.username = payload.host, payload.port, payload.username
             node.private_key_path = payload.private_key_path
             node.staging_path, node.watch_path = staging_path, watch_path
             node.proxy_id = payload.proxy_id
+        db.flush()
+        for kind in ("series", "vod"):
+            route = db.get(StorageRoute, kind)
+            if route is None:
+                db.add(StorageRoute(kind=kind, node_id=node.id))
         if payload.test:
             try:
                 dispatcher.test_connection(node)
@@ -452,6 +482,116 @@ def save_ssh_settings(payload: SSHSettings):
             node.last_connected_at = datetime.now(timezone.utc)
         db.commit()
         return {"ok": True, **_node_json(node)}
+
+
+@app.get("/api/nodes")
+def list_storage_nodes():
+    with SessionLocal() as db:
+        nodes = db.scalars(select(Node).order_by(Node.id)).all()
+    return [_node_json(node) for node in nodes]
+
+
+@app.post("/api/nodes")
+def add_storage_node(payload: SSHSettings):
+    staging_path = _validated_remote_path(payload.staging_path, "Staging directory")
+    watch_path = _validated_remote_path(payload.watch_path, "Storage root")
+    with SessionLocal() as db:
+        node = Node(
+            name=payload.name,
+            host=payload.host,
+            port=payload.port,
+            username=payload.username,
+            private_key_path=payload.private_key_path,
+            staging_path=staging_path,
+            watch_path=watch_path,
+            proxy_id=payload.proxy_id,
+        )
+        if payload.test:
+            try:
+                dispatcher.test_connection(node)
+            except Exception as exc:
+                logger.exception("SSH connection test failed for new node")
+                raise HTTPException(status_code=502, detail=f"SSH connection failed: {exc}") from exc
+            node.last_connected_at = datetime.now(timezone.utc)
+        db.add(node)
+        db.commit()
+        db.refresh(node)
+        return _node_json(node)
+
+
+@app.put("/api/nodes/{node_id}")
+def update_storage_node(node_id: int, payload: SSHSettings):
+    staging_path = _validated_remote_path(payload.staging_path, "Staging directory")
+    watch_path = _validated_remote_path(payload.watch_path, "Storage root")
+    with SessionLocal() as db:
+        node = db.get(Node, node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Storage node not found.")
+        node.name = payload.name
+        node.host, node.port, node.username = payload.host, payload.port, payload.username
+        node.private_key_path = payload.private_key_path
+        node.staging_path, node.watch_path = staging_path, watch_path
+        node.proxy_id = payload.proxy_id
+        if payload.test:
+            try:
+                dispatcher.test_connection(node)
+            except Exception as exc:
+                logger.exception("SSH connection test failed for node %s", node_id)
+                raise HTTPException(status_code=502, detail=f"SSH connection failed: {exc}") from exc
+            node.last_connected_at = datetime.now(timezone.utc)
+        db.commit()
+        return _node_json(node)
+
+
+@app.delete("/api/nodes/{node_id}")
+def delete_storage_node(node_id: int):
+    with SessionLocal() as db:
+        node = db.get(Node, node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Storage node not found.")
+        assignments = db.scalars(
+            select(StorageRoute).where(StorageRoute.node_id == node_id)
+        ).all()
+        if assignments:
+            kinds = ", ".join("movies" if route.kind == "vod" else "series" for route in assignments)
+            raise HTTPException(
+                status_code=409,
+                detail=f"Reassign {kinds} storage before removing this node.",
+            )
+        db.delete(node)
+        db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/settings/storage-routing")
+def get_storage_routing():
+    with SessionLocal() as db:
+        routes = db.scalars(select(StorageRoute)).all()
+    assignments = {route.kind: route.node_id for route in routes}
+    return {"series_node_id": assignments.get("series"), "movie_node_id": assignments.get("vod")}
+
+
+@app.put("/api/settings/storage-routing")
+def save_storage_routing(payload: StorageRouting):
+    assignments = {"series": payload.series_node_id, "vod": payload.movie_node_id}
+    with SessionLocal() as db:
+        for kind, node_id in assignments.items():
+            route = db.get(StorageRoute, kind)
+            if node_id is not None and not db.get(Node, node_id):
+                raise HTTPException(status_code=404, detail=f"Storage node {node_id} not found.")
+            if node_id is None:
+                if route:
+                    db.delete(route)
+            elif route is None:
+                db.add(StorageRoute(kind=kind, node_id=node_id))
+            else:
+                route.node_id = node_id
+                route.updated_at = utc_now()
+        db.commit()
+    return {
+        "series_node_id": payload.series_node_id,
+        "movie_node_id": payload.movie_node_id,
+    }
 
 
 @app.get("/health")

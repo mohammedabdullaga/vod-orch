@@ -42,7 +42,12 @@ function App() {
   const [categories, setCategories] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [proxies, setProxies] = useState([]);
-  const [ssh, setSsh] = useState({ host: "", port: 22, username: "", private_key_path: "", staging_path: "", watch_path: "" });
+  const [nodes, setNodes] = useState([]);
+  const [routing, setRouting] = useState({ series_node_id: null, movie_node_id: null });
+  const [editingNodeId, setEditingNodeId] = useState(null);
+  const [nodeForm, setNodeForm] = useState({
+    name: "", host: "", port: 22, username: "", private_key_path: "", staging_path: "", watch_path: "",
+  });
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [accountForm, setAccountForm] = useState({ provider_url: "", username: "", password: "", user_agent: "Mozilla/5.0" });
@@ -79,28 +84,26 @@ function App() {
 
   const loadSettings = async () => {
     try {
-      const [a, p, n] = await Promise.all([api.get("/accounts"), api.get("/proxies"), api.get("/settings/ssh")]);
-      setAccounts(a.data); setProxies(p.data); if (n.data) setSsh(n.data);
+      const [a, p, n, r] = await Promise.all([
+        api.get("/accounts"), api.get("/proxies"), api.get("/nodes"), api.get("/settings/storage-routing"),
+      ]);
+      setAccounts(a.data); setProxies(p.data); setNodes(n.data); setRouting(r.data);
     } catch (error) { setNotice(error.response?.data?.detail || "Unable to load settings."); }
   };
   const loadCategories = async () => {
     try {
-      const [categoryResponse, nodeResponse] = await Promise.all([
-        api.get("/categories"), api.get("/settings/ssh"),
-      ]);
+      const categoryResponse = await api.get("/categories");
       setCategories(categoryResponse.data);
-      if (nodeResponse.data) setSsh(nodeResponse.data);
     }
     catch (error) { setNotice(error.response?.data?.detail || "Unable to load categories."); }
   };
   useEffect(() => {
     if (!authenticated) return;
-    if (tab === tabs[1]) {
-      api.get("/settings/ssh")
-        .then(({ data }) => { if (data) setSsh(data); })
-        .catch((error) => setNotice(error.response?.data?.detail || "Unable to load the storage node."));
+    if (tab === tabs[1]) loadSettings();
+    if (tab === tabs[2]) {
+      loadCategories();
+      loadSettings();
     }
-    if (tab === tabs[2]) loadCategories();
     if (tab === tabs[3]) loadSettings();
   }, [authenticated, tab]);
 
@@ -155,13 +158,39 @@ function App() {
     event.preventDefault();
     act(async () => { await api.post("/proxies", { url: proxyUrl }); setProxyUrl(""); await loadSettings(); }, "Proxy added.");
   };
-  const saveSsh = (event, test = false) => {
+  const saveNode = (event, test = false) => {
     event?.preventDefault();
     act(async () => {
-      const response = await api.post("/settings/ssh", { ...ssh, port: Number(ssh.port), test });
-      if (test) setNotice("Remote SSH connection succeeded.");
-      setSsh(response.data);
-    }, test ? "Remote SSH connection succeeded." : "SSH node settings saved.");
+      const payload = { ...nodeForm, port: Number(nodeForm.port), test };
+      const response = editingNodeId
+        ? await api.put(`/nodes/${editingNodeId}`, payload)
+        : await api.post("/nodes", payload);
+      await loadSettings();
+      setEditingNodeId(response.data.id);
+      setNodeForm({ ...response.data, port: Number(response.data.port) });
+    }, test ? "Remote SSH connection succeeded and node saved." : "Storage node saved.");
+  };
+  const editNode = (node) => {
+    setEditingNodeId(node.id);
+    setNodeForm({ ...node, port: Number(node.port) });
+  };
+  const resetNodeForm = () => {
+    setEditingNodeId(null);
+    setNodeForm({ name: "", host: "", port: 22, username: "", private_key_path: "", staging_path: "", watch_path: "" });
+  };
+  const saveRouting = (event) => {
+    event.preventDefault();
+    act(async () => {
+      const response = await api.put("/settings/storage-routing", {
+        series_node_id: routing.series_node_id ? Number(routing.series_node_id) : null,
+        movie_node_id: routing.movie_node_id ? Number(routing.movie_node_id) : null,
+      });
+      setRouting(response.data);
+    }, "Storage routing saved. New and pending jobs will use the assigned server.");
+  };
+  const storageRootForCategory = (category) => {
+    const nodeId = category.kind === "series" ? routing.series_node_id : routing.movie_node_id;
+    return nodes.find((node) => node.id === nodeId)?.watch_path || "";
   };
   const remove = (url, id) => act(async () => { await api.delete(`${url}/${id}`); await loadSettings(); }, "Removed successfully.");
   const testProxy = (id) => act(
@@ -250,11 +279,11 @@ function App() {
           </section>
         </>}
 
-        {tab === tabs[1] && <ContentBrowser api={api} nodeId={ssh.id} onQueued={refresh} />}
+        {tab === tabs[1] && <ContentBrowser api={api} routing={routing} onQueued={refresh} />}
 
         {tab === tabs[2] && <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
           <div className="border-b border-slate-800 px-5 py-4"><h2 className="font-semibold text-white">Category watcher</h2><p className="mt-1 text-xs text-slate-500">Watched items inherit the storage root unless this category has its own remote path. Provider IDs keep same-named shows and movies separate.</p>
-            <p className="mt-2 text-xs text-slate-400">Storage root: <code className="text-indigo-300">{ssh.watch_path || "Configure in Settings & Accounts"}</code></p>
+            <p className="mt-2 text-xs text-slate-400">Series storage: <code className="text-indigo-300">{nodes.find((node) => node.id === routing.series_node_id)?.watch_path || "Unassigned"}</code> · Movies storage: <code className="text-indigo-300">{nodes.find((node) => node.id === routing.movie_node_id)?.watch_path || "Unassigned"}</code></p>
           </div>
           <div className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-3">{categories.map((category) => <div key={`${category.kind}-${category.category_id}`} className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
             <div className="flex items-center justify-between gap-3">
@@ -267,7 +296,7 @@ function App() {
                 item.category_id === category.category_id && item.kind === category.kind
                   ? { ...item, destination_path: event.target.value }
                   : item
-              ))} placeholder={ssh.watch_path ? `${ssh.watch_path} (inherit default)` : "/storage/library"} className="field" />
+              ))} placeholder={storageRootForCategory(category) ? `${storageRootForCategory(category)} (inherit assigned server)` : "No storage server assigned"} className="field" />
               <button disabled={busy} className="secondary w-full">Save path · blank uses root</button>
             </form>
           </div>)}{!categories.length && <div className="col-span-full py-12 text-center text-sm text-slate-500">Add an enabled provider account to load categories.</div>}</div>
@@ -292,14 +321,43 @@ function App() {
             </div>
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320] lg:col-span-2">
-            <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Server size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Remote storage node</h2><p className="text-xs text-slate-500">SSH key authentication; host keys must be trusted on the daemon</p></div></div>
-            <form onSubmit={(event) => saveSsh(event)} className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-3">
-              {[
-                ["host", "SSH host"], ["port", "Port"], ["username", "SSH username"],
-                ["private_key_path", "Private key path on daemon"], ["staging_path", "Remote staging directory"], ["watch_path", "Default storage root on remote server"],
-              ].map(([key, placeholder]) => <input key={key} required placeholder={placeholder} type={key === "port" ? "number" : "text"} value={ssh[key] ?? ""} onChange={(e) => setSsh({ ...ssh, [key]: e.target.value })} className="field" />)}
-              <div className="flex flex-wrap gap-2 sm:col-span-2 lg:col-span-3"><button disabled={busy} className="primary"><Settings2 size={15} />Save node</button><button type="button" disabled={busy} onClick={(event) => saveSsh(event, true)} className="secondary"><Wifi size={15} />Test connection &amp; save</button></div>
-            </form>
+            <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Server size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Storage servers &amp; routing</h2><p className="text-xs text-slate-500">Movies and series are assigned independently. SSH host keys must be trusted on the daemon.</p></div></div>
+            <div className="grid gap-5 p-5 lg:grid-cols-2">
+              <form onSubmit={saveRouting} className="space-y-3 rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+                <h3 className="text-sm font-medium text-slate-200">Content routing</h3>
+                <label className="block text-xs text-slate-400">Series storage server
+                  <select value={routing.series_node_id ?? ""} onChange={(event) => setRouting({ ...routing, series_node_id: event.target.value ? Number(event.target.value) : null })} className="field mt-2">
+                    <option value="">Not assigned</option>{nodes.map((node) => <option key={node.id} value={node.id}>{node.name} · {node.host}</option>)}
+                  </select>
+                </label>
+                <label className="block text-xs text-slate-400">Movies storage server
+                  <select value={routing.movie_node_id ?? ""} onChange={(event) => setRouting({ ...routing, movie_node_id: event.target.value ? Number(event.target.value) : null })} className="field mt-2">
+                    <option value="">Not assigned</option>{nodes.map((node) => <option key={node.id} value={node.id}>{node.name} · {node.host}</option>)}
+                  </select>
+                </label>
+                <button disabled={busy} className="primary"><Settings2 size={15} />Save routing</button>
+              </form>
+              <div className="space-y-3">
+                <h3 className="text-sm font-medium text-slate-200">Configured servers ({nodes.length})</h3>
+                {nodes.map((node) => <div key={node.id} className="flex items-center justify-between gap-3 rounded-lg bg-slate-900/70 px-3 py-3">
+                  <div className="min-w-0"><div className="truncate text-sm text-slate-200">{node.name}</div><div className="truncate text-xs text-slate-500">{node.username}@{node.host}:{node.port} · {node.watch_path}</div><div className="mt-1 text-[10px] text-indigo-300">{[routing.series_node_id === node.id && "Series", routing.movie_node_id === node.id && "Movies"].filter(Boolean).join(" · ") || "Not assigned"}</div></div>
+                  <div className="flex shrink-0 items-center"><button onClick={() => editNode(node)} className="px-2 text-xs text-indigo-300 hover:text-indigo-200">Edit</button><button onClick={() => remove("/nodes", node.id)} className="p-2 text-slate-500 hover:text-rose-300" aria-label={`Remove ${node.name}`}><Trash2 size={15} /></button></div>
+                </div>)}
+                {!nodes.length && <p className="rounded-lg border border-dashed border-slate-700 px-3 py-6 text-center text-xs text-slate-500">Add a storage server, then assign it to Movies, Series, or both.</p>}
+              </div>
+              <form onSubmit={(event) => saveNode(event)} className="grid gap-3 border-t border-slate-800 pt-5 sm:grid-cols-2 lg:col-span-2 lg:grid-cols-3">
+                <h3 className="text-sm font-medium text-slate-200 sm:col-span-2 lg:col-span-3">{editingNodeId ? `Edit storage server #${editingNodeId}` : "Add storage server"}</h3>
+                {[
+                  ["name", "Server name"], ["host", "SSH host"], ["port", "Port"], ["username", "SSH username"],
+                  ["private_key_path", "Private key path on daemon"], ["staging_path", "Remote staging directory"], ["watch_path", "Storage root on this server"],
+                ].map(([key, placeholder]) => <input key={key} required placeholder={placeholder} type={key === "port" ? "number" : "text"} value={nodeForm[key] ?? ""} onChange={(event) => setNodeForm({ ...nodeForm, [key]: event.target.value })} className="field" />)}
+                <div className="flex flex-wrap gap-2 sm:col-span-2 lg:col-span-3">
+                  <button disabled={busy} className="primary"><Plus size={15} />{editingNodeId ? "Save server" : "Add server"}</button>
+                  <button type="button" disabled={busy} onClick={(event) => saveNode(event, true)} className="secondary"><Wifi size={15} />Test connection &amp; save</button>
+                  {editingNodeId && <button type="button" onClick={resetNodeForm} className="secondary">Cancel edit</button>}
+                </div>
+              </form>
+            </div>
           </section>
         </div>}
       </main>

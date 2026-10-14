@@ -14,7 +14,7 @@ function episodeFilename(season, number, extension) {
   return `S${String(season || 0).padStart(2, "0")}E${String(number || 0).padStart(2, "0")}.${extension}`;
 }
 
-export default function ContentBrowser({ api, nodeId, onQueued }) {
+export default function ContentBrowser({ api, routing, onQueued }) {
   const [type, setType] = useState("series");
   const [categories, setCategories] = useState([]);
   const [selectedCategories, setSelectedCategories] = useState(new Set());
@@ -47,6 +47,8 @@ export default function ContentBrowser({ api, nodeId, onQueued }) {
   const visibleItems = useMemo(() => items.filter((item) =>
     `${item.name} ${item.category_name}`.toLocaleLowerCase().includes(itemSearch.toLocaleLowerCase())
   ), [items, itemSearch]);
+  const nodeId = type === "series" ? routing?.series_node_id : routing?.movie_node_id;
+  const nodeLabel = type === "series" ? "Series" : "Movies";
 
   const toggleCategorySelection = (categoryId) => {
     setSelectedCategories((current) => {
@@ -139,7 +141,7 @@ export default function ContentBrowser({ api, nodeId, onQueued }) {
 
   const queueEntries = async (entries) => {
     if (!nodeId) {
-      setNotice("Configure a remote storage node before adding downloads.");
+      setNotice(`Assign a storage server for ${nodeLabel} in Settings & Accounts before adding downloads.`);
       return;
     }
     if (!entries.length) {
@@ -154,7 +156,7 @@ export default function ContentBrowser({ api, nodeId, onQueued }) {
       for (let start = 0; start < entries.length; start += 500) {
         const { data } = await api.post("/queue/manual-batch", {
           content_type: type === "series" ? "SERIES" : "MOVIE",
-          target_node_id: nodeId,
+          target_node_id: String(nodeId),
           items: entries.slice(start, start + 500),
         });
         queued += data.queued_count;
@@ -263,7 +265,7 @@ export default function ContentBrowser({ api, nodeId, onQueued }) {
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div>
             <h2 className="font-semibold text-white">Browse &amp; Ingest</h2>
-            <p className="mt-1 text-xs text-slate-500">Explore provider content and queue specific titles or episodes.</p>
+            <p className="mt-1 text-xs text-slate-500">Explore provider content and queue specific titles or episodes. {nodeId ? `${nodeLabel} will be sent to storage server #${nodeId}.` : `No ${nodeLabel.toLowerCase()} storage server is assigned.`}</p>
           </div>
           <div className="inline-flex rounded-lg border border-slate-700 bg-slate-900 p-1">
             {["series", "movie"].map((mediaType) => (

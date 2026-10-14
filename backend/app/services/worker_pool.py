@@ -5,7 +5,16 @@ from datetime import timedelta
 from sqlalchemy import select, update
 
 from app.config import settings
-from app.models import Account, MonitoredCategory, Node, Proxy, QueueItem, SessionLocal, utc_now
+from app.models import (
+    Account,
+    MonitoredCategory,
+    Node,
+    Proxy,
+    QueueItem,
+    SessionLocal,
+    StorageRoute,
+    utc_now,
+)
 from app.security import decrypt_secret
 from app.services.dispatcher import RemoteDispatcher
 
@@ -95,6 +104,7 @@ class WorkerPool:
                 .where(
                     QueueItem.status == "PENDING",
                     (QueueItem.account_id.is_(None) | (QueueItem.account_id == account_id)),
+                    QueueItem.kind.in_(select(StorageRoute.kind)),
                 )
                 .order_by(QueueItem.created_at, QueueItem.id)
                 .limit(1)
@@ -136,7 +146,8 @@ class WorkerPool:
         with SessionLocal() as db:
             item = db.get(QueueItem, item_id)
             account = db.get(Account, account_id)
-            node = db.scalar(select(Node).order_by(Node.id).limit(1))
+            route = db.get(StorageRoute, item.kind) if item else None
+            node = db.get(Node, route.node_id) if route else None
             category = db.scalar(
                 select(MonitoredCategory).where(
                     MonitoredCategory.kind == item.kind,
@@ -147,7 +158,11 @@ class WorkerPool:
                 select(Proxy).where(Proxy.enabled.is_(True)).order_by(Proxy.id)
             ).all()
             if not item or not account or not node:
-                self._fail(item_id, "Account or remote storage node is not configured.")
+                content_type = "series" if item and item.kind == "series" else "movie"
+                self._fail(
+                    item_id,
+                    f"Account or {content_type} storage node is not configured.",
+                )
                 return
             stream_url, file_name = decrypt_secret(item.stream_url_encrypted), item.file_name
             user_agent = account.user_agent

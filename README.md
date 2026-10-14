@@ -10,7 +10,7 @@ Use this software only with media you own or are authorized to access, and with 
 backend/
   app/
     main.py                 FastAPI routes and service lifecycle
-    models.py               SQLite / SQLAlchemy models
+    models.py               SQLite / SQLAlchemy models and storage-type routing
     config.py               Environment configuration
     security.py             Fernet encryption and secret masking
     provider.py             Provider API and stream URL adapter
@@ -62,9 +62,11 @@ Use a unique administrator password and protect `.env` with mode `0600`. In prod
 
 ## Storage paths and content organization
 
-In **Settings & Accounts → Remote storage node**, set the remote **staging directory** and **default storage root** (absolute Linux paths, such as `/srv/media/staging` and `/srv/media/library`). Use **Test connection & save** to create/verify those directories and check write access. Staging and each final destination must be on the same filesystem for atomic promotion.
+In **Settings & Accounts → Storage servers & routing**, add each remote server with its own SSH credentials, remote **staging directory**, and **storage root** (absolute Linux paths, such as `/srv/media/staging` and `/srv/media/library`). Use **Test connection & save** to verify the connection and writable directories. Staging and each final destination must be on the same filesystem for atomic promotion. Assign one server to **Series** and one to **Movies**; either server may be assigned to both types.
 
-Each watched category can inherit the default root (leave its override blank) or set a category-specific absolute remote path in **Category Watcher**. Category and default roots are read when each queued job starts, so changing them routes pending/retried jobs to the new path; already-running and completed jobs are not moved automatically. Category paths must be absolute Linux paths, cannot be `/` or contain `..`, and are created remotely as needed.
+Existing single-server installations are migrated automatically: the existing server is assigned to both Movies and Series. Add the second server and update the two assignments in the dashboard. A node cannot be removed while it is assigned; reassign or clear its content routes first. Pending jobs use the current assignment when a worker starts them.
+
+Each watched category can inherit its assigned server's storage root (leave its override blank) or set a category-specific absolute remote path in **Category Watcher**. Category and server roots are read when each queued job starts, so changing them routes pending/retried jobs to the new path; already-running and completed jobs are not moved automatically. Category paths must be absolute Linux paths, cannot be `/` or contain `..`, and are created on the assigned server as needed. Jobs with no server assigned remain pending until a route is configured.
 
 The dispatcher does not match items by title alone. It sanitizes names and uses the provider's stable IDs and metadata to create paths like:
 
@@ -251,7 +253,9 @@ If the dashboard and API are served from different browser origins, set `CORS_OR
 | `GET` / `POST` / `DELETE` | `/api/accounts` | Provider account management |
 | `GET` / `POST` / `DELETE` | `/api/proxies` | Proxy pool management |
 | `POST` | `/api/proxies/{proxy_id}/test` | Test proxy IP and latency |
-| `GET` / `POST` | `/api/settings/ssh` | Read/save SSH node and optionally test connection |
+| `GET` / `POST` | `/api/settings/ssh` | Legacy single-node settings compatibility |
+| `GET` / `POST` / `PUT` / `DELETE` | `/api/nodes` | List, add, update, or remove storage servers |
+| `GET` / `PUT` | `/api/settings/storage-routing` | Assign Series and Movies to their storage server |
 
 The interactive OpenAPI documentation is at `/docs` on the API origin; keep it behind the same access controls as the API.
 

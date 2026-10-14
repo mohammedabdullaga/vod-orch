@@ -110,6 +110,7 @@ class Node(Base):
     __tablename__ = "nodes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), default="Storage server")
     host: Mapped[str] = mapped_column(String(512))
     port: Mapped[int] = mapped_column(Integer, default=22)
     username: Mapped[str] = mapped_column(String(255))
@@ -121,6 +122,18 @@ class Node(Base):
     )
     last_connected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class StorageRoute(Base):
+    __tablename__ = "storage_routes"
+
+    kind: Mapped[str] = mapped_column(String(16), primary_key=True)
+    node_id: Mapped[int] = mapped_column(
+        ForeignKey("nodes.id", ondelete="CASCADE"), index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
 
 
 def init_db() -> None:
@@ -136,6 +149,9 @@ def init_db() -> None:
                 "category_name": "VARCHAR(512)",
                 "series_id": "VARCHAR(512)",
             },
+            "nodes": {
+                "name": "VARCHAR(255) NOT NULL DEFAULT 'Storage server'",
+            },
         }
         inspector = inspect(connection)
         for table_name, columns in migrations.items():
@@ -145,3 +161,13 @@ def init_db() -> None:
                     connection.exec_driver_sql(
                         f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
                     )
+        legacy_node = connection.exec_driver_sql(
+            "SELECT id FROM nodes ORDER BY id LIMIT 1"
+        ).first()
+        if legacy_node:
+            for kind in ("series", "vod"):
+                connection.exec_driver_sql(
+                    "INSERT OR IGNORE INTO storage_routes (kind, node_id, updated_at) "
+                    "VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    (kind, legacy_node[0]),
+                )
