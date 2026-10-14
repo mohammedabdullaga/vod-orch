@@ -249,7 +249,10 @@ class ManualQueueItem(BaseModel):
 class ManualBatchRequest(BaseModel):
     content_type: Literal["SERIES", "MOVIE"]
     target_node_id: str | None = Field(default=None, max_length=64)
-    items: list[ManualQueueItem] = Field(min_length=1, max_length=500)
+    account_ids: list[int] | None = Field(default=None, min_length=1, max_length=100)
+    proxy_mode: Literal["node", "direct"] | None = None
+    account_offset: int = Field(default=0, ge=0)
+    items: list[ManualQueueItem] = Field(min_length=1, max_length=5000)
 
 
 @queue_router.post("/manual-batch")
@@ -272,10 +275,45 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                 status_code=409,
                 detail="The requested node does not match the configured content-type route.",
             )
+        selected_accounts: list[Account] = []
+        if payload.account_ids is not None:
+            if len(set(payload.account_ids)) != len(payload.account_ids):
+                raise HTTPException(status_code=422, detail="Selected account IDs must be unique.")
+            selected_accounts = db.scalars(
+                select(Account).where(
+                    Account.id.in_(payload.account_ids),
+                    Account.enabled.is_(True),
+                    Account.provider_url == account.provider_url,
+                ).order_by(Account.id)
+            ).all()
+            if len(selected_accounts) != len(payload.account_ids):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Selected accounts must be enabled and use the content provider endpoint.",
+                )
+            busy_ids = set(db.scalars(
+                select(QueueItem.account_id).where(
+                    QueueItem.account_id.in_(payload.account_ids),
+                    QueueItem.status.in_(("PENDING", "DOWNLOADING", "VERIFYING")),
+                ).distinct()
+            ).all())
+            if busy_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail="One or more selected accounts already have queued or active work. Refresh account availability.",
+                )
+        if payload.proxy_mode == "node":
+            proxy = db.get(Proxy, node.proxy_id) if node.proxy_id else None
+            if not proxy or not proxy.enabled:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The routed storage server has no enabled proxy. Choose direct connection.",
+                )
 
         queued: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         seen: set[str] = set()
+        assigned_count = 0
         for entry in payload.items:
             identity = stream_identity(account.provider_url, kind, entry.stream_id)
             if identity in seen:
@@ -330,14 +368,19 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                 "category_id": entry.category_id,
                 "category_name": category_name,
                 "series_id": entry.series_id,
+                "proxy_mode": payload.proxy_mode,
                 "stream_url_encrypted": encrypt_secret(
                     stream_url(account, kind, entry.stream_id, extension)
                 ),
                 "file_name": file_name,
+                "final_path": None,
                 "series_title": series_name,
                 "season": season,
                 "episode": episode,
-                "account_id": account.id,
+                "account_id": (
+                    selected_accounts[(payload.account_offset + assigned_count) % len(selected_accounts)].id
+                    if selected_accounts else None
+                ),
                 "status": "PENDING",
                 "progress": 0,
                 "error": None,
@@ -352,6 +395,7 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
             else:
                 db.add(QueueItem(**item_values, created_at=utc_now()))
             queued.append({"stream_id": entry.stream_id, "title": entry.title})
+            assigned_count += 1
 
         try:
             db.commit()
@@ -366,8 +410,6 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
     if queued:
         request.app.state.worker_pool.wake()
     return {"queued": queued, "skipped": skipped, "queued_count": len(queued)}
-
-
 def _integer_or_none(value: Any) -> int | None:
     try:
         parsed = int(value)

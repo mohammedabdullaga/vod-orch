@@ -25,6 +25,11 @@ export default function ContentBrowser({ api, routing, onQueued }) {
   const [itemSearch, setItemSearch] = useState("");
   const [details, setDetails] = useState(null);
   const [selectedEpisodes, setSelectedEpisodes] = useState(new Map());
+  const [pendingQueue, setPendingQueue] = useState(null);
+  const [availableAccounts, setAvailableAccounts] = useState([]);
+  const [selectedWorkerIds, setSelectedWorkerIds] = useState(new Set());
+  const [proxyAvailable, setProxyAvailable] = useState(false);
+  const [proxyMode, setProxyMode] = useState("direct");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
 
@@ -167,24 +172,63 @@ export default function ContentBrowser({ api, routing, onQueued }) {
     setBusy(true);
     setNotice("");
     try {
-      let queued = 0;
-      let skipped = 0;
-      for (let start = 0; start < entries.length; start += 500) {
-        const { data } = await api.post("/queue/manual-batch", {
-          content_type: type === "series" ? "SERIES" : "MOVIE",
-          target_node_id: String(nodeId),
-          items: entries.slice(start, start + 500),
-        });
-        queued += data.queued_count;
-        skipped += data.skipped.length;
+      const { data } = await api.get("/accounts/availability", {
+        params: { content_type: type === "series" ? "SERIES" : "MOVIE" },
+      });
+      const free = data.accounts.filter((account) => account.free);
+      if (!free.length) {
+        setNotice("No idle accounts are available for this provider. Wait for current downloads or add an account.");
+        return;
       }
-      setNotice(`Queued ${queued} item${queued === 1 ? "" : "s"}; skipped ${skipped} duplicate${skipped === 1 ? "" : "s"}.`);
-      onQueued?.();
+      setPendingQueue(entries);
+      setAvailableAccounts(free);
+      setSelectedWorkerIds(new Set(free.map((account) => account.id)));
+      setProxyAvailable(data.proxy_available);
+      setProxyMode(data.proxy_available ? "node" : "direct");
     } catch (error) {
-      setNotice(error.response?.data?.detail || "Could not queue selected content.");
+      setNotice(error.response?.data?.detail || "Could not check free provider accounts.");
     } finally {
       setBusy(false);
     }
+  };
+
+  const confirmQueueEntries = async () => {
+    if (!pendingQueue?.length || !selectedWorkerIds.size) {
+      setNotice("Choose at least one free provider account.");
+      return;
+    }
+    setBusy(true);
+    setNotice("");
+    try {
+      let queued = 0;
+      let skipped = 0;
+      const accountIds = [...selectedWorkerIds];
+      const { data } = await api.post("/queue/manual-batch", {
+        content_type: type === "series" ? "SERIES" : "MOVIE",
+        target_node_id: String(nodeId),
+        account_ids: accountIds,
+        proxy_mode: proxyMode,
+        items: pendingQueue,
+      });
+      queued = data.queued_count;
+      skipped = data.skipped.length;
+      setNotice(`Queued ${queued} item${queued === 1 ? "" : "s"}; skipped ${skipped} duplicate${skipped === 1 ? "" : "s"}.`);
+      setPendingQueue(null);
+      onQueued?.();
+    } catch (error) {
+      setNotice(error.response?.data?.detail || "Could not queue downloads. Refresh free account availability and retry.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleWorker = (accountId) => {
+    setSelectedWorkerIds((current) => {
+      const next = new Set(current);
+      if (next.has(accountId)) next.delete(accountId);
+      else next.add(accountId);
+      return next;
+    });
   };
 
   const detailsEntries = (item, data) => Object.entries(data.seasons || {}).flatMap(([seasonKey, episodes]) =>
@@ -498,6 +542,55 @@ export default function ContentBrowser({ api, routing, onQueued }) {
             </button>
           </footer>
         </div>
+      </div>}
+      {pendingQueue && <div role="dialog" aria-modal="true" aria-labelledby="queue-confirm-title" className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4">
+        <section className="w-full max-w-xl rounded-2xl border border-slate-700 bg-[#0d1320] shadow-2xl">
+          <header className="flex items-start justify-between gap-4 border-b border-slate-800 px-5 py-4">
+            <div><h2 id="queue-confirm-title" className="font-semibold text-white">Confirm download assignment</h2><p className="mt-1 text-xs text-slate-400">{pendingQueue.length} item{pendingQueue.length === 1 ? "" : "s"} will be queued across the free accounts you select.</p></div>
+            <button type="button" onClick={() => setPendingQueue(null)} disabled={busy} aria-label="Cancel queue confirmation" className="rounded-lg p-2 text-slate-400 hover:bg-slate-800"><X size={16} /></button>
+          </header>
+          <div className="space-y-5 p-5">
+            <div>
+              <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-medium text-slate-200">Idle Xtream accounts</h3><span className="text-xs text-slate-500">{selectedWorkerIds.size} selected</span></div>
+              <p className="mb-3 text-xs text-slate-500">Jobs are distributed round-robin. Each account runs at most one download at a time; selecting more free accounts increases parallel downloads.</p>
+              <div className="max-h-48 space-y-2 overflow-y-auto">
+                {availableAccounts.map((account) => {
+                  const sortedWorkers = [...selectedWorkerIds].sort((left, right) => left - right);
+                  const assignedCount = [...pendingQueue.keys()].filter((index) =>
+                    index % Math.max(1, sortedWorkers.length) === sortedWorkers.indexOf(account.id)
+                  ).length;
+                  return <label key={account.id} className="flex cursor-pointer items-center gap-3 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2.5">
+                    <input type="checkbox" checked={selectedWorkerIds.has(account.id)} onChange={() => toggleWorker(account.id)} className="accent-indigo-500" />
+                    <span className="min-w-0 flex-1"><span className="block text-sm text-slate-200">{account.username}</span><span className="block truncate text-[10px] text-slate-500">{account.provider_url}</span></span>
+                    <span className="text-[10px] text-emerald-300">Free</span>
+                    {selectedWorkerIds.has(account.id) && <span className="text-[10px] text-slate-400">~{assignedCount} jobs</span>}
+                  </label>;
+                })}
+              </div>
+            </div>
+            <fieldset>
+              <legend className="mb-2 text-sm font-medium text-slate-200">Connection mode</legend>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <label className={`cursor-pointer rounded-lg border px-3 py-3 ${proxyMode === "direct" ? "border-indigo-500 bg-indigo-950/30" : "border-slate-800 bg-slate-900/50"}`}>
+                  <input type="radio" name="queue-proxy-mode" value="direct" checked={proxyMode === "direct"} onChange={() => setProxyMode("direct")} className="mr-2 accent-indigo-500" />
+                  <span className="text-sm text-slate-200">Direct · no proxy</span>
+                </label>
+                <label className={`cursor-pointer rounded-lg border px-3 py-3 ${proxyMode === "node" ? "border-indigo-500 bg-indigo-950/30" : "border-slate-800 bg-slate-900/50"} ${!proxyAvailable ? "cursor-not-allowed opacity-40" : ""}`}>
+                  <input type="radio" name="queue-proxy-mode" value="node" checked={proxyMode === "node"} disabled={!proxyAvailable} onChange={() => setProxyMode("node")} className="mr-2 accent-indigo-500" />
+                  <span className="text-sm text-slate-200">Use storage server proxy</span>
+                </label>
+              </div>
+              {!proxyAvailable && <p className="mt-2 text-xs text-slate-500">No enabled proxy is assigned to the routed storage server.</p>}
+            </fieldset>
+          </div>
+          <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 px-5 py-4">
+            <button type="button" onClick={() => setPendingQueue(null)} disabled={busy} className="rounded-lg border border-slate-700 px-4 py-2.5 text-sm text-slate-300 hover:bg-slate-800">Cancel</button>
+            <button type="button" onClick={confirmQueueEntries} disabled={busy || !selectedWorkerIds.size} className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">
+              {busy ? <LoaderCircle size={15} className="animate-spin" /> : <Download size={15} />}
+              Confirm &amp; queue {pendingQueue.length} downloads
+            </button>
+          </footer>
+        </section>
       </div>}
       {busy && <span className="sr-only" role="status">Loading content</span>}
     </section>

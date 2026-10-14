@@ -1,5 +1,6 @@
 import re
 import shlex
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -15,6 +16,10 @@ from app.security import decrypt_secret
 @dataclass(frozen=True)
 class DispatchResult:
     final_path: str
+
+
+class DispatchCancelled(Exception):
+    pass
 
 
 class RemoteDispatcher:
@@ -50,6 +55,8 @@ class RemoteDispatcher:
         client: paramiko.SSHClient,
         command: str,
         progress: Callable[[float], None] | None = None,
+        cancel_event: threading.Event | None = None,
+        cancel_remote: Callable[[], None] | None = None,
     ) -> str:
         _stdin, stdout, stderr = client.exec_command(command, get_pty=False)
         channel = stdout.channel
@@ -57,6 +64,13 @@ class RemoteDispatcher:
         error_output = bytearray()
         started = time.monotonic()
         while not channel.exit_status_ready():
+            if cancel_event and cancel_event.is_set():
+                try:
+                    if cancel_remote:
+                        cancel_remote()
+                finally:
+                    channel.close()
+                raise DispatchCancelled("Download cancelled by request.")
             if time.monotonic() - started > self.command_timeout_seconds:
                 channel.close()
                 raise TimeoutError(
@@ -109,7 +123,8 @@ class RemoteDispatcher:
         destination_root: str | None = None,
         on_progress: Callable[[float], None] | None = None,
         on_verifying: Callable[[], None] | None = None,
-        axel_connections: int = 4,
+        axel_connections: int = 12,
+        cancel_event: threading.Event | None = None,
     ) -> DispatchResult:
         if not 1 <= axel_connections <= 12:
             raise ValueError("Axel connections must be between 1 and 12.")
@@ -133,11 +148,14 @@ class RemoteDispatcher:
         q_url = shlex.quote(stream_url)
         q_ua = shlex.quote(user_agent)
         client = self._connect(node)
+        pid_file = f"{staging_file}.pid"
         try:
+            if cancel_event and cancel_event.is_set():
+                raise DispatchCancelled("Download cancelled before it started.")
             prepare = (
                 f"mkdir -p {shlex.quote(staging_job_dir)} {shlex.quote(final_dir)} "
                 f"&& chmod 0755 {shlex.quote(final_dir)} "
-                f"&& rm -f -- {q_stage}"
+                f"&& rm -f -- {q_stage} {shlex.quote(pid_file)}"
             )
             self._run(
                 client,
@@ -176,10 +194,24 @@ class RemoteDispatcher:
                     f"axel -n {axel_connections} -a -o {q_stage} "
                     f"--user-agent={q_ua} {q_url}"
                 )
+            remote_download = (
+                f"setsid sh -c {shlex.quote(download)} & child=$!; "
+                f"printf '%s\\n' \"$child\" > {shlex.quote(pid_file)}; wait \"$child\""
+            )
             try:
-                self._run(client, download, on_progress)
+                self._run(
+                    client,
+                    remote_download,
+                    on_progress,
+                    cancel_event,
+                    lambda: self._terminate_remote_process(node, pid_file),
+                )
+                if cancel_event and cancel_event.is_set():
+                    raise DispatchCancelled("Download cancelled by request.")
                 if on_verifying:
                     on_verifying()
+                if cancel_event and cancel_event.is_set():
+                    raise DispatchCancelled("Download cancelled by request.")
                 probe = (
                     "ffprobe -v error -select_streams v:0 "
                     "-show_entries stream=codec_name "
@@ -188,6 +220,8 @@ class RemoteDispatcher:
                 )
                 if not self._run(client, probe).strip():
                     raise RuntimeError("ffprobe found no video codec in the downloaded stream.")
+                if cancel_event and cancel_event.is_set():
+                    raise DispatchCancelled("Download cancelled by request.")
                 same_filesystem = (
                     f"test -w {shlex.quote(final_dir)} && "
                     f"test -w {shlex.quote(staging_job_dir)} && "
@@ -195,7 +229,10 @@ class RemoteDispatcher:
                     f"\"$(stat -c %d {shlex.quote(final_dir)})\" ]"
                 )
                 self._run(client, same_filesystem)
-                move = f"mv -Tn -- {q_stage} {shlex.quote(final_path)} && test ! -e {q_stage}"
+                move = (
+                    f"mv -Tn -- {q_stage} {shlex.quote(final_path)} "
+                    f"&& rm -f -- {shlex.quote(pid_file)} && test ! -e {q_stage}"
+                )
                 self._run(client, move)
                 self._run(client, f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}")
                 return DispatchResult(final_path=final_path)
@@ -203,7 +240,7 @@ class RemoteDispatcher:
                 try:
                     self._run(
                         client,
-                        f"rm -f -- {q_stage} && "
+                        f"rm -f -- {q_stage} {shlex.quote(pid_file)} && "
                         f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}",
                     )
                 except Exception as first_cleanup_error:
@@ -212,7 +249,7 @@ class RemoteDispatcher:
                         cleanup_client = self._connect(node)
                         self._run(
                             cleanup_client,
-                            f"rm -f -- {q_stage} && "
+                            f"rm -f -- {q_stage} {shlex.quote(pid_file)} && "
                             f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}",
                         )
                     except Exception as reconnect_cleanup_error:
@@ -224,5 +261,21 @@ class RemoteDispatcher:
                         if cleanup_client:
                             cleanup_client.close()
                 raise
+        finally:
+            client.close()
+
+    def _terminate_remote_process(self, node: Node, pid_file: str) -> None:
+        client = self._connect(node)
+        try:
+            q_pid_file = shlex.quote(pid_file)
+            command = (
+                "for attempt in 1 2 3 4 5 6 7 8 9 10; do "
+                f"if [ -s {q_pid_file} ]; then break; fi; sleep 0.1; done; "
+                f"if [ -s {q_pid_file} ]; then pid=$(cat -- {q_pid_file}); "
+                "kill -TERM -- \"-$pid\" 2>/dev/null || true; sleep 1; "
+                "kill -KILL -- \"-$pid\" 2>/dev/null || true; "
+                "if kill -0 -- \"-$pid\" 2>/dev/null; then exit 1; fi; fi"
+            )
+            self._run(client, command)
         finally:
             client.close()

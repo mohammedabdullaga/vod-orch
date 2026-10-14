@@ -89,9 +89,11 @@ class QueueItem(Base):
     category_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     category_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
     source_provider_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    proxy_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
     series_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     stream_url_encrypted: Mapped[str] = mapped_column(Text)
     file_name: Mapped[str] = mapped_column(String(1024))
+    final_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     series_title: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     season: Mapped[int | None] = mapped_column(Integer, nullable=True)
     episode: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -118,7 +120,7 @@ class Node(Base):
     private_key_path: Mapped[str] = mapped_column(Text)
     staging_path: Mapped[str] = mapped_column(Text)
     watch_path: Mapped[str] = mapped_column(Text)
-    axel_connections: Mapped[int] = mapped_column(Integer, default=4)
+    axel_connections: Mapped[int] = mapped_column(Integer, default=12)
     proxy_id: Mapped[int | None] = mapped_column(
         ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True
     )
@@ -150,11 +152,13 @@ def init_db() -> None:
                 "category_id": "VARCHAR(255)",
                 "category_name": "VARCHAR(512)",
                 "source_provider_url": "VARCHAR(2048)",
+                "proxy_mode": "VARCHAR(16)",
                 "series_id": "VARCHAR(512)",
+                "final_path": "TEXT",
             },
             "nodes": {
                 "name": "VARCHAR(255) NOT NULL DEFAULT 'Storage server'",
-                "axel_connections": "INTEGER NOT NULL DEFAULT 4",
+                "axel_connections": "INTEGER NOT NULL DEFAULT 12",
             },
         }
         inspector = inspect(connection)
@@ -165,6 +169,23 @@ def init_db() -> None:
                     connection.exec_driver_sql(
                         f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
                     )
+        connection.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(version VARCHAR(128) PRIMARY KEY, applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        axel_migration = "default-axel-connections-12"
+        already_applied = connection.exec_driver_sql(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            (axel_migration,),
+        ).first()
+        if not already_applied:
+            connection.exec_driver_sql(
+                "UPDATE nodes SET axel_connections = 12 WHERE axel_connections = 4"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO schema_migrations (version) VALUES (?)",
+                (axel_migration,),
+            )
         legacy_node = connection.exec_driver_sql(
             "SELECT id FROM nodes ORDER BY id LIMIT 1"
         ).first()

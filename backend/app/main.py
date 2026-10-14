@@ -191,7 +191,7 @@ class SSHSettings(BaseModel):
     staging_path: str
     watch_path: str
     proxy_id: int | None = Field(default=None, ge=1)
-    axel_connections: int = Field(default=4, ge=1, le=12)
+    axel_connections: int = Field(default=12, ge=1, le=12)
     test: bool = False
 
 
@@ -330,6 +330,7 @@ def get_queue():
         "series_id": item.series_id,
         "series_title": item.series_title, "season": item.season, "episode": item.episode,
         "status": item.status, "progress": item.progress, "account": username,
+        "final_path": item.final_path,
         "error": item.error, "retries": item.retries,
     } for item, username in rows]
 
@@ -356,10 +357,69 @@ def retry_item(payload: RetryRequest):
     return {"ok": True}
 
 
+@app.post("/api/queue/{item_id}/cancel")
+def cancel_queue_item(item_id: int):
+    try:
+        status = worker_pool.cancel(item_id)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if detail == "Queue item not found." else 409
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    return {"ok": True, "status": status}
+
+
 @app.get("/api/accounts")
 def list_accounts():
     with SessionLocal() as db:
         return [_account_json(item) for item in db.scalars(select(Account).order_by(Account.id)).all()]
+
+
+@app.get("/api/accounts/availability")
+def get_account_availability(content_type: Literal["SERIES", "MOVIE"]):
+    kind = "series" if content_type == "SERIES" else "vod"
+    with SessionLocal() as db:
+        source_account = db.scalar(
+            select(Account)
+            .where(Account.enabled.is_(True))
+            .order_by(Account.id)
+            .limit(1)
+        )
+        if not source_account:
+            raise HTTPException(status_code=409, detail="Add an enabled provider account first.")
+        accounts = db.scalars(
+            select(Account)
+            .where(
+                Account.enabled.is_(True),
+                Account.provider_url == source_account.provider_url,
+            )
+            .order_by(Account.id)
+        ).all()
+        account_ids = [account.id for account in accounts]
+        busy_ids = set()
+        if account_ids:
+            busy_ids = set(db.scalars(
+                select(QueueItem.account_id).where(
+                    QueueItem.account_id.in_(account_ids),
+                    QueueItem.status.in_(("PENDING", "DOWNLOADING", "VERIFYING")),
+                ).distinct()
+            ).all())
+        route = db.get(StorageRoute, kind)
+        node = db.get(Node, route.node_id) if route else None
+        proxy = db.get(Proxy, node.proxy_id) if node and node.proxy_id else None
+        proxy_available = bool(proxy and proxy.enabled)
+    return {
+        "provider_url": source_account.provider_url,
+        "proxy_available": proxy_available,
+        "accounts": [
+            {
+                "id": account.id,
+                "username": account.username,
+                "provider_url": account.provider_url,
+                "free": account.id not in busy_ids,
+            }
+            for account in accounts
+        ],
+    }
 
 
 @app.post("/api/accounts")

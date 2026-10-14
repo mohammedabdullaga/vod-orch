@@ -3,7 +3,7 @@ import axios from "axios";
 import ContentBrowser from "./ContentBrowser";
 import {
   Activity, Check, CircleAlert, Clapperboard, Film, Gauge, LogOut, LockKeyhole,
-  Play, Plus, Radio, RefreshCw, Server, Settings2, Trash2, Tv, Wifi,
+  Play, Plus, Radio, RefreshCw, Server, Settings2, Trash2, Tv, Wifi, XCircle,
 } from "lucide-react";
 
 const api = axios.create({ baseURL: "/api", withCredentials: true });
@@ -47,7 +47,7 @@ function App() {
   const [editingNodeId, setEditingNodeId] = useState(null);
   const [nodeForm, setNodeForm] = useState({
     name: "", host: "", port: 22, username: "", private_key_path: "", staging_path: "", watch_path: "",
-    proxy_id: "", axel_connections: 4,
+    proxy_id: "", axel_connections: 12,
   });
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
@@ -151,6 +151,10 @@ function App() {
     "Category destination saved. Pending watched content will use the updated path.",
   );
   const retry = (id) => act(() => api.post("/queue/retry", { item_id: id }), "Task queued for retry.");
+  const cancelDownload = (id) => act(
+    () => api.post(`/queue/${id}/cancel`),
+    "Download cancellation requested; the remote partial file will be removed.",
+  );
   const addAccount = (event) => {
     event.preventDefault();
     act(async () => { await api.post("/accounts", accountForm); setAccountForm({ provider_url: "", username: "", password: "", user_agent: "Mozilla/5.0" }); await loadSettings(); }, "Provider account added.");
@@ -170,7 +174,7 @@ function App() {
         ...nodeForm,
         port: Number(nodeForm.port),
         proxy_id: nodeForm.proxy_id ? Number(nodeForm.proxy_id) : null,
-        axel_connections: Number(nodeForm.axel_connections || 4),
+        axel_connections: Number(nodeForm.axel_connections || 12),
         test,
       };
       const response = editingNodeId
@@ -187,14 +191,14 @@ function App() {
       ...node,
       port: Number(node.port),
       proxy_id: node.proxy_id ? String(node.proxy_id) : "",
-      axel_connections: Number(node.axel_connections || 4),
+      axel_connections: Number(node.axel_connections || 12),
     });
   };
   const resetNodeForm = () => {
     setEditingNodeId(null);
     setNodeForm({
       name: "", host: "", port: 22, username: "", private_key_path: "", staging_path: "", watch_path: "",
-      proxy_id: "", axel_connections: 4,
+      proxy_id: "", axel_connections: 12,
     });
   };
   const saveRouting = (event) => {
@@ -288,11 +292,11 @@ function App() {
             <div className="overflow-x-auto"><table className="w-full min-w-[780px] text-left text-sm">
               <thead className="bg-slate-900/60 text-xs uppercase tracking-wide text-slate-500"><tr><th className="px-5 py-3">Title</th><th className="px-4 py-3">Type</th><th className="px-4 py-3">Status</th><th className="px-4 py-3">Progress</th><th className="px-4 py-3">Account</th><th className="px-4 py-3">Action</th></tr></thead>
               <tbody className="divide-y divide-slate-800/80">{queue.length ? queue.map((item) => <tr key={item.id} className="hover:bg-slate-800/20">
-                <td className="px-5 py-4"><div className="font-medium text-slate-200">{item.title}</div>{item.series_title && <div className="mt-1 text-xs text-slate-500">{item.series_title} · S{item.season ?? "—"} E{item.episode ?? "—"}</div>}</td>
+                <td className="px-5 py-4"><div className="font-medium text-slate-200">{item.title}</div>{item.series_title && <div className="mt-1 text-xs text-slate-500">{item.series_title} · S{item.season ?? "—"} E{item.episode ?? "—"}</div>}{item.final_path && <div className="mt-1 max-w-[30rem] truncate font-mono text-[10px] text-slate-500" title={item.final_path}>Saved to: {item.final_path}</div>}</td>
                 <td className="px-4 py-4 text-slate-400">{item.kind === "series" ? <Tv size={16} /> : <Film size={16} />}</td>
                 <td className="px-4 py-4"><Status status={item.status} /></td>
                 <td className="px-4 py-4"><div className="flex items-center gap-2"><div className="h-1.5 w-20 overflow-hidden rounded bg-slate-800"><div className="h-full bg-indigo-400" style={{ width: `${item.progress || 0}%` }} /></div><span className="text-xs text-slate-500">{Math.round(item.progress || 0)}%</span></div></td>
-                <td className="px-4 py-4 text-slate-400">{item.account || "—"}</td><td className="px-4 py-4">{item.status === "FAILED" && <button disabled={busy} onClick={() => retry(item.id)} className="flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200"><RefreshCw size={13} />Retry</button>}</td>
+                <td className="px-4 py-4 text-slate-400">{item.account || "—"}</td><td className="px-4 py-4">{item.status === "FAILED" && <button disabled={busy} onClick={() => retry(item.id)} className="flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200"><RefreshCw size={13} />Retry</button>}{["PENDING", "DOWNLOADING", "VERIFYING"].includes(item.status) && <button disabled={busy} onClick={() => cancelDownload(item.id)} className="flex items-center gap-1.5 text-xs text-rose-300 hover:text-rose-200"><XCircle size={13} />Cancel</button>}{item.status === "CANCELLING" && <span className="text-xs text-amber-300">Cancelling…</span>}</td>
               </tr>) : <tr><td colSpan="6" className="px-5 py-14 text-center text-slate-500">No streams discovered yet. Enable a monitored category to begin.</td></tr>}</tbody>
             </table></div>
           </section>
@@ -359,7 +363,7 @@ function App() {
               <div className="space-y-3">
                 <h3 className="text-sm font-medium text-slate-200">Configured servers ({nodes.length})</h3>
                 {nodes.map((node) => <div key={node.id} className="flex items-center justify-between gap-3 rounded-lg bg-slate-900/70 px-3 py-3">
-                  <div className="min-w-0"><div className="truncate text-sm text-slate-200">{node.name}</div><div className="truncate text-xs text-slate-500">{node.username}@{node.host}:{node.port} · {node.watch_path}</div><div className="mt-1 text-[10px] text-slate-400">{node.axel_connections || 4} download connections · {proxies.find((proxy) => proxy.id === node.proxy_id)?.enabled ? `Proxy #${node.proxy_id}` : "Direct connection"}</div><div className="mt-1 text-[10px] text-indigo-300">{[routing.series_node_id === node.id && "Series", routing.movie_node_id === node.id && "Movies"].filter(Boolean).join(" · ") || "Not assigned"}</div></div>
+                  <div className="min-w-0"><div className="truncate text-sm text-slate-200">{node.name}</div><div className="truncate text-xs text-slate-500">{node.username}@{node.host}:{node.port} · {node.watch_path}</div><div className="mt-1 text-[10px] text-slate-400">{node.axel_connections || 12} download connections · {proxies.find((proxy) => proxy.id === node.proxy_id)?.enabled ? `Proxy #${node.proxy_id}` : "Direct connection"}</div><div className="mt-1 text-[10px] text-indigo-300">{[routing.series_node_id === node.id && "Series", routing.movie_node_id === node.id && "Movies"].filter(Boolean).join(" · ") || "Not assigned"}</div></div>
                   <div className="flex shrink-0 items-center"><button onClick={() => editNode(node)} className="px-2 text-xs text-indigo-300 hover:text-indigo-200">Edit</button><button onClick={() => remove("/nodes", node.id)} className="p-2 text-slate-500 hover:text-rose-300" aria-label={`Remove ${node.name}`}><Trash2 size={15} /></button></div>
                 </div>)}
                 {!nodes.length && <p className="rounded-lg border border-dashed border-slate-700 px-3 py-6 text-center text-xs text-slate-500">Add a storage server, then assign it to Movies, Series, or both.</p>}
@@ -371,7 +375,7 @@ function App() {
                   ["private_key_path", "Private key path on daemon"], ["staging_path", "Remote staging directory"], ["watch_path", "Storage root on this server"],
                 ].map(([key, placeholder]) => <input key={key} required placeholder={placeholder} type={key === "port" ? "number" : "text"} value={nodeForm[key] ?? ""} onChange={(event) => setNodeForm({ ...nodeForm, [key]: event.target.value })} className="field" />)}
                 <label className="block text-xs text-slate-400">Axel connections (1–12)
-                  <input required min="1" max="12" type="number" value={nodeForm.axel_connections ?? 4} onChange={(event) => setNodeForm({ ...nodeForm, axel_connections: event.target.value })} className="field mt-2" />
+                  <input required min="1" max="12" type="number" value={nodeForm.axel_connections ?? 12} onChange={(event) => setNodeForm({ ...nodeForm, axel_connections: event.target.value })} className="field mt-2" />
                 </label>
                 <label className="block text-xs text-slate-400">Worker proxy
                   <select value={nodeForm.proxy_id ?? ""} onChange={(event) => setNodeForm({ ...nodeForm, proxy_id: event.target.value })} className="field mt-2">
@@ -426,7 +430,7 @@ function LoginScreen({ busy, notice, onLogin }) {
 }
 
 function Status({ status }) {
-  const tones = { PENDING: "slate", DOWNLOADING: "blue", VERIFYING: "yellow", COMPLETED: "green", FAILED: "red" };
+  const tones = { PENDING: "slate", DOWNLOADING: "blue", VERIFYING: "yellow", CANCELLING: "yellow", COMPLETED: "green", FAILED: "red", CANCELLED: "slate" };
   return <Pill tone={tones[status] || "slate"}>{status}</Pill>;
 }
 

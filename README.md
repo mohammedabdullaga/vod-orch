@@ -70,7 +70,9 @@ Each watched category can inherit its assigned server's storage root (leave its 
 
 The **Browse & Ingest** tab supports poster-grid and compact-list views. Clicking a title card or row selects it; use **Inspect / Episodes** to inspect series seasons and choose individual episodes. **Ingest Selected via Workers** queues content immediately through the configured type-to-server route. **Export / Run as Direct Bash Script** downloads a standalone script for execution on that storage server (for example inside `tmux`); it is not executed by the VPS. The export contains provider stream URLs with account credentials, so confirm the warning, store the file securely, and delete it after use.
 
-In **Settings & Accounts**, each storage server can use 1–12 Axel connections (default 4) and an explicitly assigned proxy. A proxy is used only when it is assigned to that node and enabled; otherwise the worker connects directly, clearing inherited proxy environment variables. SOCKS5 uses `aria2c`, while direct and HTTP(S)-proxy jobs use Axel.
+Before a browser batch is queued, the dashboard lists idle provider accounts for the content's provider endpoint. Choose one or more accounts; selected jobs are distributed across them and each account still handles only one active job at a time. The request rechecks account availability before enqueueing. Choose either a direct connection or the routed storage server's enabled proxy for that batch. Automatic watched downloads continue to use the server's configured proxy when enabled.
+
+Each storage server defaults to 12 Axel connections (configurable from 1 to 12). Existing nodes that still had the previous default of 4 are migrated to 12 once; explicitly configured values other than 4 remain unchanged. SOCKS5 uses `aria2c`, while direct and HTTP(S)-proxy jobs use Axel. The queue supports cancelling pending and active downloads; active cancellation stops the remote process and removes its staging partial. Completed queue rows show the final remote path.
 
 The dispatcher does not match items by title alone. It sanitizes names and uses the provider's stable IDs and metadata to create paths like:
 
@@ -250,12 +252,14 @@ If the dashboard and API are served from different browser origins, set `CORS_OR
 | `POST` | `/api/categories/toggle` | Enable/disable monitoring and set an optional destination override |
 | `GET` | `/api/queue` | List queue items |
 | `POST` | `/api/queue/retry` | Retry a failed item |
+| `POST` | `/api/queue/{item_id}/cancel` | Cancel a pending or active download |
 | `GET` | `/api/content/categories?type=series\|movie` | Provider categories and watch state |
 | `GET` | `/api/content/items?type=series\|movie&category_ids=1,2` | Titles in selected categories |
 | `GET` | `/api/content/series/{series_id}/details` | Seasons and normalized episode metadata |
 | `POST` | `/api/queue/manual-batch` | Queue selected movies or episodes immediately |
 | `POST` | `/api/content/generate-script` | Download a standalone credential-bearing Bash script for selected titles/episodes |
 | `GET` / `POST` / `DELETE` | `/api/accounts` | Provider account management |
+| `GET` | `/api/accounts/availability?content_type=SERIES\|MOVIE` | List idle accounts for the current provider and proxy availability |
 | `GET` / `POST` / `DELETE` | `/api/proxies` | Proxy pool management |
 | `PUT` | `/api/proxies/{proxy_id}/enabled` | Enable/disable a proxy assigned to a storage node |
 | `POST` | `/api/proxies/{proxy_id}/test` | Test proxy IP and latency |
