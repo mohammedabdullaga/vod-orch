@@ -267,8 +267,9 @@ The interactive OpenAPI documentation is at `/docs` on the API origin; keep it b
 
 ## Operational notes
 
-- A worker is created for each enabled provider account, enforcing one active download per account.
+- A worker is created for each enabled provider account and reconciled on every worker-pool poll; adding an account wakes the pool immediately. Each queue item is claimed by one idle worker for the same provider endpoint, and its stream URL is rebuilt with that worker's credentials.
 - Manual browser queue requests wake the account worker immediately and use the same provider/type/stream identity and safe destination layout as polled items. Repeated queued/completed items are reported as skipped.
+- On daemon startup, interrupted `DOWNLOADING` and `VERIFYING` jobs are reset to `PENDING` for recovery.
 - Queue stream IDs are unique. Existing queue items are not re-created when polled again.
 - Failed jobs are retried with exponential backoff up to `MAX_RETRIES`; manual retry is also available.
 - SSH host-key checking is strict. The daemon must trust the storage server key before a test or download can succeed.

@@ -326,6 +326,7 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                 "provider_stream_id": entry.stream_id,
                 "title": entry.title,
                 "kind": kind,
+                "source_provider_url": account.provider_url,
                 "category_id": entry.category_id,
                 "category_name": category_name,
                 "series_id": entry.series_id,

@@ -162,6 +162,7 @@ class CategoryPoller:
                 title=title, kind=kind, stream_url_encrypted=encrypt_secret(url),
                 file_name=file_name, series_title=series_title, season=season,
                 episode=episode, category_id=category_id, category_name=category_name,
+                source_provider_url=account.provider_url,
                 series_id=series_id, status="PENDING", created_at=utc_now(),
             ))
             try:

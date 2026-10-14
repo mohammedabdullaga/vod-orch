@@ -88,6 +88,7 @@ class QueueItem(Base):
     kind: Mapped[str] = mapped_column(String(16))
     category_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     category_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    source_provider_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     series_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     stream_url_encrypted: Mapped[str] = mapped_column(Text)
     file_name: Mapped[str] = mapped_column(String(1024))
@@ -148,6 +149,7 @@ def init_db() -> None:
                 "provider_stream_id": "VARCHAR(512)",
                 "category_id": "VARCHAR(255)",
                 "category_name": "VARCHAR(512)",
+                "source_provider_url": "VARCHAR(2048)",
                 "series_id": "VARCHAR(512)",
             },
             "nodes": {

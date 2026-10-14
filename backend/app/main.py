@@ -347,10 +347,12 @@ def retry_item(payload: RetryRequest):
         if item.status != "FAILED":
             raise HTTPException(status_code=409, detail="Only failed queue items can be retried.")
         item.status = "PENDING"
+        item.account_id = None
         item.retry_after = None
         item.error = None
         item.retries = 0
         db.commit()
+    worker_pool.wake()
     return {"ok": True}
 
 
@@ -381,7 +383,9 @@ def add_account(payload: AccountCreate):
             db.rollback()
             raise HTTPException(status_code=409, detail="This provider account is already configured.") from exc
         db.refresh(account)
-        return _account_json(account)
+        result = _account_json(account)
+    worker_pool.wake()
+    return result
 
 
 @app.delete("/api/accounts/{account_id}")

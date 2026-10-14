@@ -24,21 +24,25 @@ class RemoteDispatcher:
 
     def _connect(self, node: Node) -> paramiko.SSHClient:
         client = paramiko.SSHClient()
-        client.load_system_host_keys()
-        if self.known_hosts_path:
-            client.load_host_keys(self.known_hosts_path)
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        client.connect(
-            hostname=node.host,
-            port=node.port,
-            username=node.username,
-            key_filename=node.private_key_path,
-            timeout=15,
-            banner_timeout=15,
-            auth_timeout=15,
-            look_for_keys=False,
-            allow_agent=False,
-        )
+        try:
+            client.load_system_host_keys()
+            if self.known_hosts_path:
+                client.load_host_keys(self.known_hosts_path)
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+            client.connect(
+                hostname=node.host,
+                port=node.port,
+                username=node.username,
+                key_filename=node.private_key_path,
+                timeout=15,
+                banner_timeout=15,
+                auth_timeout=15,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+        except Exception:
+            client.close()
+            raise
         return client
 
     def _run(
