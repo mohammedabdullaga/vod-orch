@@ -337,6 +337,7 @@ class WorkerPool:
                     proxy_record = None
                 proxy_url = decrypt_secret(proxy_record.url_encrypted) if proxy_record else None
                 axel_connections = node.axel_connections
+                downloader = item.downloader or "axel"
                 if cancel_event.is_set():
                     self._mark_cancelled(item_id)
                     return
@@ -362,6 +363,7 @@ class WorkerPool:
                 lambda progress, speed, file_size: self._set_transfer_metrics(
                     item_id, progress, speed, file_size
                 ),
+                downloader=downloader,
             )
             with SessionLocal() as db:
                 item = db.get(QueueItem, item_id)

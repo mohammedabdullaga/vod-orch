@@ -23,6 +23,7 @@ class DispatchCancelled(Exception):
 
 _ANSI_ESCAPE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 _FILE_SIZE = re.compile(rb"File size:.*?\(([\d,]+)\s+bytes\)", re.IGNORECASE)
+_WGET_FILE_SIZE = re.compile(rb"Length:\s*([\d,]+)(?:\s|$)", re.IGNORECASE)
 _SAMPLED_SPEED = re.compile(rb"MEDIA_TRANSFER speed_bytes_per_second=(\d+)")
 _FINAL_SIZE = re.compile(rb"MEDIA_TRANSFER file_size_bytes=(\d+)")
 _TRANSFER_SPEED = re.compile(
@@ -39,6 +40,7 @@ def _parse_transfer_metrics(
     percentages = _PERCENTAGE.findall(clean_output[-4096:])
     speeds = _TRANSFER_SPEED.findall(clean_output[-4096:])
     file_sizes = _FILE_SIZE.findall(clean_output[-16384:])
+    wget_file_sizes = _WGET_FILE_SIZE.findall(clean_output[-16384:])
     sampled_speeds = _SAMPLED_SPEED.findall(clean_output[-4096:])
     final_sizes = _FINAL_SIZE.findall(clean_output[-4096:])
     progress = min(float(percentages[-1]), 100.0) if percentages else None
@@ -49,10 +51,9 @@ def _parse_transfer_metrics(
         multiplier = 1024 if "i" in unit_name else 1000
         power = 0 if unit_name == "b" else 1 if unit_name.startswith("k") else 2 if unit_name.startswith("m") else 3
         speed = float(value) * multiplier**power
+    size_candidates = final_sizes or file_sizes or wget_file_sizes
     file_size = (
-        int(final_sizes[-1])
-        if final_sizes
-        else int(file_sizes[-1].replace(b",", b"")) if file_sizes else None
+        int(size_candidates[-1].replace(b",", b"")) if size_candidates else None
     )
     return progress, speed, file_size
 
@@ -178,9 +179,20 @@ class RemoteDispatcher:
         axel_connections: int = 12,
         cancel_event: threading.Event | None = None,
         on_transfer_metrics: Callable[[float | None, float | None, int | None], None] | None = None,
+        downloader: str = "axel",
     ) -> DispatchResult:
         if not 1 <= axel_connections <= 12:
             raise ValueError("Axel connections must be between 1 and 12.")
+        if downloader not in ("axel", "wget"):
+            raise ValueError("Downloader must be either axel or wget.")
+        proxy_scheme = urlsplit(proxy_url).scheme.lower() if proxy_url else ""
+        if downloader == "wget":
+            if proxy_scheme in ("socks5", "socks5h"):
+                raise RuntimeError(
+                    "Wget does not support SOCKS5 proxies. Choose Axel/aria2c or an HTTP(S) proxy."
+                )
+            if proxy_url and proxy_scheme not in ("http", "https"):
+                raise RuntimeError("Wget proxy URL scheme must be http or https.")
         relative_path = PurePosixPath(file_name)
         if (
             relative_path.is_absolute()
@@ -214,8 +226,27 @@ class RemoteDispatcher:
                 client,
                 prepare,
             )
-            proxy_scheme = urlsplit(proxy_url).scheme.lower() if proxy_url else ""
-            if proxy_scheme == "socks5":
+            if downloader == "wget":
+                clear_proxy_env = (
+                    "env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy "
+                    "-u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY "
+                    "-u no_proxy -u NO_PROXY "
+                )
+                proxy_env = ""
+                use_proxy = "no"
+                if proxy_url:
+                    safe_proxy = shlex.quote(proxy_url)
+                    proxy_env = (
+                        f"http_proxy={safe_proxy} https_proxy={safe_proxy} "
+                        f"HTTP_PROXY={safe_proxy} HTTPS_PROXY={safe_proxy} "
+                    )
+                    use_proxy = "yes"
+                download = (
+                    f"{clear_proxy_env}{proxy_env}"
+                    f"wget -cO {q_stage} --tries=99 --retry-connrefused "
+                    f"--user-agent={q_ua} -e use_proxy={use_proxy} {q_url}"
+                )
+            elif proxy_scheme == "socks5":
                 download = (
                     "env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy "
                     "-u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY "

@@ -32,8 +32,13 @@ export default function ContentBrowser({ api, routing, onQueued }) {
   const [selectedProxyId, setSelectedProxyId] = useState("");
   const [proxyAvailable, setProxyAvailable] = useState(false);
   const [proxyMode, setProxyMode] = useState("direct");
+  const [downloader, setDownloader] = useState("axel");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
+  const selectedProxy = availableProxies.find((proxy) => String(proxy.id) === selectedProxyId);
+  const wgetProxyUnsupported = downloader === "wget"
+    && proxyMode === "node"
+    && /^socks5h?:/i.test(selectedProxy?.url || "");
 
   useEffect(() => {
     let current = true;
@@ -217,6 +222,7 @@ export default function ContentBrowser({ api, routing, onQueued }) {
         account_ids: accountIds,
         proxy_mode: proxyMode === "node" ? "selected" : "direct",
         proxy_id: proxyMode === "node" ? Number(selectedProxyId) : null,
+        downloader,
         items: pendingQueue,
       });
       queued = data.queued_count;
@@ -578,6 +584,21 @@ export default function ContentBrowser({ api, routing, onQueued }) {
               </div>
             </div>
             <fieldset>
+              <legend className="mb-2 text-sm font-medium text-slate-200">Download client</legend>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <label className={`cursor-pointer rounded-lg border px-3 py-3 ${downloader === "axel" ? "border-indigo-500 bg-indigo-950/30" : "border-slate-800 bg-slate-900/50"}`}>
+                  <input type="radio" name="queue-downloader" value="axel" checked={downloader === "axel"} onChange={() => setDownloader("axel")} className="mr-2 accent-indigo-500" />
+                  <span className="text-sm text-slate-200">Axel / aria2c · default</span>
+                  <span className="mt-1 block text-xs text-slate-500">Uses configured parallel connections; SOCKS5 uses aria2c.</span>
+                </label>
+                <label className={`cursor-pointer rounded-lg border px-3 py-3 ${downloader === "wget" ? "border-indigo-500 bg-indigo-950/30" : "border-slate-800 bg-slate-900/50"}`}>
+                  <input type="radio" name="queue-downloader" value="wget" checked={downloader === "wget"} onChange={() => setDownloader("wget")} className="mr-2 accent-indigo-500" />
+                  <span className="text-sm text-slate-200">Wget · reference-script options</span>
+                  <span className="mt-1 block text-xs text-slate-500">Resumes partial transfers; one connection per file.</span>
+                </label>
+              </div>
+            </fieldset>
+            <fieldset>
               <legend className="mb-2 text-sm font-medium text-slate-200">Connection mode</legend>
               <div className="grid gap-2 sm:grid-cols-2">
                 <label className={`cursor-pointer rounded-lg border px-3 py-3 ${proxyMode === "direct" ? "border-indigo-500 bg-indigo-950/30" : "border-slate-800 bg-slate-900/50"}`}>
@@ -595,12 +616,13 @@ export default function ContentBrowser({ api, routing, onQueued }) {
                   {availableProxies.map((proxy) => <option key={proxy.id} value={proxy.id}>Proxy #{proxy.id} · {proxy.url}</option>)}
                 </select>
               </label>}
+              {wgetProxyUnsupported && <p className="mt-2 text-xs text-amber-300">Wget cannot use SOCKS5 proxies. Choose Axel / aria2c or switch to a direct or HTTP(S) connection.</p>}
               {!proxyAvailable && <p className="mt-2 text-xs text-slate-500">There are no enabled proxies in the proxy pool.</p>}
             </fieldset>
           </div>
           <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 px-5 py-4">
             <button type="button" onClick={() => setPendingQueue(null)} disabled={busy} className="rounded-lg border border-slate-700 px-4 py-2.5 text-sm text-slate-300 hover:bg-slate-800">Cancel</button>
-            <button type="button" onClick={confirmQueueEntries} disabled={busy || !selectedWorkerIds.size || (proxyMode === "node" && !selectedProxyId)} className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">
+            <button type="button" onClick={confirmQueueEntries} disabled={busy || !selectedWorkerIds.size || (proxyMode === "node" && !selectedProxyId) || wgetProxyUnsupported} className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">
               {busy ? <LoaderCircle size={15} className="animate-spin" /> : <Download size={15} />}
               Confirm &amp; queue {pendingQueue.length} downloads
             </button>

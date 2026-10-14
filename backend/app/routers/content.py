@@ -2,6 +2,7 @@ import logging
 import re
 import shlex
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
@@ -252,6 +253,7 @@ class ManualBatchRequest(BaseModel):
     account_ids: list[int] | None = Field(default=None, min_length=1, max_length=100)
     proxy_mode: Literal["node", "selected", "direct"] | None = None
     proxy_id: int | None = Field(default=None, ge=1)
+    downloader: Literal["axel", "wget"] = "axel"
     account_offset: int = Field(default=0, ge=0)
     items: list[ManualQueueItem] = Field(min_length=1, max_length=5000)
 
@@ -335,6 +337,18 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                 status_code=422,
                 detail="A proxy can only be selected when proxy mode is enabled.",
             )
+        if payload.downloader == "wget" and selected_proxy_id:
+            selected_proxy = db.get(Proxy, selected_proxy_id)
+            proxy_scheme = (
+                urlsplit(decrypt_secret(selected_proxy.url_encrypted)).scheme.lower()
+                if selected_proxy
+                else ""
+            )
+            if proxy_scheme in ("socks5", "socks5h"):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Wget does not support SOCKS5 proxies. Choose Axel/aria2c or an HTTP(S) proxy.",
+                )
 
         queued: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
@@ -396,6 +410,7 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                 "series_id": entry.series_id,
                 "proxy_mode": payload.proxy_mode,
                 "proxy_id": selected_proxy_id,
+                "downloader": payload.downloader,
                 "stream_url_encrypted": encrypt_secret(
                     stream_url(account, kind, entry.stream_id, extension)
                 ),

@@ -93,6 +93,7 @@ class QueueItem(Base):
     proxy_id: Mapped[int | None] = mapped_column(
         ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True
     )
+    downloader: Mapped[str] = mapped_column(String(16), default="axel")
     series_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     stream_url_encrypted: Mapped[str] = mapped_column(Text)
     file_name: Mapped[str] = mapped_column(String(1024))
@@ -159,6 +160,7 @@ def init_db() -> None:
                 "source_provider_url": "VARCHAR(2048)",
                 "proxy_mode": "VARCHAR(16)",
                 "proxy_id": "INTEGER",
+                "downloader": "VARCHAR(16) NOT NULL DEFAULT 'axel'",
                 "series_id": "VARCHAR(512)",
                 "final_path": "TEXT",
                 "file_size_bytes": "INTEGER",
