@@ -31,6 +31,7 @@ from app.security import decrypt_secret, encrypt_secret, mask_secret
 from app.services.dispatcher import RemoteDispatcher
 from app.services.poller import CategoryPoller
 from app.services.worker_pool import WorkerPool
+from app.routers.content import queue_router, router as content_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,6 +64,9 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-CSRF-Token"],
     allow_credentials=True,
 )
+app.state.worker_pool = worker_pool
+app.include_router(content_router)
+app.include_router(queue_router)
 
 
 @app.middleware("http")
@@ -203,7 +207,7 @@ def _account_json(account: Account) -> dict:
 
 def _node_json(node: Node) -> dict:
     return {
-        "host": node.host, "port": node.port, "username": node.username,
+        "id": str(node.id), "host": node.host, "port": node.port, "username": node.username,
         "private_key_path": node.private_key_path, "staging_path": node.staging_path,
         "watch_path": node.watch_path, "proxy_id": node.proxy_id,
         "last_connected_at": node.last_connected_at.isoformat() if node.last_connected_at else None,

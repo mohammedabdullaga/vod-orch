@@ -14,7 +14,10 @@ backend/
     config.py               Environment configuration
     security.py             Fernet encryption and secret masking
     provider.py             Provider API and stream URL adapter
+    routers/
+      content.py            Content discovery and manual queue endpoints
     services/
+      content_paths.py      Shared identity-safe relative destinations
       poller.py             Category polling and queue ingestion
       worker_pool.py        One worker per enabled account
       dispatcher.py         SSH, remote download, probe and promotion
@@ -22,7 +25,8 @@ backend/
   media-ingestion.service   systemd unit
   requirements.txt          Python dependencies
 frontend/
-  src/App.jsx               Single-page dashboard
+  src/App.jsx               Authenticated dashboard and tab navigation
+  src/ContentBrowser.jsx    Category, title, series and episode browser
   src/index.css             Tailwind and global styles
   package.json              Frontend scripts and dependencies
   vite.config.js            Development API proxy
@@ -71,6 +75,8 @@ The dispatcher does not match items by title alone. It sanitizes names and uses 
 ```
 
 Series and movies are separated, and same-named shows/movies with different provider IDs get separate directories. Queue deduplication keys include provider base URL, content type, and stream ID so a movie ID cannot suppress a series episode with the same ID. A no-clobber atomic move prevents an existing final file from being silently overwritten. The app does not infer identity from a title or merge folders with similar names.
+
+Staging follows the same relative directory layout as the final destination. Each temporary filename has a `.part-<job id>` suffix so concurrent work cannot collide; after `ffprobe` succeeds, the file is atomically promoted to its final name.
 
 ## VPS setup
 
@@ -238,6 +244,10 @@ If the dashboard and API are served from different browser origins, set `CORS_OR
 | `POST` | `/api/categories/toggle` | Enable/disable monitoring and set an optional destination override |
 | `GET` | `/api/queue` | List queue items |
 | `POST` | `/api/queue/retry` | Retry a failed item |
+| `GET` | `/api/content/categories?type=series\|movie` | Provider categories and watch state |
+| `GET` | `/api/content/items?type=series\|movie&category_ids=1,2` | Titles in selected categories |
+| `GET` | `/api/content/series/{series_id}/details` | Seasons and normalized episode metadata |
+| `POST` | `/api/queue/manual-batch` | Queue selected movies or episodes immediately |
 | `GET` / `POST` / `DELETE` | `/api/accounts` | Provider account management |
 | `GET` / `POST` / `DELETE` | `/api/proxies` | Proxy pool management |
 | `POST` | `/api/proxies/{proxy_id}/test` | Test proxy IP and latency |
@@ -248,6 +258,7 @@ The interactive OpenAPI documentation is at `/docs` on the API origin; keep it b
 ## Operational notes
 
 - A worker is created for each enabled provider account, enforcing one active download per account.
+- Manual browser queue requests wake the account worker immediately and use the same provider/type/stream identity and safe destination layout as polled items. Repeated queued/completed items are reported as skipped.
 - Queue stream IDs are unique. Existing queue items are not re-created when polled again.
 - Failed jobs are retried with exponential backoff up to `MAX_RETRIES`; manual retry is also available.
 - SSH host-key checking is strict. The daemon must trust the storage server key before a test or download can succeed.

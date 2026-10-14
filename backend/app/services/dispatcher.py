@@ -115,8 +115,10 @@ class RemoteDispatcher:
         ):
             raise ValueError("Content destination must be a safe relative POSIX path.")
         final_root = destination_root or node.watch_path
-        staging_job_dir = str(PurePosixPath(node.staging_path) / str(job_id))
-        staging_file = str(PurePosixPath(staging_job_dir) / relative_path.name)
+        staging_job_dir = str(PurePosixPath(node.staging_path) / relative_path.parent)
+        staging_file = str(
+            PurePosixPath(staging_job_dir) / f"{relative_path.name}.part-{job_id}"
+        )
         final_path = str(PurePosixPath(final_root) / relative_path)
         stage_dir = str(PurePosixPath(node.staging_path))
         final_dir = str(PurePosixPath(final_path).parent)
@@ -137,7 +139,7 @@ class RemoteDispatcher:
                     f"--auto-file-renaming=false --file-allocation=none --summary-interval=1 "
                     f"--all-proxy={shlex.quote(proxy_url)} --user-agent={q_ua} "
                     f"--dir={shlex.quote(staging_job_dir)} "
-                    f"--out={shlex.quote(relative_path.name)} {q_url}"
+                    f"--out={shlex.quote(PurePosixPath(staging_file).name)} {q_url}"
                 )
             elif proxy_url and proxy_scheme in ("http", "https"):
                 safe_proxy = shlex.quote(proxy_url)

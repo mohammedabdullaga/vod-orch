@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import axios from "axios";
+import ContentBrowser from "./ContentBrowser";
 import {
   Activity, Check, CircleAlert, Clapperboard, Film, Gauge, LogOut, LockKeyhole,
   Play, Plus, Radio, RefreshCw, Server, Settings2, Trash2, Tv, Wifi,
@@ -21,7 +22,7 @@ api.interceptors.response.use(
     return Promise.reject(error);
   },
 );
-const tabs = ["Overview & Queue", "Category Watcher", "Settings & Accounts"];
+const tabs = ["Overview & Queue", "Browse & Ingest", "Category Watcher", "Settings & Accounts"];
 
 function Pill({ children, tone = "slate" }) {
   const tones = {
@@ -94,8 +95,13 @@ function App() {
   };
   useEffect(() => {
     if (!authenticated) return;
-    if (tab === tabs[1]) loadCategories();
-    if (tab === tabs[2]) loadSettings();
+    if (tab === tabs[1]) {
+      api.get("/settings/ssh")
+        .then(({ data }) => { if (data) setSsh(data); })
+        .catch((error) => setNotice(error.response?.data?.detail || "Unable to load the storage node."));
+    }
+    if (tab === tabs[2]) loadCategories();
+    if (tab === tabs[3]) loadSettings();
   }, [authenticated, tab]);
 
   const act = async (operation, success) => {
@@ -244,7 +250,9 @@ function App() {
           </section>
         </>}
 
-        {tab === tabs[1] && <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
+        {tab === tabs[1] && <ContentBrowser api={api} nodeId={ssh.id} onQueued={refresh} />}
+
+        {tab === tabs[2] && <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
           <div className="border-b border-slate-800 px-5 py-4"><h2 className="font-semibold text-white">Category watcher</h2><p className="mt-1 text-xs text-slate-500">Watched items inherit the storage root unless this category has its own remote path. Provider IDs keep same-named shows and movies separate.</p>
             <p className="mt-2 text-xs text-slate-400">Storage root: <code className="text-indigo-300">{ssh.watch_path || "Configure in Settings & Accounts"}</code></p>
           </div>
@@ -265,7 +273,7 @@ function App() {
           </div>)}{!categories.length && <div className="col-span-full py-12 text-center text-sm text-slate-500">Add an enabled provider account to load categories.</div>}</div>
         </section>}
 
-        {tab === tabs[2] && <div className="grid gap-6 lg:grid-cols-2">
+        {tab === tabs[3] && <div className="grid gap-6 lg:grid-cols-2">
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
             <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Radio size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Provider accounts</h2><p className="text-xs text-slate-500">One active download per enabled account</p></div></div>
             <div className="space-y-2 p-5">{accounts.map((account) => <div key={account.id} className="flex items-center justify-between rounded-lg bg-slate-900/70 px-3 py-2.5"><div><div className="text-sm text-slate-200">{account.username}</div><div className="text-xs text-slate-500">{account.provider_url}</div></div><button onClick={() => remove("/accounts", account.id)} className="p-2 text-slate-500 hover:text-rose-300" aria-label={`Remove ${account.username}`}><Trash2 size={15} /></button></div>)}

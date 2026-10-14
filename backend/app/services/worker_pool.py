@@ -17,6 +17,7 @@ class WorkerPool:
         self.dispatcher = dispatcher
         self._manager: asyncio.Task | None = None
         self._workers: dict[int, asyncio.Task] = {}
+        self._wakeups: dict[int, asyncio.Event] = {}
         self._stopping = asyncio.Event()
         self.active_count = 0
 
@@ -25,6 +26,7 @@ class WorkerPool:
 
     async def stop(self) -> None:
         self._stopping.set()
+        self.wake()
         if self._manager:
             await self._manager
         for task in self._workers.values():
@@ -40,26 +42,36 @@ class WorkerPool:
             for account_id, task in list(self._workers.items()):
                 if task.done():
                     self._workers.pop(account_id)
+                    self._wakeups.pop(account_id, None)
                     if not task.cancelled():
                         error = task.exception()
                         if error:
                             logger.error("Account worker %s stopped unexpectedly: %s", account_id, error)
             for account_id in account_ids - self._workers.keys():
+                wakeup = asyncio.Event()
+                self._wakeups[account_id] = wakeup
                 self._workers[account_id] = asyncio.create_task(
-                    self._account_worker(account_id), name=f"account-worker-{account_id}"
+                    self._account_worker(account_id, wakeup), name=f"account-worker-{account_id}"
                 )
             for account_id in self._workers.keys() - account_ids:
                 self._workers.pop(account_id).cancel()
+                self._wakeups.pop(account_id, None)
             try:
                 await asyncio.wait_for(self._stopping.wait(), timeout=settings.worker_poll_seconds)
             except asyncio.TimeoutError:
                 pass
 
-    async def _account_worker(self, account_id: int) -> None:
+    async def _account_worker(self, account_id: int, wakeup: asyncio.Event) -> None:
         while not self._stopping.is_set():
+            wakeup.clear()
             item_id = self._claim_next(account_id)
             if item_id is None:
-                await asyncio.sleep(settings.worker_poll_seconds)
+                try:
+                    await asyncio.wait_for(
+                        wakeup.wait(), timeout=settings.worker_poll_seconds
+                    )
+                except asyncio.TimeoutError:
+                    pass
                 continue
             self.active_count += 1
             try:
@@ -69,6 +81,10 @@ class WorkerPool:
                 self._fail(item_id, str(exc))
             finally:
                 self.active_count -= 1
+
+    def wake(self) -> None:
+        for wakeup in self._wakeups.values():
+            wakeup.set()
 
     def _claim_next(self, account_id: int) -> int | None:
         with SessionLocal() as db:

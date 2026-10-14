@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import logging
 from sqlalchemy import or_, select
 
@@ -7,6 +6,11 @@ from app.config import settings
 from app.models import Account, MonitoredCategory, QueueItem, SessionLocal, utc_now
 from app.provider import provider_action, stream_url
 from app.security import encrypt_secret
+from app.services.content_paths import (
+    normalized_episode_path,
+    safe_filename,
+    stream_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,16 +98,21 @@ class CategoryPoller:
                 series_title = str(series.get("name") or "Series")
                 season = _int_or_none(episode.get("season")) or season_key_number
                 episode_number = _int_or_none(episode.get("episode_num"))
-                episode_title = _safe_filename(
+                episode_title = safe_filename(
                     f"{series_title} - S{season or 0:02d}E{episode_number or 0:02d}",
                     max_length=140,
                 )
                 title = episode.get("title") or episode_title
-                file_name = (
-                    f"Series/{_identity_segment(series_title, str(series_id), account.provider_url)}"
-                    f"/Season {season or 0:02d}/"
-                    f"{episode_title} [{_safe_provider_id(str(stream_id), account.provider_url)}]."
-                    f"{_safe_extension(extension)}"
+                file_name, season, episode_number = normalized_episode_path(
+                    kind="series",
+                    title=title,
+                    provider_stream_id=str(stream_id),
+                    provider_url=account.provider_url,
+                    extension=extension,
+                    series_name=series_title,
+                    series_id=str(series_id),
+                    season=season,
+                    episode_num=episode_number,
                 )
                 self._insert_item(
                     account, str(stream_id), title, "series",
@@ -120,9 +129,13 @@ class CategoryPoller:
             return
         extension = stream.get("container_extension", "mkv")
         title = str(stream.get("name") or f"Movie {stream_id}")
-        file_name = (
-            f"Movies/{_identity_segment(title, str(stream_id), account.provider_url)}/"
-            f"{_safe_filename(title, max_length=160)}.{_safe_extension(extension)}"
+        file_name, _, _ = normalized_episode_path(
+            kind="vod",
+            title=title,
+            provider_stream_id=str(stream_id),
+            provider_url=account.provider_url,
+            extension=extension,
+            filename=title,
         )
         self._insert_item(
             account, str(stream_id), title, "vod",
@@ -136,9 +149,7 @@ class CategoryPoller:
         series_title: str | None, season: int | None, episode: int | None,
         category_id: str, category_name: str, series_id: str | None,
     ) -> None:
-        identity = hashlib.sha256(
-            f"{account.provider_url.rstrip('/')}\0{kind}\0{provider_stream_id}".encode("utf-8")
-        ).hexdigest()
+        identity = stream_identity(account.provider_url, kind, provider_stream_id)
         with SessionLocal() as db:
             if db.scalar(select(QueueItem.id).where(or_(
                 QueueItem.stream_id == identity,
@@ -158,31 +169,6 @@ class CategoryPoller:
             except Exception:
                 db.rollback()
                 logger.exception("Could not enqueue provider stream %s", provider_stream_id)
-
-
-def _safe_filename(value: str, max_length: int = 240) -> str:
-    cleaned = "".join(char for char in value if char.isalnum() or char in " ._-()[]")
-    return cleaned.strip(" .")[:max_length].rstrip(" .") or "media.mkv"
-
-
-def _identity_segment(title: str, provider_id: str, provider_url: str) -> str:
-    return (
-        f"{_safe_filename(title, max_length=130)} "
-        f"[{_safe_provider_id(provider_id, provider_url)}]"
-    )
-
-
-def _safe_provider_id(provider_id: str, provider_url: str) -> str:
-    safe_id = "".join(char for char in provider_id if char.isalnum() or char in "_-")[:48]
-    digest = hashlib.sha256(
-        f"{provider_url.rstrip('/')}\0{provider_id}".encode("utf-8")
-    ).hexdigest()[:16]
-    return f"{safe_id}-{digest}" if safe_id else digest
-
-
-def _safe_extension(value: str) -> str:
-    extension = "".join(char for char in value.lstrip(".") if char.isalnum())[:12]
-    return extension or "mkv"
 
 
 def _int_or_none(value) -> int | None:
