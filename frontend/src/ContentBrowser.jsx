@@ -28,6 +28,8 @@ export default function ContentBrowser({ api, routing, onQueued }) {
   const [pendingQueue, setPendingQueue] = useState(null);
   const [availableAccounts, setAvailableAccounts] = useState([]);
   const [selectedWorkerIds, setSelectedWorkerIds] = useState(new Set());
+  const [availableProxies, setAvailableProxies] = useState([]);
+  const [selectedProxyId, setSelectedProxyId] = useState("");
   const [proxyAvailable, setProxyAvailable] = useState(false);
   const [proxyMode, setProxyMode] = useState("direct");
   const [busy, setBusy] = useState(false);
@@ -183,8 +185,14 @@ export default function ContentBrowser({ api, routing, onQueued }) {
       setPendingQueue(entries);
       setAvailableAccounts(free);
       setSelectedWorkerIds(new Set(free.map((account) => account.id)));
-      setProxyAvailable(data.proxy_available);
-      setProxyMode(data.proxy_available ? "node" : "direct");
+      const proxies = data.proxies || [];
+      setAvailableProxies(proxies);
+      setProxyAvailable(proxies.length > 0);
+      const preferredProxy = proxies.find(
+        (proxy) => proxy.id === data.assigned_proxy_id,
+      ) || proxies[0];
+      setSelectedProxyId(preferredProxy ? String(preferredProxy.id) : "");
+      setProxyMode(proxies.length > 0 ? "node" : "direct");
     } catch (error) {
       setNotice(error.response?.data?.detail || "Could not check free provider accounts.");
     } finally {
@@ -207,7 +215,8 @@ export default function ContentBrowser({ api, routing, onQueued }) {
         content_type: type === "series" ? "SERIES" : "MOVIE",
         target_node_id: String(nodeId),
         account_ids: accountIds,
-        proxy_mode: proxyMode,
+        proxy_mode: proxyMode === "node" ? "selected" : "direct",
+        proxy_id: proxyMode === "node" ? Number(selectedProxyId) : null,
         items: pendingQueue,
       });
       queued = data.queued_count;
@@ -577,15 +586,21 @@ export default function ContentBrowser({ api, routing, onQueued }) {
                 </label>
                 <label className={`cursor-pointer rounded-lg border px-3 py-3 ${proxyMode === "node" ? "border-indigo-500 bg-indigo-950/30" : "border-slate-800 bg-slate-900/50"} ${!proxyAvailable ? "cursor-not-allowed opacity-40" : ""}`}>
                   <input type="radio" name="queue-proxy-mode" value="node" checked={proxyMode === "node"} disabled={!proxyAvailable} onChange={() => setProxyMode("node")} className="mr-2 accent-indigo-500" />
-                  <span className="text-sm text-slate-200">Use storage server proxy</span>
+                  <span className="text-sm text-slate-200">Use enabled proxy</span>
                 </label>
               </div>
-              {!proxyAvailable && <p className="mt-2 text-xs text-slate-500">No enabled proxy is assigned to the routed storage server.</p>}
+              {proxyAvailable && proxyMode === "node" && <label className="mt-3 block text-xs text-slate-400">
+                Enabled proxy for this batch
+                <select value={selectedProxyId} onChange={(event) => setSelectedProxyId(event.target.value)} className="mt-2 w-full rounded-lg border border-slate-700 bg-[#090d16] px-3 py-2 text-sm text-slate-200">
+                  {availableProxies.map((proxy) => <option key={proxy.id} value={proxy.id}>Proxy #{proxy.id} · {proxy.url}</option>)}
+                </select>
+              </label>}
+              {!proxyAvailable && <p className="mt-2 text-xs text-slate-500">There are no enabled proxies in the proxy pool.</p>}
             </fieldset>
           </div>
           <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 px-5 py-4">
             <button type="button" onClick={() => setPendingQueue(null)} disabled={busy} className="rounded-lg border border-slate-700 px-4 py-2.5 text-sm text-slate-300 hover:bg-slate-800">Cancel</button>
-            <button type="button" onClick={confirmQueueEntries} disabled={busy || !selectedWorkerIds.size} className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">
+            <button type="button" onClick={confirmQueueEntries} disabled={busy || !selectedWorkerIds.size || (proxyMode === "node" && !selectedProxyId)} className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">
               {busy ? <LoaderCircle size={15} className="animate-spin" /> : <Download size={15} />}
               Confirm &amp; queue {pendingQueue.length} downloads
             </button>

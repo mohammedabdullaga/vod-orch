@@ -10,7 +10,6 @@ from urllib.parse import urlsplit
 import paramiko
 
 from app.models import Node
-from app.security import decrypt_secret
 
 
 @dataclass(frozen=True)
@@ -20,6 +19,42 @@ class DispatchResult:
 
 class DispatchCancelled(Exception):
     pass
+
+
+_ANSI_ESCAPE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+_FILE_SIZE = re.compile(rb"File size:.*?\(([\d,]+)\s+bytes\)", re.IGNORECASE)
+_SAMPLED_SPEED = re.compile(rb"MEDIA_TRANSFER speed_bytes_per_second=(\d+)")
+_FINAL_SIZE = re.compile(rb"MEDIA_TRANSFER file_size_bytes=(\d+)")
+_TRANSFER_SPEED = re.compile(
+    rb"\[\s*([\d.]+)\s*(B|KB|KiB|MB|MiB|GB|GiB)\/s\s*\]",
+    re.IGNORECASE,
+)
+_PERCENTAGE = re.compile(rb"(?<!\d)(\d{1,3})%")
+
+
+def _parse_transfer_metrics(
+    output: bytes,
+) -> tuple[float | None, float | None, int | None]:
+    clean_output = _ANSI_ESCAPE.sub(b"", output).replace(b"\r", b"\n")
+    percentages = _PERCENTAGE.findall(clean_output[-4096:])
+    speeds = _TRANSFER_SPEED.findall(clean_output[-4096:])
+    file_sizes = _FILE_SIZE.findall(clean_output[-16384:])
+    sampled_speeds = _SAMPLED_SPEED.findall(clean_output[-4096:])
+    final_sizes = _FINAL_SIZE.findall(clean_output[-4096:])
+    progress = min(float(percentages[-1]), 100.0) if percentages else None
+    speed = float(sampled_speeds[-1]) if sampled_speeds else None
+    if speed is None and speeds:
+        value, unit = speeds[-1]
+        unit_name = unit.decode("ascii").lower()
+        multiplier = 1024 if "i" in unit_name else 1000
+        power = 0 if unit_name == "b" else 1 if unit_name.startswith("k") else 2 if unit_name.startswith("m") else 3
+        speed = float(value) * multiplier**power
+    file_size = (
+        int(final_sizes[-1])
+        if final_sizes
+        else int(file_sizes[-1].replace(b",", b"")) if file_sizes else None
+    )
+    return progress, speed, file_size
 
 
 class RemoteDispatcher:
@@ -57,12 +92,15 @@ class RemoteDispatcher:
         progress: Callable[[float], None] | None = None,
         cancel_event: threading.Event | None = None,
         cancel_remote: Callable[[], None] | None = None,
+        on_transfer_metrics: Callable[[float | None, float | None, int | None], None] | None = None,
     ) -> str:
         _stdin, stdout, stderr = client.exec_command(command, get_pty=False)
         channel = stdout.channel
         output = bytearray()
         error_output = bytearray()
         started = time.monotonic()
+        last_metrics: tuple[float | None, float | None, int | None] = (None, None, None)
+        last_metrics_at = 0.0
         while not channel.exit_status_ready():
             if cancel_event and cancel_event.is_set():
                 try:
@@ -82,15 +120,29 @@ class RemoteDispatcher:
             if channel.recv_stderr_ready():
                 error_output.extend(channel.recv_stderr(65536))
                 del error_output[:-65536]
-            if progress:
-                matches = re.findall(rb"(?<!\d)(\d{1,3})%", (output + error_output)[-4096:])
-                if matches:
-                    progress(min(float(matches[-1]), 100.0))
+            parsed_progress, speed, file_size = _parse_transfer_metrics(output + error_output)
+            metrics = (parsed_progress, speed, file_size)
+            now = time.monotonic()
+            if parsed_progress is not None and progress:
+                progress(parsed_progress)
+            if (
+                on_transfer_metrics
+                and metrics != last_metrics
+                and (now - last_metrics_at >= 1.0 or file_size != last_metrics[2])
+            ):
+                on_transfer_metrics(*metrics)
+                last_metrics = metrics
+                last_metrics_at = now
             time.sleep(0.1)
         while channel.recv_ready():
             output.extend(channel.recv(65536))
         while channel.recv_stderr_ready():
             error_output.extend(channel.recv_stderr(65536))
+        final_metrics = _parse_transfer_metrics(output + error_output)
+        if on_transfer_metrics:
+            on_transfer_metrics(*final_metrics)
+        if progress and final_metrics[0] is not None:
+            progress(final_metrics[0])
         code = channel.recv_exit_status()
         if code:
             detail = (error_output or output).decode("utf-8", errors="replace")[-4000:]
@@ -125,6 +177,7 @@ class RemoteDispatcher:
         on_verifying: Callable[[], None] | None = None,
         axel_connections: int = 12,
         cancel_event: threading.Event | None = None,
+        on_transfer_metrics: Callable[[float | None, float | None, int | None], None] | None = None,
     ) -> DispatchResult:
         if not 1 <= axel_connections <= 12:
             raise ValueError("Axel connections must be between 1 and 12.")
@@ -196,7 +249,18 @@ class RemoteDispatcher:
                 )
             remote_download = (
                 f"setsid sh -c {shlex.quote(download)} & child=$!; "
-                f"printf '%s\\n' \"$child\" > {shlex.quote(pid_file)}; wait \"$child\""
+                f"printf '%s\\n' \"$child\" > {shlex.quote(pid_file)}; "
+                "previous_bytes=0; "
+                f"while kill -0 \"$child\" 2>/dev/null; do "
+                f"current_bytes=$(stat -c %s -- {q_stage} 2>/dev/null || printf '0'); "
+                "delta_bytes=$((current_bytes - previous_bytes)); "
+                "printf 'MEDIA_TRANSFER speed_bytes_per_second=%s\\n' \"$delta_bytes\"; "
+                "previous_bytes=$current_bytes; sleep 1; done; "
+                "wait \"$child\"; download_status=$?; "
+                f"if [ \"$download_status\" -eq 0 ]; then "
+                f"current_bytes=$(stat -c %s -- {q_stage} 2>/dev/null || printf '0'); "
+                "printf 'MEDIA_TRANSFER file_size_bytes=%s\\n' \"$current_bytes\"; fi; "
+                "exit \"$download_status\""
             )
             try:
                 self._run(
@@ -205,6 +269,7 @@ class RemoteDispatcher:
                     on_progress,
                     cancel_event,
                     lambda: self._terminate_remote_process(node, pid_file),
+                    on_transfer_metrics,
                 )
                 if cancel_event and cancel_event.is_set():
                     raise DispatchCancelled("Download cancelled by request.")

@@ -33,6 +33,25 @@ function Pill({ children, tone = "slate" }) {
   return <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold ${tones[tone]}`}>{children}</span>;
 }
 
+function formatBytes(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "Size pending";
+  const bytes = Number(value);
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = bytes;
+  let unitIndex = -1;
+  do {
+    size /= 1000;
+    unitIndex += 1;
+  } while (size >= 1000 && unitIndex < units.length - 1);
+  return `${size.toFixed(2)} ${units[unitIndex]}`;
+}
+
+function formatSpeed(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "Speed pending";
+  return `${formatBytes(Number(value))}/s`;
+}
+
 function App() {
   const [authenticated, setAuthenticated] = useState(null);
   const [adminUsername, setAdminUsername] = useState("");
@@ -290,13 +309,13 @@ function App() {
           <section className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0d1320]">
             <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4"><div><h2 className="font-semibold text-white">Ingestion queue</h2><p className="mt-1 text-xs text-slate-500">Latest 500 discovered streams</p></div><button onClick={refresh} className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white" aria-label="Refresh queue"><RefreshCw size={16} /></button></div>
             <div className="overflow-x-auto"><table className="w-full min-w-[780px] text-left text-sm">
-              <thead className="bg-slate-900/60 text-xs uppercase tracking-wide text-slate-500"><tr><th className="px-5 py-3">Title</th><th className="px-4 py-3">Type</th><th className="px-4 py-3">Status</th><th className="px-4 py-3">Progress</th><th className="px-4 py-3">Account</th><th className="px-4 py-3">Action</th></tr></thead>
+              <thead className="bg-slate-900/60 text-xs uppercase tracking-wide text-slate-500"><tr><th className="px-5 py-3">Title</th><th className="px-4 py-3">Type</th><th className="px-4 py-3">Status</th><th className="px-4 py-3">Progress</th><th className="px-4 py-3">Worker / Transfer</th><th className="px-4 py-3">Action</th></tr></thead>
               <tbody className="divide-y divide-slate-800/80">{queue.length ? queue.map((item) => <tr key={item.id} className="hover:bg-slate-800/20">
                 <td className="px-5 py-4"><div className="font-medium text-slate-200">{item.title}</div>{item.series_title && <div className="mt-1 text-xs text-slate-500">{item.series_title} · S{item.season ?? "—"} E{item.episode ?? "—"}</div>}{item.final_path && <div className="mt-1 max-w-[30rem] truncate font-mono text-[10px] text-slate-500" title={item.final_path}>Saved to: {item.final_path}</div>}</td>
                 <td className="px-4 py-4 text-slate-400">{item.kind === "series" ? <Tv size={16} /> : <Film size={16} />}</td>
                 <td className="px-4 py-4"><Status status={item.status} /></td>
                 <td className="px-4 py-4"><div className="flex items-center gap-2"><div className="h-1.5 w-20 overflow-hidden rounded bg-slate-800"><div className="h-full bg-indigo-400" style={{ width: `${item.progress || 0}%` }} /></div><span className="text-xs text-slate-500">{Math.round(item.progress || 0)}%</span></div></td>
-                <td className="px-4 py-4 text-slate-400">{item.account || "—"}</td><td className="px-4 py-4">{item.status === "FAILED" && <button disabled={busy} onClick={() => retry(item.id)} className="flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200"><RefreshCw size={13} />Retry</button>}{["PENDING", "DOWNLOADING", "VERIFYING"].includes(item.status) && <button disabled={busy} onClick={() => cancelDownload(item.id)} className="flex items-center gap-1.5 text-xs text-rose-300 hover:text-rose-200"><XCircle size={13} />Cancel</button>}{item.status === "CANCELLING" && <span className="text-xs text-amber-300">Cancelling…</span>}</td>
+                <td className="px-4 py-4"><div className="text-xs text-slate-300">{item.account || "Unassigned"}</div><div className="mt-1 whitespace-nowrap text-[10px] text-slate-500"><span title="Reported stream file size">{formatBytes(item.file_size_bytes)}</span><span className="mx-1.5 text-slate-700">·</span><span title="Latest reported transfer speed">{formatSpeed(item.speed_bytes_per_second)}</span></div></td><td className="px-4 py-4">{item.status === "FAILED" && <button disabled={busy} onClick={() => retry(item.id)} className="flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200"><RefreshCw size={13} />Retry</button>}{["PENDING", "DOWNLOADING", "VERIFYING"].includes(item.status) && <button disabled={busy} onClick={() => cancelDownload(item.id)} className="flex items-center gap-1.5 text-xs text-rose-300 hover:text-rose-200"><XCircle size={13} />Cancel</button>}{item.status === "CANCELLING" && <span className="text-xs text-amber-300">Cancelling…</span>}</td>
               </tr>) : <tr><td colSpan="6" className="px-5 py-14 text-center text-slate-500">No streams discovered yet. Enable a monitored category to begin.</td></tr>}</tbody>
             </table></div>
           </section>

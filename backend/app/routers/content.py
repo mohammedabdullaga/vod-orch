@@ -250,7 +250,8 @@ class ManualBatchRequest(BaseModel):
     content_type: Literal["SERIES", "MOVIE"]
     target_node_id: str | None = Field(default=None, max_length=64)
     account_ids: list[int] | None = Field(default=None, min_length=1, max_length=100)
-    proxy_mode: Literal["node", "direct"] | None = None
+    proxy_mode: Literal["node", "selected", "direct"] | None = None
+    proxy_id: int | None = Field(default=None, ge=1)
     account_offset: int = Field(default=0, ge=0)
     items: list[ManualQueueItem] = Field(min_length=1, max_length=5000)
 
@@ -302,13 +303,38 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                     status_code=409,
                     detail="One or more selected accounts already have queued or active work. Refresh account availability.",
                 )
+        selected_proxy_id = None
         if payload.proxy_mode == "node":
-            proxy = db.get(Proxy, node.proxy_id) if node.proxy_id else None
+            if payload.proxy_id is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Use selected proxy mode when specifying a proxy ID.",
+                )
+            selected_proxy_id = node.proxy_id
+            proxy = db.get(Proxy, selected_proxy_id) if selected_proxy_id else None
             if not proxy or not proxy.enabled:
                 raise HTTPException(
                     status_code=409,
-                    detail="The routed storage server has no enabled proxy. Choose direct connection.",
+                    detail="The routed storage server has no enabled proxy. Refresh proxy availability or choose direct connection.",
                 )
+        elif payload.proxy_mode == "selected":
+            if payload.proxy_id is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Select an enabled proxy or choose direct connection.",
+                )
+            selected_proxy_id = payload.proxy_id
+            proxy = db.get(Proxy, selected_proxy_id)
+            if not proxy or not proxy.enabled:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The selected proxy is no longer enabled. Refresh proxy availability or choose another proxy.",
+                )
+        elif payload.proxy_id is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="A proxy can only be selected when proxy mode is enabled.",
+            )
 
         queued: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
@@ -369,9 +395,12 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                 "category_name": category_name,
                 "series_id": entry.series_id,
                 "proxy_mode": payload.proxy_mode,
+                "proxy_id": selected_proxy_id,
                 "stream_url_encrypted": encrypt_secret(
                     stream_url(account, kind, entry.stream_id, extension)
                 ),
+                "file_size_bytes": None,
+                "speed_bytes_per_second": None,
                 "file_name": file_name,
                 "final_path": None,
                 "series_title": series_name,

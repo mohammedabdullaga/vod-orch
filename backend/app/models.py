@@ -90,6 +90,9 @@ class QueueItem(Base):
     category_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
     source_provider_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     proxy_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    proxy_id: Mapped[int | None] = mapped_column(
+        ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True
+    )
     series_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     stream_url_encrypted: Mapped[str] = mapped_column(Text)
     file_name: Mapped[str] = mapped_column(String(1024))
@@ -99,6 +102,8 @@ class QueueItem(Base):
     episode: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="PENDING", index=True)
     progress: Mapped[float] = mapped_column(Float, default=0)
+    file_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    speed_bytes_per_second: Mapped[float | None] = mapped_column(Float, nullable=True)
     account_id: Mapped[int | None] = mapped_column(
         ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True
     )
@@ -153,8 +158,11 @@ def init_db() -> None:
                 "category_name": "VARCHAR(512)",
                 "source_provider_url": "VARCHAR(2048)",
                 "proxy_mode": "VARCHAR(16)",
+                "proxy_id": "INTEGER",
                 "series_id": "VARCHAR(512)",
                 "final_path": "TEXT",
+                "file_size_bytes": "INTEGER",
+                "speed_bytes_per_second": "FLOAT",
             },
             "nodes": {
                 "name": "VARCHAR(255) NOT NULL DEFAULT 'Storage server'",

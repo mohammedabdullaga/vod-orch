@@ -330,6 +330,8 @@ def get_queue():
         "series_id": item.series_id,
         "series_title": item.series_title, "season": item.season, "episode": item.episode,
         "status": item.status, "progress": item.progress, "account": username,
+        "file_size_bytes": item.file_size_bytes,
+        "speed_bytes_per_second": item.speed_bytes_per_second,
         "final_path": item.final_path,
         "error": item.error, "retries": item.retries,
     } for item, username in rows]
@@ -349,6 +351,9 @@ def retry_item(payload: RetryRequest):
             raise HTTPException(status_code=409, detail="Only failed queue items can be retried.")
         item.status = "PENDING"
         item.account_id = None
+        item.file_size_bytes = None
+        item.speed_bytes_per_second = None
+        item.progress = 0
         item.retry_after = None
         item.error = None
         item.retries = 0
@@ -405,11 +410,23 @@ def get_account_availability(content_type: Literal["SERIES", "MOVIE"]):
             ).all())
         route = db.get(StorageRoute, kind)
         node = db.get(Node, route.node_id) if route else None
-        proxy = db.get(Proxy, node.proxy_id) if node and node.proxy_id else None
-        proxy_available = bool(proxy and proxy.enabled)
+        assigned_proxy = db.get(Proxy, node.proxy_id) if node and node.proxy_id else None
+        enabled_proxies = db.scalars(
+            select(Proxy).where(Proxy.enabled.is_(True)).order_by(Proxy.id)
+        ).all()
     return {
         "provider_url": source_account.provider_url,
-        "proxy_available": proxy_available,
+        "proxy_available": bool(enabled_proxies),
+        "assigned_proxy_id": (
+            assigned_proxy.id if assigned_proxy and assigned_proxy.enabled else None
+        ),
+        "proxies": [
+            {
+                "id": proxy.id,
+                "url": mask_secret(decrypt_secret(proxy.url_encrypted)),
+            }
+            for proxy in enabled_proxies
+        ],
         "accounts": [
             {
                 "id": account.id,

@@ -169,6 +169,7 @@ class WorkerPool:
                     status="PENDING",
                     account_id=None,
                     progress=0,
+                    speed_bytes_per_second=None,
                     error=None,
                     retry_after=None,
                     updated_at=utc_now(),
@@ -235,7 +236,12 @@ class WorkerPool:
                 update(QueueItem)
                 .where(QueueItem.id == candidate.id, QueueItem.status == "PENDING")
                 .values(
-                    status="DOWNLOADING", progress=0, account_id=account_id, error=None,
+                    status="DOWNLOADING",
+                    progress=0,
+                    file_size_bytes=None,
+                    speed_bytes_per_second=None,
+                    account_id=account_id,
+                    error=None,
                 )
             )
             if claimed.rowcount != 1:
@@ -314,14 +320,17 @@ class WorkerPool:
                     if category and category.destination_path
                     else node.watch_path
                 )
-                proxy_record = db.get(Proxy, node.proxy_id) if node.proxy_id else None
-                if item.proxy_mode == "node" and (
+                if item.proxy_mode == "selected":
+                    proxy_record = db.get(Proxy, item.proxy_id) if item.proxy_id else None
+                else:
+                    proxy_record = db.get(Proxy, node.proxy_id) if node.proxy_id else None
+                if item.proxy_mode in ("node", "selected") and (
                     not proxy_record or not proxy_record.enabled
                 ):
                     self._fail(
                         item_id,
-                        "The selected storage-server proxy is no longer enabled. "
-                        "Retry and choose direct connection or enable the proxy.",
+                        "The selected proxy is no longer available. "
+                        "Retry and choose an enabled proxy or direct connection.",
                     )
                     return
                 if item.proxy_mode == "direct" or (proxy_record and not proxy_record.enabled):
@@ -350,6 +359,9 @@ class WorkerPool:
                 ),
                 axel_connections,
                 cancel_event,
+                lambda progress, speed, file_size: self._set_transfer_metrics(
+                    item_id, progress, speed, file_size
+                ),
             )
             with SessionLocal() as db:
                 item = db.get(QueueItem, item_id)
@@ -390,6 +402,24 @@ class WorkerPool:
             item = db.get(QueueItem, item_id)
             if item and item.status not in ("COMPLETED", "FAILED", "CANCELLED", "CANCELLING"):
                 item.status = status
+                db.commit()
+
+    @staticmethod
+    def _set_transfer_metrics(
+        item_id: int,
+        progress: float | None,
+        speed: float | None,
+        file_size: int | None,
+    ) -> None:
+        with SessionLocal() as db:
+            item = db.get(QueueItem, item_id)
+            if item and item.status == "DOWNLOADING":
+                if progress is not None:
+                    item.progress = progress
+                if speed is not None:
+                    item.speed_bytes_per_second = speed
+                if file_size is not None:
+                    item.file_size_bytes = file_size
                 db.commit()
 
     @staticmethod
