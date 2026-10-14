@@ -1,0 +1,110 @@
+from datetime import datetime, timezone
+
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+
+from app.config import settings
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+engine = create_engine(
+    settings.database_url,
+    connect_args={"check_same_thread": False} if settings.database_url.startswith("sqlite") else {},
+)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+@event.listens_for(engine, "connect")
+def set_sqlite_pragmas(connection, _record):
+    if settings.database_url.startswith("sqlite"):
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+
+class Account(Base):
+    __tablename__ = "accounts"
+    __table_args__ = (UniqueConstraint("provider_url", "username"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider_url: Mapped[str] = mapped_column(String(2048))
+    username: Mapped[str] = mapped_column(String(255))
+    password_encrypted: Mapped[str] = mapped_column(Text)
+    user_agent: Mapped[str] = mapped_column(String(1024), default="Mozilla/5.0")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class Proxy(Base):
+    __tablename__ = "proxies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    url_encrypted: Mapped[str] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class MonitoredCategory(Base):
+    __tablename__ = "monitored_categories"
+    __table_args__ = (UniqueConstraint("category_id", "kind"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    category_id: Mapped[str] = mapped_column(String(255), index=True)
+    name: Mapped[str] = mapped_column(String(512))
+    kind: Mapped[str] = mapped_column(String(16))
+    monitored: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class QueueItem(Base):
+    __tablename__ = "queue"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    stream_id: Mapped[str] = mapped_column(String(512), unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(1024))
+    kind: Mapped[str] = mapped_column(String(16))
+    stream_url_encrypted: Mapped[str] = mapped_column(Text)
+    file_name: Mapped[str] = mapped_column(String(1024))
+    series_title: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    season: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    episode: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="PENDING", index=True)
+    progress: Mapped[float] = mapped_column(Float, default=0)
+    account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retries: Mapped[int] = mapped_column(Integer, default=0)
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class Node(Base):
+    __tablename__ = "nodes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    host: Mapped[str] = mapped_column(String(512))
+    port: Mapped[int] = mapped_column(Integer, default=22)
+    username: Mapped[str] = mapped_column(String(255))
+    private_key_path: Mapped[str] = mapped_column(Text)
+    staging_path: Mapped[str] = mapped_column(Text)
+    watch_path: Mapped[str] = mapped_column(Text)
+    proxy_id: Mapped[int | None] = mapped_column(
+        ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True
+    )
+    last_connected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+def init_db() -> None:
+    Base.metadata.create_all(bind=engine)

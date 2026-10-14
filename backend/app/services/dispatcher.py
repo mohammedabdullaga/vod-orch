@@ -1,0 +1,166 @@
+import re
+import shlex
+import time
+from dataclasses import dataclass
+from pathlib import PurePosixPath
+from typing import Callable
+from urllib.parse import urlsplit
+
+import paramiko
+
+from app.models import Node
+from app.security import decrypt_secret
+
+
+@dataclass(frozen=True)
+class DispatchResult:
+    final_path: str
+
+
+class RemoteDispatcher:
+    def __init__(self, known_hosts_path: str = "", command_timeout_seconds: int = 86400) -> None:
+        self.known_hosts_path = known_hosts_path
+        self.command_timeout_seconds = command_timeout_seconds
+
+    def _connect(self, node: Node) -> paramiko.SSHClient:
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        if self.known_hosts_path:
+            client.load_host_keys(self.known_hosts_path)
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        client.connect(
+            hostname=node.host,
+            port=node.port,
+            username=node.username,
+            key_filename=node.private_key_path,
+            timeout=15,
+            banner_timeout=15,
+            auth_timeout=15,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+        return client
+
+    def _run(
+        self,
+        client: paramiko.SSHClient,
+        command: str,
+        progress: Callable[[float], None] | None = None,
+    ) -> str:
+        _stdin, stdout, stderr = client.exec_command(command, get_pty=False)
+        channel = stdout.channel
+        output = bytearray()
+        error_output = bytearray()
+        started = time.monotonic()
+        while not channel.exit_status_ready():
+            if time.monotonic() - started > self.command_timeout_seconds:
+                channel.close()
+                raise TimeoutError(
+                    f"Remote command exceeded {self.command_timeout_seconds} seconds."
+                )
+            if channel.recv_ready():
+                output.extend(channel.recv(65536))
+                del output[:-65536]
+            if channel.recv_stderr_ready():
+                error_output.extend(channel.recv_stderr(65536))
+                del error_output[:-65536]
+            if progress:
+                matches = re.findall(rb"(?<!\d)(\d{1,3})%", (output + error_output)[-4096:])
+                if matches:
+                    progress(min(float(matches[-1]), 100.0))
+            time.sleep(0.1)
+        while channel.recv_ready():
+            output.extend(channel.recv(65536))
+        while channel.recv_stderr_ready():
+            error_output.extend(channel.recv_stderr(65536))
+        code = channel.recv_exit_status()
+        if code:
+            detail = (error_output or output).decode("utf-8", errors="replace")[-4000:]
+            raise RuntimeError(f"Remote command failed with exit code {code}: {detail.strip()}")
+        return output.decode("utf-8", errors="replace")
+
+    def test_connection(self, node: Node) -> None:
+        client = self._connect(node)
+        try:
+            self._run(client, "printf 'connection-ok'")
+        finally:
+            client.close()
+
+    def dispatch(
+        self,
+        node: Node,
+        stream_url: str,
+        file_name: str,
+        user_agent: str,
+        proxy_url: str | None,
+        on_progress: Callable[[float], None] | None = None,
+        on_verifying: Callable[[], None] | None = None,
+    ) -> DispatchResult:
+        staging_file = str(PurePosixPath(node.staging_path) / file_name)
+        final_path = str(PurePosixPath(node.watch_path) / file_name)
+        stage_dir = str(PurePosixPath(node.staging_path))
+        final_dir = str(PurePosixPath(node.watch_path))
+        q_stage = shlex.quote(staging_file)
+        q_url = shlex.quote(stream_url)
+        q_ua = shlex.quote(user_agent)
+        client = self._connect(node)
+        try:
+            self._run(client, f"mkdir -p {shlex.quote(stage_dir)}")
+            proxy_scheme = urlsplit(proxy_url).scheme.lower() if proxy_url else ""
+            if proxy_scheme == "socks5":
+                download = (
+                    f"aria2c --split=3 --max-connection-per-server=3 --allow-overwrite=true "
+                    f"--auto-file-renaming=false --file-allocation=none --summary-interval=1 "
+                    f"--all-proxy={shlex.quote(proxy_url)} --user-agent={q_ua} "
+                    f"--dir={shlex.quote(stage_dir)} --out={shlex.quote(file_name)} {q_url}"
+                )
+            elif proxy_url and proxy_scheme in ("http", "https"):
+                safe_proxy = shlex.quote(proxy_url)
+                download = (
+                    f"http_proxy={safe_proxy} https_proxy={safe_proxy} "
+                    f"axel -n 3 -a -o {q_stage} --user-agent={q_ua} {q_url}"
+                )
+            elif proxy_url:
+                raise RuntimeError("Proxy URL scheme must be http, https, or socks5.")
+            else:
+                download = f"axel -n 3 -a -o {q_stage} --user-agent={q_ua} {q_url}"
+            try:
+                self._run(client, download, on_progress)
+                if on_verifying:
+                    on_verifying()
+                probe = (
+                    "ffprobe -v error -select_streams v:0 "
+                    "-show_entries stream=codec_name "
+                    "-of default=noprint_wrappers=1:nokey=1 "
+                    f"{q_stage}"
+                )
+                if not self._run(client, probe).strip():
+                    raise RuntimeError("ffprobe found no video codec in the downloaded stream.")
+                same_filesystem = (
+                    f"mkdir -p {shlex.quote(final_dir)} && "
+                    f"[ \"$(stat -c %d {shlex.quote(stage_dir)})\" = "
+                    f"\"$(stat -c %d {shlex.quote(final_dir)})\" ]"
+                )
+                self._run(client, same_filesystem)
+                move = f"mv -T -- {q_stage} {shlex.quote(final_path)}"
+                self._run(client, move)
+                return DispatchResult(final_path=final_path)
+            except Exception as original_error:
+                try:
+                    self._run(client, f"rm -f {q_stage}")
+                except Exception as first_cleanup_error:
+                    cleanup_client = None
+                    try:
+                        cleanup_client = self._connect(node)
+                        self._run(cleanup_client, f"rm -f {q_stage}")
+                    except Exception as reconnect_cleanup_error:
+                        raise RuntimeError(
+                            f"{original_error}; staging cleanup failed after reconnect "
+                            f"({first_cleanup_error}; {reconnect_cleanup_error})"
+                        ) from original_error
+                    finally:
+                        if cleanup_client:
+                            cleanup_client.close()
+                raise
+        finally:
+            client.close()

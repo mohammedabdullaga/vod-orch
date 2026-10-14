@@ -1,0 +1,21 @@
+[Unit]
+Description=Media Stream Ingestion API and Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=media-ingestion
+Group=media-ingestion
+WorkingDirectory=/opt/media-ingestion/backend
+EnvironmentFile=/opt/media-ingestion/backend/.env
+ExecStart=/opt/media-ingestion/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/media-ingestion/backend
+
+[Install]
+WantedBy=multi-user.target
