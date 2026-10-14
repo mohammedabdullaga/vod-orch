@@ -320,6 +320,17 @@ class WorkerPool:
                     if category and category.destination_path
                     else node.watch_path
                 )
+                match_existing_series = bool(
+                    category
+                    and item.kind == "series"
+                    and category.match_existing_series
+                )
+                series_match_name = item.series_title if match_existing_series else None
+                series_match_prefixes = (
+                    category.strip_prefixes
+                    if match_existing_series and category
+                    else None
+                )
                 if item.proxy_mode == "selected":
                     proxy_record = db.get(Proxy, item.proxy_id) if item.proxy_id else None
                 else:
@@ -364,6 +375,9 @@ class WorkerPool:
                     item_id, progress, speed, file_size
                 ),
                 downloader=downloader,
+                match_existing_series=match_existing_series,
+                series_name=series_match_name,
+                series_match_prefixes=series_match_prefixes,
             )
             with SessionLocal() as db:
                 item = db.get(QueueItem, item_id)

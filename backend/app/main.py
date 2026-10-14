@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from pydantic import BaseModel, Field, HttpUrl
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from starlette.responses import JSONResponse
 
@@ -180,6 +180,8 @@ class CategoryToggle(BaseModel):
     kind: Literal["series", "vod"]
     monitored: bool
     destination_path: str | None = Field(default=None, max_length=4096)
+    match_existing_series: bool | None = None
+    strip_prefixes: str | None = Field(default=None, max_length=1024)
 
 
 class SSHSettings(BaseModel):
@@ -239,7 +241,15 @@ def _node_json(node: Node) -> dict:
 @app.get("/api/status")
 def get_status():
     with SessionLocal() as db:
-        counts = dict(db.query(QueueItem.status, func.count(QueueItem.id)).group_by(QueueItem.status).all())
+        counts = dict(
+            db.query(QueueItem.status, func.count(QueueItem.id))
+            .where(
+                (QueueItem.status != "COMPLETED")
+                | QueueItem.hidden_from_dashboard.is_(False)
+            )
+            .group_by(QueueItem.status)
+            .all()
+        )
         routed_nodes = db.scalars(
             select(Node)
             .join(StorageRoute, StorageRoute.node_id == Node.id)
@@ -281,6 +291,8 @@ async def get_categories():
                     "category_id": category_id, "name": row.get("category_name", row.get("name", "Unknown")),
                     "kind": kind, "monitored": bool(state.monitored) if state else False,
                     "destination_path": state.destination_path if state else None,
+                    "match_existing_series": bool(state.match_existing_series) if state else False,
+                    "strip_prefixes": state.strip_prefixes if state else "",
                 })
         return result
     except Exception as exc:
@@ -305,12 +317,33 @@ def toggle_category(payload: CategoryToggle):
             item.destination_path = _validated_remote_path(
                 payload.destination_path, "Category destination", allow_none=True
             )
+        if payload.match_existing_series is not None:
+            if payload.match_existing_series and payload.kind != "series":
+                raise HTTPException(
+                    status_code=422,
+                    detail="Existing-folder matching is only available for series categories.",
+                )
+            item.match_existing_series = payload.match_existing_series
+        if payload.strip_prefixes is not None:
+            item.strip_prefixes = payload.strip_prefixes.strip()
+        resolved_destination = (
+            item.destination_path
+            if "destination_path" not in payload.model_fields_set
+            else payload.destination_path
+        )
+        if item.match_existing_series and not resolved_destination:
+            raise HTTPException(
+                status_code=422,
+                detail="Set a custom category destination path before enabling series-folder matching.",
+            )
         db.commit()
     return {
         "ok": True,
         "category_id": payload.category_id,
         "monitored": payload.monitored,
         "destination_path": item.destination_path,
+        "match_existing_series": item.match_existing_series,
+        "strip_prefixes": item.strip_prefixes,
     }
 
 
@@ -320,6 +353,7 @@ def get_queue():
         rows = db.execute(
             select(QueueItem, Account.username)
             .outerjoin(Account, QueueItem.account_id == Account.id)
+            .where(QueueItem.hidden_from_dashboard.is_(False))
             .order_by(QueueItem.created_at.desc())
             .limit(500)
         ).all()
@@ -335,6 +369,22 @@ def get_queue():
         "final_path": item.final_path,
         "error": item.error, "retries": item.retries,
     } for item, username in rows]
+
+
+@app.post("/api/queue/clear-completed")
+def clear_completed_queue():
+    with SessionLocal() as db:
+        result = db.execute(
+            update(QueueItem)
+            .where(
+                QueueItem.status == "COMPLETED",
+                QueueItem.hidden_from_dashboard.is_(False),
+            )
+            .values(hidden_from_dashboard=True)
+        )
+        cleared_count = result.rowcount or 0
+        db.commit()
+    return {"ok": True, "cleared_count": cleared_count}
 
 
 class RetryRequest(BaseModel):

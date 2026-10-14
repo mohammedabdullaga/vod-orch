@@ -7,6 +7,7 @@ from app.models import Account, MonitoredCategory, QueueItem, SessionLocal, utc_
 from app.provider import provider_action, stream_url
 from app.security import encrypt_secret
 from app.services.content_paths import (
+    clean_content_name,
     normalized_episode_path,
     safe_filename,
     stream_identity,
@@ -95,7 +96,9 @@ class CategoryPoller:
                 if stream_id is None:
                     continue
                 extension = episode.get("container_extension", "mkv")
-                series_title = str(series.get("name") or "Series")
+                series_title = clean_content_name(
+                    str(series.get("name") or "Series"), category.strip_prefixes
+                )
                 season = _int_or_none(episode.get("season")) or season_key_number
                 episode_number = _int_or_none(episode.get("episode_num"))
                 episode_title = safe_filename(
@@ -113,6 +116,7 @@ class CategoryPoller:
                     series_id=str(series_id),
                     season=season,
                     episode_num=episode_number,
+                    strip_prefixes=category.strip_prefixes,
                 )
                 self._insert_item(
                     account, str(stream_id), title, "series",
@@ -136,6 +140,7 @@ class CategoryPoller:
             provider_url=account.provider_url,
             extension=extension,
             filename=title,
+            strip_prefixes=category.strip_prefixes,
         )
         self._insert_item(
             account, str(stream_id), title, "vod",

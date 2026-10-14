@@ -108,6 +108,8 @@ export default function ContentBrowser({ api, routing, onQueued }) {
           kind: kindFor(type),
           monitored: true,
           destination_path: category.destination_path || null,
+          match_existing_series: category.match_existing_series || false,
+          strip_prefixes: category.strip_prefixes || "",
         });
       }
       setCategories((current) => current.map((category) =>

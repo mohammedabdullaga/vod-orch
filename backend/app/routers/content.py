@@ -22,6 +22,7 @@ from app.models import (
 from app.provider import provider_action, stream_url
 from app.security import decrypt_secret, encrypt_secret
 from app.services.content_paths import (
+    clean_content_name,
     normalized_episode_path,
     safe_extension,
     season_number as parse_season_number,
@@ -98,6 +99,8 @@ async def get_content_categories(
             "kind": kind,
             "monitored": bool(state.monitored) if state else False,
             "destination_path": state.destination_path if state else None,
+            "match_existing_series": bool(state.match_existing_series) if state else False,
+            "strip_prefixes": state.strip_prefixes if state else "",
         })
     return result
 
@@ -398,7 +401,13 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                 season=entry.season,
                 episode_num=entry.episode_num,
                 filename=entry.filename,
+                strip_prefixes=category.strip_prefixes if category else None,
             )
+            if kind == "series":
+                series_name = clean_content_name(
+                    series_name or entry.title,
+                    category.strip_prefixes if category else None,
+                )
             item_values = {
                 "stream_id": identity,
                 "provider_stream_id": entry.stream_id,
@@ -493,7 +502,7 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
             proxy = None
         script_proxy_url = decrypt_secret(proxy.url_encrypted) if proxy else None
         category_overrides = {
-            category.category_id: category.destination_path
+            category.category_id: category
             for category in db.scalars(
                 select(MonitoredCategory).where(
                     MonitoredCategory.kind == kind,
@@ -546,11 +555,17 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
             season=entry.season,
             episode_num=entry.episode_num,
             filename=entry.filename,
+            strip_prefixes=(
+                category_overrides[entry.category_id].strip_prefixes
+                if entry.category_id in category_overrides
+                else None
+            ),
         )
         if relative_path in added:
             continue
         added.add(relative_path)
-        root = category_overrides.get(entry.category_id or "") or node.watch_path
+        category = category_overrides.get(entry.category_id or "")
+        root = (category.destination_path if category else None) or node.watch_path
         destination = f"{root.rstrip('/')}/{relative_path}"
         parent = destination.rsplit("/", 1)[0]
         url = stream_url(account, kind, entry.stream_id, extension)

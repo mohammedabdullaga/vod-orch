@@ -144,6 +144,8 @@ function App() {
       await api.post("/categories/toggle", {
         category_id: category.category_id, name: category.name, kind: category.kind,
         monitored: next, destination_path: category.destination_path || null,
+        match_existing_series: category.match_existing_series || false,
+        strip_prefixes: category.strip_prefixes || "",
       });
       setCategories((items) => items.map((item) =>
         item.category_id === category.category_id && item.kind === category.kind
@@ -160,6 +162,8 @@ function App() {
         kind: category.kind,
         monitored: category.monitored,
         destination_path: category.destination_path?.trim() || null,
+        match_existing_series: category.match_existing_series || false,
+        strip_prefixes: category.strip_prefixes || "",
       });
       setCategories((items) => items.map((item) =>
         item.category_id === category.category_id && item.kind === category.kind
@@ -174,6 +178,17 @@ function App() {
     () => api.post(`/queue/${id}/cancel`),
     "Download cancellation requested; the remote partial file will be removed.",
   );
+  const clearDownloadedList = () => {
+    const completedCount = status?.queue?.completed || 0;
+    if (!completedCount) return;
+    if (!window.confirm(
+      `Clear ${completedCount} completed download${completedCount === 1 ? "" : "s"} from the dashboard list? Downloaded files and completion records used to prevent duplicate downloads will remain.`
+    )) return;
+    act(
+      () => api.post("/queue/clear-completed"),
+      ({ data }) => `Cleared ${data.cleared_count} completed item${data.cleared_count === 1 ? "" : "s"} from the dashboard list. Downloaded files were not deleted.`,
+    );
+  };
   const addAccount = (event) => {
     event.preventDefault();
     act(async () => { await api.post("/accounts", accountForm); setAccountForm({ provider_url: "", username: "", password: "", user_agent: "Mozilla/5.0" }); await loadSettings(); }, "Provider account added.");
@@ -307,7 +322,7 @@ function App() {
             {statCards.map(([label, value, Icon, color]) => <div key={label} className="rounded-2xl border border-slate-800 bg-[#0d1320] p-5"><div className="flex items-center justify-between"><span className="text-sm text-slate-400">{label}</span><Icon size={17} className={color} /></div><div className="mt-3 text-3xl font-semibold text-white">{value}</div></div>)}
           </div>
           <section className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0d1320]">
-            <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4"><div><h2 className="font-semibold text-white">Ingestion queue</h2><p className="mt-1 text-xs text-slate-500">Latest 500 discovered streams</p></div><button onClick={refresh} className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white" aria-label="Refresh queue"><RefreshCw size={16} /></button></div>
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-5 py-4"><div><h2 className="font-semibold text-white">Ingestion queue</h2><p className="mt-1 text-xs text-slate-500">Latest 500 discovered streams</p></div><div className="flex items-center gap-2"><button onClick={clearDownloadedList} disabled={busy || !(counts.completed || 0)} className="inline-flex items-center gap-1.5 rounded-lg border border-rose-900/70 px-3 py-2 text-xs text-rose-300 hover:bg-rose-950/40 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 size={14} />Clear downloaded list</button><button onClick={refresh} disabled={busy} className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white disabled:opacity-40" aria-label="Refresh queue"><RefreshCw size={16} /></button></div></div>
             <div className="overflow-x-auto"><table className="w-full min-w-[780px] text-left text-sm">
               <thead className="bg-slate-900/60 text-xs uppercase tracking-wide text-slate-500"><tr><th className="px-5 py-3">Title</th><th className="px-4 py-3">Type</th><th className="px-4 py-3">Status</th><th className="px-4 py-3">Progress</th><th className="px-4 py-3">Worker / Transfer</th><th className="px-4 py-3">Action</th></tr></thead>
               <tbody className="divide-y divide-slate-800/80">{queue.length ? queue.map((item) => <tr key={item.id} className="hover:bg-slate-800/20">
@@ -324,7 +339,7 @@ function App() {
         {tab === tabs[1] && <ContentBrowser api={api} routing={routing} onQueued={refresh} />}
 
         {tab === tabs[2] && <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
-          <div className="border-b border-slate-800 px-5 py-4"><h2 className="font-semibold text-white">Category watcher</h2><p className="mt-1 text-xs text-slate-500">Watched items inherit the storage root unless this category has its own remote path. Provider IDs keep same-named shows and movies separate.</p>
+          <div className="border-b border-slate-800 px-5 py-4"><h2 className="font-semibold text-white">Category watcher</h2><p className="mt-1 text-xs text-slate-500">Watched items inherit the storage root unless this category has its own remote path. Series can optionally match existing folders beneath a custom path; ambiguous matches are skipped. Configure leading labels to remove from downloaded names.</p>
             <p className="mt-2 text-xs text-slate-400">Series storage: <code className="text-indigo-300">{nodes.find((node) => node.id === routing.series_node_id)?.watch_path || "Unassigned"}</code> · Movies storage: <code className="text-indigo-300">{nodes.find((node) => node.id === routing.movie_node_id)?.watch_path || "Unassigned"}</code></p>
           </div>
           <div className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-3">{categories.map((category) => <div key={`${category.kind}-${category.category_id}`} className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
@@ -339,6 +354,20 @@ function App() {
                   ? { ...item, destination_path: event.target.value }
                   : item
               ))} placeholder={storageRootForCategory(category) ? `${storageRootForCategory(category)} (inherit assigned server)` : "No storage server assigned"} className="field" />
+              {category.kind === "series" && <label className="flex items-start gap-2 rounded-lg border border-slate-800 p-3 text-xs text-slate-300">
+                <input type="checkbox" checked={Boolean(category.match_existing_series)} onChange={(event) => setCategories((items) => items.map((item) =>
+                  item.category_id === category.category_id && item.kind === category.kind
+                    ? { ...item, match_existing_series: event.target.checked }
+                    : item
+                ))} className="mt-0.5 accent-indigo-500" />
+                <span>Match new episodes to an existing series folder under this custom path. Only a unique close match will be used; no match or ambiguous matches fail safely.</span>
+              </label>}
+              <label className="block text-xs text-slate-400">Leading prefixes to strip (comma-separated)</label>
+              <input value={category.strip_prefixes || ""} onChange={(event) => setCategories((items) => items.map((item) =>
+                item.category_id === category.category_id && item.kind === category.kind
+                  ? { ...item, strip_prefixes: event.target.value }
+                  : item
+              ))} placeholder="4K-ar-fast, [4K], Arabic Dub" className="field" />
               <button disabled={busy} className="secondary w-full">Save path · blank uses root</button>
             </form>
           </div>)}{!categories.length && <div className="col-span-full py-12 text-center text-sm text-slate-500">Add an enabled provider account to load categories.</div>}</div>

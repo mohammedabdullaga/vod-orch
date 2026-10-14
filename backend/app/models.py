@@ -75,6 +75,8 @@ class MonitoredCategory(Base):
     kind: Mapped[str] = mapped_column(String(16))
     monitored: Mapped[bool] = mapped_column(Boolean, default=False)
     destination_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    match_existing_series: Mapped[bool] = mapped_column(Boolean, default=False)
+    strip_prefixes: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 
@@ -102,6 +104,7 @@ class QueueItem(Base):
     season: Mapped[int | None] = mapped_column(Integer, nullable=True)
     episode: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="PENDING", index=True)
+    hidden_from_dashboard: Mapped[bool] = mapped_column(Boolean, default=False)
     progress: Mapped[float] = mapped_column(Float, default=0)
     file_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     speed_bytes_per_second: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -152,6 +155,8 @@ def init_db() -> None:
         migrations = {
             "monitored_categories": {
                 "destination_path": "TEXT",
+                "match_existing_series": "BOOLEAN NOT NULL DEFAULT 0",
+                "strip_prefixes": "TEXT NOT NULL DEFAULT ''",
             },
             "queue": {
                 "provider_stream_id": "VARCHAR(512)",
@@ -162,6 +167,7 @@ def init_db() -> None:
                 "proxy_id": "INTEGER",
                 "downloader": "VARCHAR(16) NOT NULL DEFAULT 'axel'",
                 "series_id": "VARCHAR(512)",
+                "hidden_from_dashboard": "BOOLEAN NOT NULL DEFAULT 0",
                 "final_path": "TEXT",
                 "file_size_bytes": "INTEGER",
                 "speed_bytes_per_second": "FLOAT",

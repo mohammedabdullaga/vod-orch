@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 import paramiko
 
 from app.models import Node
+from app.services.content_paths import match_series_directory
 
 
 @dataclass(frozen=True)
@@ -94,7 +95,10 @@ class RemoteDispatcher:
         cancel_event: threading.Event | None = None,
         cancel_remote: Callable[[], None] | None = None,
         on_transfer_metrics: Callable[[float | None, float | None, int | None], None] | None = None,
+        max_output_bytes: int = 65536,
     ) -> str:
+        if max_output_bytes < 1:
+            raise ValueError("Remote command output limit must be positive.")
         _stdin, stdout, stderr = client.exec_command(command, get_pty=False)
         channel = stdout.channel
         output = bytearray()
@@ -117,7 +121,7 @@ class RemoteDispatcher:
                 )
             if channel.recv_ready():
                 output.extend(channel.recv(65536))
-                del output[:-65536]
+                del output[:-max_output_bytes]
             if channel.recv_stderr_ready():
                 error_output.extend(channel.recv_stderr(65536))
                 del error_output[:-65536]
@@ -180,6 +184,9 @@ class RemoteDispatcher:
         cancel_event: threading.Event | None = None,
         on_transfer_metrics: Callable[[float | None, float | None, int | None], None] | None = None,
         downloader: str = "axel",
+        match_existing_series: bool = False,
+        series_name: str | None = None,
+        series_match_prefixes: str | None = None,
     ) -> DispatchResult:
         if not 1 <= axel_connections <= 12:
             raise ValueError("Axel connections must be between 1 and 12.")
@@ -202,21 +209,45 @@ class RemoteDispatcher:
         ):
             raise ValueError("Content destination must be a safe relative POSIX path.")
         final_root = destination_root or node.watch_path
-        staging_job_dir = str(PurePosixPath(node.staging_path) / relative_path.parent)
-        staging_file = str(
-            PurePosixPath(staging_job_dir) / f"{relative_path.name}.part-{job_id}"
-        )
-        final_path = str(PurePosixPath(final_root) / relative_path)
-        stage_dir = str(PurePosixPath(node.staging_path))
-        final_dir = str(PurePosixPath(final_path).parent)
-        q_stage = shlex.quote(staging_file)
-        q_url = shlex.quote(stream_url)
-        q_ua = shlex.quote(user_agent)
         client = self._connect(node)
-        pid_file = f"{staging_file}.pid"
         try:
             if cancel_event and cancel_event.is_set():
                 raise DispatchCancelled("Download cancelled before it started.")
+            if match_existing_series:
+                if not series_name:
+                    raise ValueError("Series name is required for existing-folder matching.")
+                if len(relative_path.parts) < 3:
+                    raise ValueError("Series destination path is invalid for folder matching.")
+                listing = self._run(
+                    client,
+                    f"find {shlex.quote(final_root)} -mindepth 1 -maxdepth 1 "
+                    "-type d -print0 | head -z -n 10001",
+                    max_output_bytes=3 * 1024 * 1024,
+                )
+                folder_names = [name for name in listing.split("\0") if name]
+                if len(folder_names) > 10000:
+                    raise ValueError(
+                        "The custom series path contains more than 10,000 folders; "
+                        "use a narrower path to avoid ambiguous matches."
+                    )
+                matched_folder = match_series_directory(
+                    series_name,
+                    folder_names,
+                    series_match_prefixes,
+                )
+                final_root = str(PurePosixPath(final_root) / matched_folder)
+                relative_path = PurePosixPath(*relative_path.parts[-2:])
+            staging_job_dir = str(PurePosixPath(node.staging_path) / relative_path.parent)
+            staging_file = str(
+                PurePosixPath(staging_job_dir) / f"{relative_path.name}.part-{job_id}"
+            )
+            final_path = str(PurePosixPath(final_root) / relative_path)
+            stage_dir = str(PurePosixPath(node.staging_path))
+            final_dir = str(PurePosixPath(final_path).parent)
+            q_stage = shlex.quote(staging_file)
+            q_url = shlex.quote(stream_url)
+            q_ua = shlex.quote(user_agent)
+            pid_file = f"{staging_file}.pid"
             prepare = (
                 f"mkdir -p {shlex.quote(staging_job_dir)} {shlex.quote(final_dir)} "
                 f"&& chmod 0755 {shlex.quote(final_dir)} "
