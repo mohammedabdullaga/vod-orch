@@ -22,7 +22,7 @@ from app.models import (
     StorageRoute,
     utc_now,
 )
-from app.provider import provider_action, resolve_provider_proxy_selection, stream_url
+from app.provider import cached_provider_action, resolve_provider_proxy_selection, stream_url
 from app.security import decrypt_secret, encrypt_secret
 from app.services.content_paths import (
     category_directory_name,
@@ -82,10 +82,24 @@ async def _request_provider(
     action: str,
     *,
     proxy_url: str | None = None,
+    force_refresh: bool = False,
+    response: Response | None = None,
     **params: Any,
 ) -> Any:
     try:
-        return await provider_action(account, action, proxy_url=proxy_url, **params)
+        payload, cache_state = await cached_provider_action(
+            account,
+            action,
+            proxy_url=proxy_url,
+            force_refresh=force_refresh,
+            **params,
+        )
+        if response is not None and (
+            response.headers.get("X-Provider-Catalog-Cache") != "stale"
+            or cache_state == "stale"
+        ):
+            response.headers["X-Provider-Catalog-Cache"] = cache_state
+        return payload
     except HTTPException:
         raise
     except Exception as exc:
@@ -101,14 +115,21 @@ def _provider_kind(content_type: str) -> tuple[str, str, str]:
 
 @router.get("/categories")
 async def get_content_categories(
+    response: Response,
     type: Literal["series", "movie"] = Query(...),
     account_id: int | None = Query(default=None, ge=1),
     proxy_id: int | None = Query(default=None, ge=0),
+    refresh: bool = Query(default=False),
 ) -> list[dict[str, Any]]:
     kind, action, _ = _provider_kind(type)
     account = _provider_account(account_id)
     proxy_url = _resolve_api_proxy(proxy_id)
-    rows = _provider_rows(await _request_provider(account, action, proxy_url=proxy_url), action)
+    rows = _provider_rows(
+        await _request_provider(
+            account, action, proxy_url=proxy_url, force_refresh=refresh, response=response
+        ),
+        action,
+    )
     with SessionLocal() as db:
         states = {
             item.category_id: item
@@ -140,10 +161,12 @@ async def get_content_categories(
 @router.get("/items")
 async def get_content_items(
     request: Request,
+    response: Response,
     type: Literal["series", "movie"] = Query(...),
     category_ids: str = Query(..., min_length=1, max_length=5000),
     account_id: int | None = Query(default=None, ge=1),
     proxy_id: int | None = Query(default=None, ge=0),
+    refresh: bool = Query(default=False),
 ) -> list[dict[str, Any]]:
     kind, _, items_action = _provider_kind(type)
     ids = list(dict.fromkeys(part.strip() for part in category_ids.split(",") if part.strip()))
@@ -155,6 +178,7 @@ async def get_content_items(
         account,
         "get_series_categories" if kind == "series" else "get_vod_categories",
         proxy_url=proxy_url,
+        response=response,
     )
     category_rows = _provider_rows(
         categories_response,
@@ -179,6 +203,8 @@ async def get_content_items(
                 account,
                 items_action,
                 proxy_url=proxy_url,
+                force_refresh=refresh,
+                response=response,
                 category_id=category_id,
             ),
             items_action,
@@ -342,9 +368,11 @@ async def get_content_items(
 
 @router.get("/series/{series_id}/details")
 async def get_series_details(
+    response: Response,
     series_id: str,
     account_id: int | None = Query(default=None, ge=1),
     proxy_id: int | None = Query(default=None, ge=0),
+    refresh: bool = Query(default=False),
 ) -> dict[str, Any]:
     if not series_id or len(series_id) > 512:
         raise HTTPException(status_code=422, detail="Invalid series ID.")
@@ -354,6 +382,8 @@ async def get_series_details(
         account,
         "get_series_info",
         proxy_url=proxy_url,
+        force_refresh=refresh,
+        response=response,
         series_id=series_id,
     )
     if not isinstance(info, dict):

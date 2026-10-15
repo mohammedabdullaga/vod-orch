@@ -1,11 +1,25 @@
+import json
+import logging
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import httpx
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
-from app.models import Account, AppSettings, Proxy, SessionLocal
+from app.models import (
+    Account,
+    AppSettings,
+    ProviderCatalogCache,
+    Proxy,
+    SessionLocal,
+    utc_now,
+)
 from app.security import decrypt_secret
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_provider_proxy(proxy_id: int | None) -> str | None:
@@ -54,6 +68,119 @@ async def provider_action(
         )
         response.raise_for_status()
         return response.json()
+
+
+async def cached_provider_action(
+    account: Account,
+    action: str,
+    *,
+    proxy_url: str | None = None,
+    force_refresh: bool = False,
+    **params: Any,
+) -> tuple[Any, str]:
+    cache_params = {
+        key: str(value) if key.endswith("_id") and value is not None else value
+        for key, value in params.items()
+    }
+    params_key = json.dumps(
+        {
+            "provider_url": account.provider_url.rstrip("/"),
+            "username": account.username,
+            "params": cache_params,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with SessionLocal() as db:
+        cached = db.scalar(
+            select(ProviderCatalogCache).where(
+                ProviderCatalogCache.account_id == account.id,
+                ProviderCatalogCache.action == action,
+                ProviderCatalogCache.params_key == params_key,
+            )
+        )
+        cached_payload = None
+        cached_at = None
+        if cached:
+            cached_at = cached.fetched_at
+            try:
+                cached_payload = json.loads(cached.payload)
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Ignoring invalid cached provider payload for account %s action %s",
+                    account.id,
+                    action,
+                )
+
+    ttl_seconds = (
+        settings.provider_series_details_ttl_seconds
+        if action == "get_series_info"
+        else settings.provider_catalog_ttl_seconds
+    )
+    if cached_payload is not None and cached_at is not None and not force_refresh:
+        cache_time = cached_at
+        if cache_time.tzinfo is None:
+            cache_time = cache_time.replace(tzinfo=timezone.utc)
+        age_seconds = (datetime.now(timezone.utc) - cache_time).total_seconds()
+        if age_seconds < ttl_seconds:
+            return cached_payload, "hit"
+
+    try:
+        payload = await provider_action(
+            account,
+            action,
+            proxy_url=proxy_url,
+            **params,
+        )
+        serialized_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    except Exception as exc:
+        if cached_payload is None:
+            raise
+        logger.warning(
+            "Provider refresh failed for account %s action %s (%s); serving stale catalog",
+            account.id,
+            action,
+            type(exc).__name__,
+        )
+        return cached_payload, "stale"
+
+    with SessionLocal() as db:
+        entry = db.scalar(
+            select(ProviderCatalogCache).where(
+                ProviderCatalogCache.account_id == account.id,
+                ProviderCatalogCache.action == action,
+                ProviderCatalogCache.params_key == params_key,
+            )
+        )
+        if entry is None:
+            entry = ProviderCatalogCache(
+                account_id=account.id,
+                action=action,
+                params_key=params_key,
+                payload=serialized_payload,
+                fetched_at=utc_now(),
+            )
+            db.add(entry)
+        else:
+            entry.payload = serialized_payload
+            entry.fetched_at = utc_now()
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            entry = db.scalar(
+                select(ProviderCatalogCache).where(
+                    ProviderCatalogCache.account_id == account.id,
+                    ProviderCatalogCache.action == action,
+                    ProviderCatalogCache.params_key == params_key,
+                )
+            )
+            if entry is None:
+                raise
+            entry.payload = serialized_payload
+            entry.fetched_at = utc_now()
+            db.commit()
+    return payload, "refreshed"
 
 
 def stream_url(account: Account, kind: str, stream_id: str, extension: str = "mkv") -> str:

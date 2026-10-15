@@ -185,19 +185,31 @@ export default function ContentBrowser({
     }
   };
 
-  const browseSelected = async () => {
+  const browseSelected = async (forceRefresh = false) => {
     if (!selectedCategories.size) return setNotice("Select one or more categories to browse.");
     setBusy(true);
     setNotice("");
     setSelectedItems(new Set());
     setItemSearch("");
     try {
+      if (forceRefresh) {
+        const { data: refreshedCategories } = await api.get("/content/categories", {
+          params: {
+            type,
+            account_id: sourceAccountId,
+            proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+            refresh: true,
+          },
+        });
+        setCategories(refreshedCategories);
+      }
       const { data } = await api.get("/content/items", {
         params: {
           type,
           account_id: sourceAccountId,
           category_ids: [...selectedCategories].join(","),
           proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+          refresh: forceRefresh,
         },
       });
       setItems(data);
@@ -545,7 +557,8 @@ export default function ContentBrowser({
             </div>
             <div className="grid gap-2 border-t border-slate-800 p-3 sm:grid-cols-2">
               <button disabled={busy || !selectedCategories.size} onClick={monitorSelected} className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-40">Monitor selected</button>
-              <button disabled={busy || !selectedCategories.size} onClick={browseSelected} className="rounded-lg bg-indigo-500 px-3 py-2 text-xs font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">Browse selected</button>
+              <button disabled={busy || !selectedCategories.size} onClick={() => browseSelected()} className="rounded-lg bg-indigo-500 px-3 py-2 text-xs font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">Browse selected</button>
+              <button disabled={busy || !selectedCategories.size} onClick={() => browseSelected(true)} title="Fetch fresh categories and titles from the provider instead of using cached data." className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-300 hover:border-slate-500 hover:text-white disabled:opacity-40">Refresh from provider</button>
             </div>
           </div>
 

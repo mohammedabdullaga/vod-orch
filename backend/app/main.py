@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from pydantic import BaseModel, Field, HttpUrl
@@ -37,7 +37,11 @@ from app.models import (
     init_db,
     utc_now,
 )
-from app.provider import provider_action, resolve_provider_proxy, resolve_provider_proxy_selection
+from app.provider import (
+    cached_provider_action,
+    resolve_provider_proxy,
+    resolve_provider_proxy_selection,
+)
 from app.security import decrypt_secret, encrypt_secret, mask_secret
 from app.services.dispatcher import RemoteDispatcher
 from app.services.poller import CategoryPoller
@@ -73,6 +77,7 @@ app.add_middleware(
     allow_origins=list(settings.cors_origins),
     allow_methods=["*"],
     allow_headers=["Content-Type", "X-CSRF-Token"],
+    expose_headers=["X-Provider-Catalog-Cache"],
     allow_credentials=True,
 )
 app.state.worker_pool = worker_pool
@@ -281,7 +286,11 @@ def get_status():
 
 
 @app.get("/api/categories")
-async def get_categories(proxy_id: int | None = Query(default=None, ge=0)):
+async def get_categories(
+    response: Response,
+    proxy_id: int | None = Query(default=None, ge=0),
+    refresh: bool = Query(default=False),
+):
     with SessionLocal() as db:
         account = db.scalar(select(Account).where(Account.enabled.is_(True)).order_by(Account.id).limit(1))
         states = {
@@ -297,7 +306,18 @@ async def get_categories(proxy_id: int | None = Query(default=None, ge=0)):
     try:
         result = []
         for kind, action in (("series", "get_series_categories"), ("vod", "get_vod_categories")):
-            for row in await provider_action(account, action, proxy_url=proxy_url):
+            rows, cache_state = await cached_provider_action(
+                account,
+                action,
+                proxy_url=proxy_url,
+                force_refresh=refresh,
+            )
+            if (
+                response.headers.get("X-Provider-Catalog-Cache") != "stale"
+                or cache_state == "stale"
+            ):
+                response.headers["X-Provider-Catalog-Cache"] = cache_state
+            for row in rows:
                 category_id = str(row.get("category_id", row.get("id", "")))
                 state = states.get((kind, category_id))
                 result.append({

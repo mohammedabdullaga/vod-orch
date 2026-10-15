@@ -4,7 +4,7 @@ from sqlalchemy import or_, select
 
 from app.config import settings
 from app.models import Account, AppSettings, MonitoredCategory, QueueItem, SessionLocal, utc_now
-from app.provider import provider_action, resolve_provider_proxy, stream_url
+from app.provider import cached_provider_action, resolve_provider_proxy, stream_url
 from app.security import encrypt_secret
 from app.services.content_paths import (
     clean_content_name,
@@ -68,16 +68,16 @@ class CategoryPoller:
         proxy_url: str | None,
     ) -> None:
         source_categories = {
-            "series": await provider_action(
+            "series": (await cached_provider_action(
                 account,
                 "get_series_categories",
                 proxy_url=proxy_url,
-            ),
-            "vod": await provider_action(
+            ))[0],
+            "vod": (await cached_provider_action(
                 account,
                 "get_vod_categories",
                 proxy_url=proxy_url,
-            ),
+            ))[0],
         }
         available = {
             (kind, str(item.get("category_id", item.get("id", ""))))
@@ -89,7 +89,7 @@ class CategoryPoller:
         ]
         for category in active_categories:
             if category.kind == "series":
-                series_list = await provider_action(
+                series_list, _cache_state = await cached_provider_action(
                     account,
                     "get_series",
                     proxy_url=proxy_url,
@@ -98,7 +98,7 @@ class CategoryPoller:
                 for series in series_list:
                     await self._enqueue_series(account, category, series, proxy_url)
             else:
-                streams = await provider_action(
+                streams, _cache_state = await cached_provider_action(
                     account,
                     "get_vod_streams",
                     proxy_url=proxy_url,
@@ -117,7 +117,7 @@ class CategoryPoller:
         series_id = series.get("series_id", series.get("id"))
         if series_id is None:
             return
-        info = await provider_action(
+        info, _cache_state = await cached_provider_action(
             account,
             "get_series_info",
             proxy_url=proxy_url,

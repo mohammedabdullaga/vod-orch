@@ -56,6 +56,22 @@ class Account(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class ProviderCatalogCache(Base):
+    __tablename__ = "provider_catalog_cache"
+    __table_args__ = (
+        UniqueConstraint("account_id", "action", "params_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+    action: Mapped[str] = mapped_column(String(64))
+    params_key: Mapped[str] = mapped_column(Text)
+    payload: Mapped[str] = mapped_column(Text)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class Proxy(Base):
     __tablename__ = "proxies"
 
