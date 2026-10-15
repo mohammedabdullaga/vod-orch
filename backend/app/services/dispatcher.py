@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 import paramiko
 
+from app.config import settings
 from app.models import Node
 from app.services.content_paths import match_series_directory
 
@@ -180,7 +181,7 @@ class RemoteDispatcher:
         destination_root: str | None = None,
         on_progress: Callable[[float], None] | None = None,
         on_verifying: Callable[[], None] | None = None,
-        axel_connections: int = 12,
+        axel_connections: int = settings.default_axel_connections,
         cancel_event: threading.Event | None = None,
         on_transfer_metrics: Callable[[float | None, float | None, int | None], None] | None = None,
         downloader: str = "axel",
@@ -192,6 +193,7 @@ class RemoteDispatcher:
             raise ValueError("Axel connections must be between 1 and 12.")
         if downloader not in ("axel", "wget"):
             raise ValueError("Downloader must be either axel or wget.")
+        user_agent = user_agent.strip() or "Mozilla"
         proxy_scheme = urlsplit(proxy_url).scheme.lower() if proxy_url else ""
         if downloader == "wget":
             if proxy_scheme in ("socks5", "socks5h"):
@@ -246,23 +248,27 @@ class RemoteDispatcher:
             final_dir = str(PurePosixPath(final_path).parent)
             q_stage = shlex.quote(staging_file)
             q_url = shlex.quote(stream_url)
-            q_ua = shlex.quote(user_agent)
+            q_ua = (
+                '"'
+                + user_agent.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("$", "\\$")
+                .replace("`", "\\`")
+                + '"'
+            )
             pid_file = f"{staging_file}.pid"
+            state_file = f"{staging_file}.st"
+            q_state_file = shlex.quote(state_file)
             prepare = (
                 f"mkdir -p {shlex.quote(staging_job_dir)} {shlex.quote(final_dir)} "
                 f"&& chmod 0755 {shlex.quote(final_dir)} "
-                f"&& rm -f -- {q_stage} {shlex.quote(pid_file)}"
+                f"&& rm -f -- {q_stage} {q_state_file} {shlex.quote(pid_file)}"
             )
             self._run(
                 client,
                 prepare,
             )
             if downloader == "wget":
-                clear_proxy_env = (
-                    "env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy "
-                    "-u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY "
-                    "-u no_proxy -u NO_PROXY "
-                )
                 proxy_env = ""
                 use_proxy = "no"
                 if proxy_url:
@@ -273,18 +279,15 @@ class RemoteDispatcher:
                     )
                     use_proxy = "yes"
                 download = (
-                    f"{clear_proxy_env}{proxy_env}"
-                    f"wget -cO {q_stage} --tries=99 --retry-connrefused "
+                    f"{proxy_env}"
+                        f"wget -q -cO {q_stage} --tries=99 --retry-connrefused "
                     f"--user-agent={q_ua} -e use_proxy={use_proxy} {q_url}"
                 )
             elif proxy_scheme == "socks5":
                 download = (
-                    "env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy "
-                    "-u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY "
-                    "-u no_proxy -u NO_PROXY "
-                    f"aria2c --split={axel_connections} "
+                    f"aria2c --quiet=true --split={axel_connections} "
                     f"--max-connection-per-server={axel_connections} --allow-overwrite=true "
-                    f"--auto-file-renaming=false --file-allocation=none --summary-interval=1 "
+                    f"--auto-file-renaming=false --file-allocation=none "
                     f"--all-proxy={shlex.quote(proxy_url)} --user-agent={q_ua} "
                     f"--dir={shlex.quote(staging_job_dir)} "
                     f"--out={shlex.quote(PurePosixPath(staging_file).name)} {q_url}"
@@ -292,24 +295,21 @@ class RemoteDispatcher:
             elif proxy_url and proxy_scheme in ("http", "https"):
                 safe_proxy = shlex.quote(proxy_url)
                 download = (
-                    "env -u ftp_proxy -u all_proxy -u FTP_PROXY -u ALL_PROXY "
-                    "-u no_proxy -u NO_PROXY "
                     f"http_proxy={safe_proxy} https_proxy={safe_proxy} "
                     f"HTTP_PROXY={safe_proxy} HTTPS_PROXY={safe_proxy} "
-                    f"axel -n {axel_connections} -a -o {q_stage} "
+                    f"axel -q -n {axel_connections} -o {q_stage} "
                     f"--user-agent={q_ua} {q_url}"
                 )
             elif proxy_url:
                 raise RuntimeError("Proxy URL scheme must be http, https, or socks5.")
             else:
                 download = (
-                    "env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy "
-                    "-u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY "
-                    "-u no_proxy -u NO_PROXY "
-                    f"axel -n {axel_connections} -a -o {q_stage} "
+                    f"axel -q -n {axel_connections} -o {q_stage} "
                     f"--user-agent={q_ua} {q_url}"
                 )
             remote_download = (
+                "unset http_proxy https_proxy ftp_proxy all_proxy "
+                "HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY no_proxy NO_PROXY; "
                 f"setsid sh -c {shlex.quote(download)} & child=$!; "
                 f"printf '%s\\n' \"$child\" > {shlex.quote(pid_file)}; "
                 "previous_bytes=0; "
@@ -319,6 +319,7 @@ class RemoteDispatcher:
                 "printf 'MEDIA_TRANSFER speed_bytes_per_second=%s\\n' \"$delta_bytes\"; "
                 "previous_bytes=$current_bytes; sleep 1; done; "
                 "wait \"$child\"; download_status=$?; "
+                f"rm -f -- {q_state_file}; "
                 f"if [ \"$download_status\" -eq 0 ]; then "
                 f"current_bytes=$(stat -c %s -- {q_stage} 2>/dev/null || printf '0'); "
                 "printf 'MEDIA_TRANSFER file_size_bytes=%s\\n' \"$current_bytes\"; fi; "
@@ -367,7 +368,7 @@ class RemoteDispatcher:
                 try:
                     self._run(
                         client,
-                        f"rm -f -- {q_stage} {shlex.quote(pid_file)} && "
+                        f"rm -f -- {q_stage} {q_state_file} {shlex.quote(pid_file)} && "
                         f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}",
                     )
                 except Exception as first_cleanup_error:
@@ -376,7 +377,7 @@ class RemoteDispatcher:
                         cleanup_client = self._connect(node)
                         self._run(
                             cleanup_client,
-                            f"rm -f -- {q_stage} {shlex.quote(pid_file)} && "
+                            f"rm -f -- {q_stage} {q_state_file} {shlex.quote(pid_file)} && "
                             f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}",
                         )
                     except Exception as reconnect_cleanup_error:

@@ -15,6 +15,7 @@ class Settings:
     max_retries: int = int(os.getenv("MAX_RETRIES", "5"))
     request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
     remote_job_timeout_seconds: int = int(os.getenv("REMOTE_JOB_TIMEOUT_SECONDS", "86400"))
+    default_axel_connections: int = int(os.getenv("DEFAULT_AXEL_CONNECTIONS", "12"))
     known_hosts_path: str = os.getenv("SSH_KNOWN_HOSTS", "")
     admin_username: str = os.getenv("ADMIN_USERNAME", "")
     admin_password: str = os.getenv("ADMIN_PASSWORD", "")
@@ -26,6 +27,10 @@ class Settings:
         for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
         if origin.strip()
     )
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.default_axel_connections <= 12:
+            raise ValueError("DEFAULT_AXEL_CONNECTIONS must be between 1 and 12.")
 
 
 settings = Settings()

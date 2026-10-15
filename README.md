@@ -31,8 +31,12 @@ frontend/
   package.json              Frontend scripts and dependencies
   vite.config.js            Development API proxy
 setup.sh                    Install axel, aria2 and ffmpeg on the storage server
+DOWNLOADING_AND_CONNECTIONS.md
+                            Download lifecycle and VPS/storage network flow
 .gitignore
 ```
+
+For a detailed description of the download lifecycle, network connections, and transfer direction, see [Downloading and server connections](./DOWNLOADING_AND_CONNECTIONS.md).
 
 ## Ports and network paths
 
@@ -74,7 +78,7 @@ The **Browse & Ingest** tab supports poster-grid and compact-list views. Clickin
 
 Before a browser batch is queued, the dashboard lists idle provider accounts for the content's provider endpoint. Choose one or more accounts; selected jobs are distributed across them and each account still handles only one active job at a time. The request rechecks account availability before enqueueing. Choose either a direct connection or any enabled proxy from the proxy pool for that batch. The selected proxy ID is stored per queue item and revalidated when the worker starts; disabling or deleting it before dispatch fails the job explicitly rather than silently switching routes. Automatic watched downloads continue to use the routed server's configured proxy when enabled.
 
-Each storage server defaults to 12 Axel connections (configurable from 1 to 12). Existing nodes that still had the previous default of 4 are migrated to 12 once; explicitly configured values other than 4 remain unchanged. In the manual batch confirmation, choose the existing Axel/aria2c behavior or Wget before queueing. Wget uses the reference script's resume/output, 99-retry, retry-on-connection-refused, User-Agent, and explicit proxy/direct settings; it downloads each file over one connection and cannot use SOCKS5. SOCKS5 with the default choice uses `aria2c`; direct and HTTP(S)-proxy jobs with the default choice use Axel. File size and current transfer rate are sampled from remote staging-file growth, so they are available for both downloaders; percentage is shown when the selected downloader reports one. The speed is the latest sample after transfer completion. The queue supports cancelling pending and active downloads; active cancellation stops the remote process and removes its staging partial. Completed queue rows show the final remote path.
+Each storage server defaults to 12 Axel connections (configurable from 1 to 12 per node or by setting `DEFAULT_AXEL_CONNECTIONS` in `backend/.env` for new nodes). Existing nodes keep their saved connection counts; the earlier one-time migration changed only nodes that still had the old default of 4. New accounts and download commands default to the standard `Mozilla` User-Agent; an account's explicitly configured User-Agent is preserved. Daemon Axel jobs use quiet mode without ANSI progress output, while the standalone script uses the terminal-friendly Axel output. Wget uses the reference script's resume/output, 99-retry, retry-on-connection-refused, User-Agent, and explicit proxy/direct settings; it downloads each file over one connection and cannot use SOCKS5. SOCKS5 with the default choice uses `aria2c`; direct and HTTP(S)-proxy jobs with the default choice use Axel. File size and current transfer rate are sampled from remote staging-file growth, so they are available for both downloaders; percentage is shown when the selected downloader reports one. The speed is the latest sample after transfer completion. The queue supports cancelling pending and active downloads; active cancellation stops the remote process and removes its staging partial and Axel state file. Completed queue rows show the final remote path.
 
 Use **Clear downloaded list** in **Overview & Queue** to hide completed items from the dashboard and completed count. This does not remove media files or completion records, so cleared streams remain protected from duplicate queueing.
 
@@ -257,6 +261,7 @@ If the dashboard and API are served from different browser origins, set `CORS_OR
 | `GET` | `/api/queue` | List queue items |
 | `POST` | `/api/queue/retry` | Retry a failed item |
 | `POST` | `/api/queue/{item_id}/cancel` | Cancel a pending or active download |
+| `POST` | `/api/queue/stop-all-and-clear` | Stop active jobs and hide all queue entries without deleting media files |
 | `GET` | `/api/content/categories?type=series\|movie` | Provider categories and watch state |
 | `GET` | `/api/content/items?type=series\|movie&category_ids=1,2` | Titles in selected categories |
 | `GET` | `/api/content/series/{series_id}/details` | Seasons and normalized episode metadata |
@@ -280,6 +285,7 @@ The interactive OpenAPI documentation is at `/docs` on the API origin; keep it b
 - On daemon startup, interrupted `DOWNLOADING` and `VERIFYING` jobs are reset to `PENDING` for recovery.
 - Queue stream IDs are unique. Existing queue items are not re-created when polled again.
 - Failed jobs are retried with exponential backoff up to `MAX_RETRIES`; manual retry is also available.
+- **Stop all & clear all** cancels active work, cancels pending work and hides every queue entry. Records remain internally as deduplication tombstones; completed media files are never deleted by this action. Monitored categories remain enabled and can enqueue future new streams.
 - SSH host-key checking is strict. The daemon must trust the storage server key before a test or download can succeed.
 - The remote node needs `axel`, `aria2c` for SOCKS5, and `ffprobe`. Remote SSH egress and provider/proxy network policy must allow the requested stream.
 - Back up both `backend/ingestion.db` and the encryption key securely.

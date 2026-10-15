@@ -34,6 +34,7 @@ class WorkerPool:
         self._busy_accounts: set[int] = set()
         self._cancel_events: dict[int, threading.Event] = {}
         self._cancel_lock = threading.Lock()
+        self._clearing_queue = False
         self._manager_wakeup = asyncio.Event()
         self._stopping = asyncio.Event()
         self.active_count = 0
@@ -180,6 +181,8 @@ class WorkerPool:
             logger.warning("Reset %s interrupted queue jobs to PENDING.", result.rowcount)
 
     def _claim_next(self, account_id: int) -> int | None:
+        if self._clearing_queue:
+            return None
         with SessionLocal() as db:
             now = utc_now()
             self._release_due_retries(db, now)
@@ -250,6 +253,81 @@ class WorkerPool:
             db.commit()
             return candidate.id
 
+    async def stop_all_and_clear(
+        self, timeout_seconds: float = 120
+    ) -> dict[str, int | bool]:
+        if self._clearing_queue:
+            raise RuntimeError("A stop-all-and-clear operation is already in progress.")
+        self._clearing_queue = True
+        try:
+            with SessionLocal() as db:
+                statuses = db.scalars(select(QueueItem.status)).all()
+                pending_count = sum(status == "PENDING" for status in statuses)
+                active_count = sum(
+                    status in ("DOWNLOADING", "VERIFYING", "CANCELLING")
+                    for status in statuses
+                )
+                db.execute(
+                    update(QueueItem)
+                    .where(QueueItem.status == "PENDING")
+                    .values(
+                        status="CANCELLED",
+                        account_id=None,
+                        progress=0,
+                        error="Cancelled by administrator during stop-all-and-clear.",
+                        retry_after=None,
+                        updated_at=utc_now(),
+                    )
+                )
+                db.execute(
+                    update(QueueItem)
+                    .where(QueueItem.status.in_(("DOWNLOADING", "VERIFYING")))
+                    .values(
+                        status="CANCELLING",
+                        error="Cancellation requested by stop-all-and-clear.",
+                        retry_after=None,
+                        updated_at=utc_now(),
+                    )
+                )
+                db.commit()
+
+            with self._cancel_lock:
+                cancel_events = list(self._cancel_events.values())
+            for cancel_event in cancel_events:
+                cancel_event.set()
+            self.wake()
+
+            deadline = asyncio.get_running_loop().time() + timeout_seconds
+            while True:
+                with self._cancel_lock:
+                    active_jobs = bool(self._cancel_events)
+                if not active_jobs:
+                    break
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Timed out waiting for remote downloads to stop; queue records were not cleared."
+                    )
+                await asyncio.sleep(min(0.1, remaining))
+
+            with SessionLocal() as db:
+                result = db.execute(
+                    update(QueueItem)
+                    .where(QueueItem.hidden_from_dashboard.is_(False))
+                    .values(hidden_from_dashboard=True, updated_at=utc_now())
+                )
+                cleared_count = result.rowcount or 0
+                db.commit()
+            return {
+                "ok": True,
+                "cleared_count": cleared_count,
+                "pending_cancelled_count": pending_count,
+                "active_cancelled_count": active_count,
+            }
+        finally:
+            self._clearing_queue = False
+            self.wake()
+
     @staticmethod
     def _release_due_retries(db, now) -> None:
         due = db.scalars(
@@ -314,7 +392,7 @@ class WorkerPool:
                     )
                 else:
                     stream_url_value = decrypt_secret(item.stream_url_encrypted)
-                user_agent = account.user_agent
+                user_agent = account.user_agent or "Mozilla"
                 destination_root = (
                     category.destination_path
                     if category and category.destination_path
@@ -347,7 +425,9 @@ class WorkerPool:
                 if item.proxy_mode == "direct" or (proxy_record and not proxy_record.enabled):
                     proxy_record = None
                 proxy_url = decrypt_secret(proxy_record.url_encrypted) if proxy_record else None
-                axel_connections = node.axel_connections
+                axel_connections = (
+                    node.axel_connections or settings.default_axel_connections
+                )
                 downloader = item.downloader or "axel"
                 if cancel_event.is_set():
                     self._mark_cancelled(item_id)

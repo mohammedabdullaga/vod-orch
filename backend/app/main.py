@@ -163,7 +163,7 @@ class AccountCreate(BaseModel):
     provider_url: HttpUrl
     username: str = Field(min_length=1, max_length=255)
     password: str = Field(min_length=1)
-    user_agent: str = Field(default="Mozilla/5.0", max_length=1024)
+    user_agent: str = Field(default="Mozilla", max_length=1024)
 
 
 class ProxyCreate(BaseModel):
@@ -193,7 +193,9 @@ class SSHSettings(BaseModel):
     staging_path: str
     watch_path: str
     proxy_id: int | None = Field(default=None, ge=1)
-    axel_connections: int = Field(default=12, ge=1, le=12)
+    axel_connections: int = Field(
+        default=settings.default_axel_connections, ge=1, le=12
+    )
     test: bool = False
 
 
@@ -243,10 +245,7 @@ def get_status():
     with SessionLocal() as db:
         counts = dict(
             db.query(QueueItem.status, func.count(QueueItem.id))
-            .where(
-                (QueueItem.status != "COMPLETED")
-                | QueueItem.hidden_from_dashboard.is_(False)
-            )
+            .where(QueueItem.hidden_from_dashboard.is_(False))
             .group_by(QueueItem.status)
             .all()
         )
@@ -263,10 +262,14 @@ def get_status():
     )
     return {
         "daemon_running": True, "ssh_connected": ssh_connected, "active_workers": worker_pool.active_count,
-        "available_accounts": accounts, "queue": {
+        "available_accounts": accounts,
+        "default_axel_connections": settings.default_axel_connections,
+        "queue": {
             "pending": counts.get("PENDING", 0), "downloading": counts.get("DOWNLOADING", 0),
             "verifying": counts.get("VERIFYING", 0), "completed": counts.get("COMPLETED", 0),
             "failed": counts.get("FAILED", 0),
+            "cancelled": counts.get("CANCELLED", 0),
+            "cancelling": counts.get("CANCELLING", 0),
         },
     }
 
@@ -385,6 +388,16 @@ def clear_completed_queue():
         cleared_count = result.rowcount or 0
         db.commit()
     return {"ok": True, "cleared_count": cleared_count}
+
+
+@app.post("/api/queue/stop-all-and-clear")
+async def stop_all_and_clear_queue():
+    try:
+        return await worker_pool.stop_all_and_clear()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
 
 
 class RetryRequest(BaseModel):

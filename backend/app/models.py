@@ -51,7 +51,7 @@ class Account(Base):
     provider_url: Mapped[str] = mapped_column(String(2048))
     username: Mapped[str] = mapped_column(String(255))
     password_encrypted: Mapped[str] = mapped_column(Text)
-    user_agent: Mapped[str] = mapped_column(String(1024), default="Mozilla/5.0")
+    user_agent: Mapped[str] = mapped_column(String(1024), default="Mozilla")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -129,7 +129,9 @@ class Node(Base):
     private_key_path: Mapped[str] = mapped_column(Text)
     staging_path: Mapped[str] = mapped_column(Text)
     watch_path: Mapped[str] = mapped_column(Text)
-    axel_connections: Mapped[int] = mapped_column(Integer, default=12)
+    axel_connections: Mapped[int] = mapped_column(
+        Integer, default=settings.default_axel_connections
+    )
     proxy_id: Mapped[int | None] = mapped_column(
         ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True
     )
@@ -174,7 +176,9 @@ def init_db() -> None:
             },
             "nodes": {
                 "name": "VARCHAR(255) NOT NULL DEFAULT 'Storage server'",
-                "axel_connections": "INTEGER NOT NULL DEFAULT 12",
+                "axel_connections": (
+                    f"INTEGER NOT NULL DEFAULT {settings.default_axel_connections}"
+                ),
             },
         }
         inspector = inspect(connection)

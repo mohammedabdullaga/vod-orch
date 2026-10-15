@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from app.config import settings
 from app.models import (
     Account,
     MonitoredCategory,
@@ -373,7 +374,7 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                     )
                 )
             )
-            if existing and existing.status != "FAILED":
+            if existing and existing.status not in ("FAILED", "CANCELLED"):
                 skipped.append({"stream_id": entry.stream_id, "reason": existing.status.lower()})
                 continue
 
@@ -435,6 +436,7 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                     if selected_accounts else None
                 ),
                 "status": "PENDING",
+                "hidden_from_dashboard": False,
                 "progress": 0,
                 "error": None,
                 "retry_after": None,
@@ -522,6 +524,8 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
         for entry in payload.items
     })
     host_comment = str(node.host).replace("\n", " ").replace("\r", " ")
+    axel_connections = node.axel_connections or settings.default_axel_connections
+    user_agent = account.user_agent or "Mozilla"
     required_downloader = "aria2c" if proxy_scheme == "socks5" else "axel"
     lines = [
         "#!/usr/bin/env bash",
@@ -531,6 +535,8 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
         f"# Categories: {', '.join(categories)}",
         f"# Generated at: {timestamp.isoformat()}",
         "set -euo pipefail",
+        "unset http_proxy https_proxy ftp_proxy all_proxy "
+        "HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY no_proxy NO_PROXY",
         "",
         f"command -v {required_downloader} >/dev/null 2>&1 || "
         f"{{ echo '{required_downloader} is required' >&2; exit 127; }}",
@@ -573,15 +579,19 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
         q_parent = shlex.quote(parent)
         q_destination = shlex.quote(destination)
         q_url = shlex.quote(url)
-        q_user_agent = shlex.quote(account.user_agent or "Mozilla")
+        q_user_agent = (
+            '"'
+            + user_agent.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("$", "\\$")
+            .replace("`", "\\`")
+            + '"'
+        )
         lines.append(f"mkdir -p {q_parent} && chmod 0755 {q_parent}")
         if proxy_scheme == "socks5" and quoted_proxy:
             lines.append(
-                "env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy "
-                "-u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY "
-                "-u no_proxy -u NO_PROXY "
-                f"aria2c --split={node.axel_connections} "
-                f"--max-connection-per-server={node.axel_connections} "
+                f"aria2c --split={axel_connections} "
+                f"--max-connection-per-server={axel_connections} "
                 f"--allow-overwrite=true --auto-file-renaming=false "
                 f"--file-allocation=none --summary-interval=1 "
                 f"--all-proxy={quoted_proxy} --user-agent={q_user_agent} "
@@ -589,19 +599,14 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
             )
         elif quoted_proxy:
             lines.append(
-                "env -u ftp_proxy -u all_proxy -u FTP_PROXY -u ALL_PROXY "
-                "-u no_proxy -u NO_PROXY "
                 f"http_proxy={quoted_proxy} https_proxy={quoted_proxy} "
                 f"HTTP_PROXY={quoted_proxy} HTTPS_PROXY={quoted_proxy} "
-                f"axel -n {node.axel_connections} -a -o {q_destination} "
+                f"axel -n {axel_connections} -o {q_destination} "
                 f"--user-agent={q_user_agent} {q_url}"
             )
         else:
             lines.append(
-                "env -u http_proxy -u https_proxy -u ftp_proxy -u all_proxy "
-                "-u HTTP_PROXY -u HTTPS_PROXY -u FTP_PROXY -u ALL_PROXY "
-                "-u no_proxy -u NO_PROXY "
-                f"axel -n {node.axel_connections} -a -o {q_destination} "
+                f"axel -n {axel_connections} -o {q_destination} "
                 f"--user-agent={q_user_agent} {q_url}"
             )
         lines.append("")

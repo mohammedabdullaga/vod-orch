@@ -66,11 +66,11 @@ function App() {
   const [editingNodeId, setEditingNodeId] = useState(null);
   const [nodeForm, setNodeForm] = useState({
     name: "", host: "", port: 22, username: "", private_key_path: "", staging_path: "", watch_path: "",
-    proxy_id: "", axel_connections: 12,
+    proxy_id: "", axel_connections: "",
   });
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
-  const [accountForm, setAccountForm] = useState({ provider_url: "", username: "", password: "", user_agent: "Mozilla/5.0" });
+  const [accountForm, setAccountForm] = useState({ provider_url: "", username: "", password: "", user_agent: "Mozilla" });
   const [proxyUrl, setProxyUrl] = useState("");
 
   useEffect(() => {
@@ -189,9 +189,24 @@ function App() {
       ({ data }) => `Cleared ${data.cleared_count} completed item${data.cleared_count === 1 ? "" : "s"} from the dashboard list. Downloaded files were not deleted.`,
     );
   };
+  const stopAllAndClearQueue = () => {
+    const counts = status?.queue || {};
+    const total = [
+      counts.pending, counts.downloading, counts.verifying, counts.completed,
+      counts.failed, counts.cancelled, counts.cancelling,
+    ].reduce((sum, value) => sum + (value || 0), 0);
+    if (!total) return;
+    if (!window.confirm(
+      `Stop active downloads and clear all ${total} queue entries, including completed and pending items? Downloaded media files will remain on storage servers.`
+    )) return;
+    act(
+      () => api.post("/queue/stop-all-and-clear"),
+      ({ data }) => `Stopped ${data.active_cancelled_count} active and cancelled ${data.pending_cancelled_count} pending download${data.pending_cancelled_count === 1 ? "" : "s"}; cleared ${data.cleared_count} queue entr${data.cleared_count === 1 ? "y" : "ies"}. Downloaded media files were kept.`,
+    );
+  };
   const addAccount = (event) => {
     event.preventDefault();
-    act(async () => { await api.post("/accounts", accountForm); setAccountForm({ provider_url: "", username: "", password: "", user_agent: "Mozilla/5.0" }); await loadSettings(); }, "Provider account added.");
+    act(async () => { await api.post("/accounts", accountForm); setAccountForm({ provider_url: "", username: "", password: "", user_agent: "Mozilla" }); await loadSettings(); }, "Provider account added.");
   };
   const addProxy = (event) => {
     event.preventDefault();
@@ -204,11 +219,12 @@ function App() {
   const saveNode = (event, test = false) => {
     event?.preventDefault();
     act(async () => {
+      const { axel_connections, ...nodeFields } = nodeForm;
       const payload = {
-        ...nodeForm,
+        ...nodeFields,
         port: Number(nodeForm.port),
         proxy_id: nodeForm.proxy_id ? Number(nodeForm.proxy_id) : null,
-        axel_connections: Number(nodeForm.axel_connections || 12),
+        ...(axel_connections ? { axel_connections: Number(axel_connections) } : {}),
         test,
       };
       const response = editingNodeId
@@ -232,7 +248,7 @@ function App() {
     setEditingNodeId(null);
     setNodeForm({
       name: "", host: "", port: 22, username: "", private_key_path: "", staging_path: "", watch_path: "",
-      proxy_id: "", axel_connections: 12,
+      proxy_id: "", axel_connections: "",
     });
   };
   const saveRouting = (event) => {
@@ -322,7 +338,7 @@ function App() {
             {statCards.map(([label, value, Icon, color]) => <div key={label} className="rounded-2xl border border-slate-800 bg-[#0d1320] p-5"><div className="flex items-center justify-between"><span className="text-sm text-slate-400">{label}</span><Icon size={17} className={color} /></div><div className="mt-3 text-3xl font-semibold text-white">{value}</div></div>)}
           </div>
           <section className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0d1320]">
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-5 py-4"><div><h2 className="font-semibold text-white">Ingestion queue</h2><p className="mt-1 text-xs text-slate-500">Latest 500 discovered streams</p></div><div className="flex items-center gap-2"><button onClick={clearDownloadedList} disabled={busy || !(counts.completed || 0)} className="inline-flex items-center gap-1.5 rounded-lg border border-rose-900/70 px-3 py-2 text-xs text-rose-300 hover:bg-rose-950/40 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 size={14} />Clear downloaded list</button><button onClick={refresh} disabled={busy} className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white disabled:opacity-40" aria-label="Refresh queue"><RefreshCw size={16} /></button></div></div>
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-5 py-4"><div><h2 className="font-semibold text-white">Ingestion queue</h2><p className="mt-1 text-xs text-slate-500">Latest 500 discovered streams</p></div><div className="flex flex-wrap items-center gap-2"><button onClick={clearDownloadedList} disabled={busy || !(counts.completed || 0)} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 size={14} />Clear downloaded list</button><button onClick={stopAllAndClearQueue} disabled={busy || ![counts.pending, counts.downloading, counts.verifying, counts.completed, counts.failed, counts.cancelled, counts.cancelling].some((value) => value > 0)} className="inline-flex items-center gap-1.5 rounded-lg border border-rose-900/70 px-3 py-2 text-xs text-rose-300 hover:bg-rose-950/40 disabled:cursor-not-allowed disabled:opacity-40"><XCircle size={14} />Stop all &amp; clear all</button><button onClick={refresh} disabled={busy} className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white disabled:opacity-40" aria-label="Refresh queue"><RefreshCw size={16} /></button></div></div>
             <div className="overflow-x-auto"><table className="w-full min-w-[780px] text-left text-sm">
               <thead className="bg-slate-900/60 text-xs uppercase tracking-wide text-slate-500"><tr><th className="px-5 py-3">Title</th><th className="px-4 py-3">Type</th><th className="px-4 py-3">Status</th><th className="px-4 py-3">Progress</th><th className="px-4 py-3">Worker / Transfer</th><th className="px-4 py-3">Action</th></tr></thead>
               <tbody className="divide-y divide-slate-800/80">{queue.length ? queue.map((item) => <tr key={item.id} className="hover:bg-slate-800/20">
@@ -423,7 +439,7 @@ function App() {
                   ["private_key_path", "Private key path on daemon"], ["staging_path", "Remote staging directory"], ["watch_path", "Storage root on this server"],
                 ].map(([key, placeholder]) => <input key={key} required placeholder={placeholder} type={key === "port" ? "number" : "text"} value={nodeForm[key] ?? ""} onChange={(event) => setNodeForm({ ...nodeForm, [key]: event.target.value })} className="field" />)}
                 <label className="block text-xs text-slate-400">Axel connections (1–12)
-                  <input required min="1" max="12" type="number" value={nodeForm.axel_connections ?? 12} onChange={(event) => setNodeForm({ ...nodeForm, axel_connections: event.target.value })} className="field mt-2" />
+                  <input required min="1" max="12" type="number" value={nodeForm.axel_connections || status?.default_axel_connections || 12} onChange={(event) => setNodeForm({ ...nodeForm, axel_connections: event.target.value })} className="field mt-2" />
                 </label>
                 <label className="block text-xs text-slate-400">Worker proxy
                   <select value={nodeForm.proxy_id ?? ""} onChange={(event) => setNodeForm({ ...nodeForm, proxy_id: event.target.value })} className="field mt-2">
