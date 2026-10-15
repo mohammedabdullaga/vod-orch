@@ -28,6 +28,7 @@ from app.auth import (
 from app.models import (
     Account,
     AppSettings,
+    M3UPlaylist,
     MonitoredCategory,
     Node,
     Proxy,
@@ -649,6 +650,14 @@ def delete_proxy(proxy_id: int):
         proxy = db.get(Proxy, proxy_id)
         if not proxy:
             raise HTTPException(status_code=404, detail="Proxy not found.")
+        assigned_playlists = db.scalar(
+            select(func.count(M3UPlaylist.id)).where(M3UPlaylist.proxy_id == proxy_id)
+        )
+        if assigned_playlists:
+            raise HTTPException(
+                status_code=409,
+                detail="This proxy is assigned to an M3U playlist. Reassign that playlist before deleting the proxy.",
+            )
         db.delete(proxy)
         db.commit()
     return {"ok": True}

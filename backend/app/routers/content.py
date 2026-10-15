@@ -26,7 +26,12 @@ from app.models import (
     StorageRoute,
     utc_now,
 )
-from app.provider import cached_provider_action, resolve_provider_proxy_selection, stream_url
+from app.provider import (
+    cached_provider_action,
+    resolve_provider_proxy,
+    resolve_provider_proxy_selection,
+    stream_url,
+)
 from app.security import decrypt_secret, encrypt_secret
 from app.services.m3u import fetch_playlist, replace_playlist_entries
 from app.services.content_paths import (
@@ -125,6 +130,10 @@ class M3UPlaylistCreate(BaseModel):
     proxy_id: int | None = Field(default=None, ge=0)
 
 
+class M3UPlaylistProxyUpdate(BaseModel):
+    proxy_id: int | None = Field(default=None, ge=0)
+
+
 def _playlist_category_id(playlist_id: int, group_title: str) -> str:
     group_hash = hashlib.sha256(group_title.encode("utf-8")).hexdigest()[:16]
     return f"m3u:{playlist_id}:{group_hash}"
@@ -156,6 +165,7 @@ def list_m3u_playlists() -> list[dict[str, Any]]:
             {
                 "id": playlist.id,
                 "name": playlist.name,
+                "proxy_id": playlist.proxy_id,
                 "enabled": playlist.enabled,
                 "entry_count": playlist.entry_count,
                 "fetched_at": playlist.fetched_at.isoformat(),
@@ -168,8 +178,12 @@ def list_m3u_playlists() -> list[dict[str, Any]]:
 async def import_m3u_playlist(payload: M3UPlaylistCreate) -> dict[str, Any]:
     if not payload.name.strip():
         raise HTTPException(status_code=422, detail="Playlist name cannot be blank.")
+    proxy_id = payload.proxy_id or None
     try:
-        proxy_url = resolve_provider_proxy_selection(payload.proxy_id)
+        proxy_url = resolve_provider_proxy(proxy_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
         entries = await fetch_playlist(payload.url, proxy_url)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -182,6 +196,7 @@ async def import_m3u_playlist(payload: M3UPlaylistCreate) -> dict[str, Any]:
         playlist = M3UPlaylist(
             name=payload.name.strip(),
             source_url_encrypted=encrypt_secret(payload.url),
+            proxy_id=proxy_id,
             entry_count=0,
             fetched_at=utc_now(),
         )
@@ -194,17 +209,21 @@ async def import_m3u_playlist(payload: M3UPlaylistCreate) -> dict[str, Any]:
 
 
 @playlist_router.post("/{playlist_id}/refresh")
-async def refresh_m3u_playlist(
-    playlist_id: int,
-    proxy_id: int | None = Query(default=None, ge=0),
-) -> dict[str, Any]:
+async def refresh_m3u_playlist(playlist_id: int) -> dict[str, Any]:
     with SessionLocal() as db:
         playlist = db.get(M3UPlaylist, playlist_id)
         if not playlist:
             raise HTTPException(status_code=404, detail="M3U playlist not found.")
         source_url = decrypt_secret(playlist.source_url_encrypted)
+        proxy_id = playlist.proxy_id
     try:
-        proxy_url = resolve_provider_proxy_selection(proxy_id)
+        proxy_url = resolve_provider_proxy(proxy_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"The assigned M3U proxy is unavailable. Replace it before refreshing: {exc}",
+        ) from exc
+    try:
         entries = await fetch_playlist(source_url, proxy_url)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -215,6 +234,26 @@ async def refresh_m3u_playlist(
         raise HTTPException(status_code=422, detail="The refreshed playlist contains no usable HTTP streams.")
     count = await asyncio.to_thread(replace_playlist_entries, playlist_id, entries)
     return {"id": playlist_id, "entry_count": count}
+
+
+@playlist_router.put("/{playlist_id}/proxy")
+def update_m3u_playlist_proxy(
+    playlist_id: int,
+    payload: M3UPlaylistProxyUpdate,
+) -> dict[str, int | None]:
+    proxy_id = payload.proxy_id or None
+    if proxy_id is not None:
+        try:
+            resolve_provider_proxy(proxy_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    with SessionLocal() as db:
+        playlist = db.get(M3UPlaylist, playlist_id)
+        if not playlist:
+            raise HTTPException(status_code=404, detail="M3U playlist not found.")
+        playlist.proxy_id = proxy_id
+        db.commit()
+    return {"id": playlist_id, "proxy_id": proxy_id}
 
 
 @playlist_router.delete("/{playlist_id}")

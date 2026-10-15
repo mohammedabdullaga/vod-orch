@@ -78,6 +78,9 @@ class M3UPlaylist(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255))
     source_url_encrypted: Mapped[str] = mapped_column(Text)
+    proxy_id: Mapped[int | None] = mapped_column(
+        ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True
+    )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     entry_count: Mapped[int] = mapped_column(Integer, default=0)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -244,6 +247,9 @@ def init_db() -> None:
                     f"INTEGER NOT NULL DEFAULT {settings.default_axel_connections}"
                 ),
             },
+            "m3u_playlists": {
+                "proxy_id": "INTEGER",
+            },
         }
         inspector = inspect(connection)
         for table_name, columns in migrations.items():
@@ -253,6 +259,12 @@ def init_db() -> None:
                     connection.exec_driver_sql(
                         f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
                     )
+                    if table_name == "m3u_playlists" and column_name == "proxy_id":
+                        connection.exec_driver_sql(
+                            "UPDATE m3u_playlists SET proxy_id = "
+                            "(SELECT provider_proxy_id FROM app_settings WHERE id = 1) "
+                            "WHERE proxy_id IS NULL"
+                        )
         connection.exec_driver_sql(
             "CREATE TABLE IF NOT EXISTS schema_migrations "
             "(version VARCHAR(128) PRIMARY KEY, applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"
