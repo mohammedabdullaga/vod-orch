@@ -46,7 +46,11 @@ from app.security import decrypt_secret, encrypt_secret, mask_secret
 from app.services.dispatcher import RemoteDispatcher
 from app.services.poller import CategoryPoller
 from app.services.worker_pool import WorkerPool
-from app.routers.content import queue_router, router as content_router
+from app.routers.content import (
+    playlist_router,
+    queue_router,
+    router as content_router,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -84,6 +88,7 @@ app.state.worker_pool = worker_pool
 app.state.dispatcher = dispatcher
 app.include_router(content_router)
 app.include_router(queue_router)
+app.include_router(playlist_router)
 
 
 @app.middleware("http")

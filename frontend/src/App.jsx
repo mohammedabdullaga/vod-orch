@@ -60,6 +60,7 @@ function App() {
   const [queue, setQueue] = useState([]);
   const [categories, setCategories] = useState([]);
   const [accounts, setAccounts] = useState([]);
+  const [m3uPlaylists, setM3uPlaylists] = useState([]);
   const [proxies, setProxies] = useState([]);
   const [providerProxyId, setProviderProxyId] = useState("");
   const [providerProxyReady, setProviderProxyReady] = useState(false);
@@ -73,6 +74,7 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [accountForm, setAccountForm] = useState({ provider_url: "", username: "", password: "", user_agent: "Mozilla" });
+  const [playlistForm, setPlaylistForm] = useState({ name: "", url: "" });
   const [proxyUrl, setProxyUrl] = useState("");
 
   useEffect(() => {
@@ -106,14 +108,16 @@ function App() {
 
   const loadSettings = async () => {
     try {
-      const [a, p, n, r, providerProxy] = await Promise.all([
+      const [a, p, n, r, providerProxy, playlists] = await Promise.all([
         api.get("/accounts"),
         api.get("/proxies"),
         api.get("/nodes"),
         api.get("/settings/storage-routing"),
         api.get("/settings/provider-proxy"),
+        api.get("/playlists"),
       ]);
       setAccounts(a.data);
+      setM3uPlaylists(playlists.data);
       setProxies(p.data);
       setProviderProxyId((selected) =>
         p.data.some((proxy) => proxy.enabled && String(proxy.id) === String(providerProxy.data.proxy_id))
@@ -247,6 +251,27 @@ function App() {
     event.preventDefault();
     act(async () => { await api.post("/accounts", accountForm); setAccountForm({ provider_url: "", username: "", password: "", user_agent: "Mozilla" }); await loadSettings(); }, "Provider account added.");
   };
+  const importPlaylist = (event) => {
+    event.preventDefault();
+    act(async () => {
+      await api.post("/playlists/import", {
+        ...playlistForm,
+        proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+      });
+      setPlaylistForm({ name: "", url: "" });
+      await loadSettings();
+    }, "M3U playlist fetched and saved to the local catalog.");
+  };
+  const refreshPlaylist = (playlist) => act(
+    async () => {
+      const { data } = await api.post(`/playlists/${playlist.id}/refresh`, null, {
+        params: { proxy_id: providerProxyId ? Number(providerProxyId) : 0 },
+      });
+      await loadSettings();
+      return data;
+    },
+    (data) => `Refreshed ${playlist.name}: ${data.entry_count} entries stored.`,
+  );
   const addProxy = (event) => {
     event.preventDefault();
     act(async () => { await api.post("/proxies", { url: proxyUrl }); setProxyUrl(""); await loadSettings(); }, "Proxy added.");
@@ -393,6 +418,7 @@ function App() {
 
         {tab === tabs[1] && <ContentBrowser
           api={api}
+          playlists={m3uPlaylists}
           routing={routing}
           onQueued={refresh}
           proxies={proxies.filter((proxy) => proxy.enabled)}
@@ -456,6 +482,22 @@ function App() {
                 <input placeholder="User-Agent" value={accountForm.user_agent} onChange={(e) => setAccountForm({ ...accountForm, user_agent: e.target.value })} className="field" />
                 <button disabled={busy} className="primary"><Plus size={15} />Add account</button>
               </form>
+            </div>
+          </section>
+          <section className="rounded-2xl border border-slate-800 bg-[#0d1320] lg:col-span-2">
+            <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Clapperboard size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">M3U playlist catalogs</h2><p className="text-xs text-slate-500">Fetch playlists into SQLite; source and stream URLs are encrypted at rest.</p></div></div>
+            <div className="space-y-3 p-5">
+              {m3uPlaylists.map((playlist) => <div key={playlist.id} className="flex flex-wrap items-center gap-3 rounded-lg bg-slate-900/70 px-3 py-2.5">
+                <div className="min-w-0 flex-1"><div className="text-sm text-slate-200">{playlist.name}</div><div className="text-xs text-slate-500">{playlist.entry_count} entries · fetched {new Date(playlist.fetched_at).toLocaleString()}</div></div>
+                <button type="button" disabled={busy} onClick={() => refreshPlaylist(playlist)} className="inline-flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200 disabled:opacity-40"><RefreshCw size={13} />Refresh</button>
+                <button type="button" onClick={() => remove("/playlists", playlist.id)} disabled={busy} className="p-2 text-slate-500 hover:text-rose-300" aria-label={`Remove ${playlist.name}`}><Trash2 size={15} /></button>
+              </div>)}
+              <form onSubmit={importPlaylist} className="grid gap-2 border-t border-slate-800 pt-4 md:grid-cols-[minmax(180px,0.6fr)_minmax(260px,1.4fr)_auto]">
+                <input required maxLength={255} placeholder="Playlist name" value={playlistForm.name} onChange={(event) => setPlaylistForm({ ...playlistForm, name: event.target.value })} className="field" />
+                <input required type="url" maxLength={4096} placeholder="https://provider.example/playlist.m3u" value={playlistForm.url} onChange={(event) => setPlaylistForm({ ...playlistForm, url: event.target.value })} className="field" />
+                <button disabled={busy} className="primary"><Plus size={15} />Fetch M3U</button>
+              </form>
+              <p className="text-[11px] text-slate-500">Playlist entries retain group/category, stream URL, tvg metadata, EXTINF attributes, and per-entry directives. M3U downloads use the exact stored stream URL; enabled Xtream accounts provide worker concurrency only.</p>
             </div>
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">

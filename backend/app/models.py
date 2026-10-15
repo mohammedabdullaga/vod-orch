@@ -72,6 +72,45 @@ class ProviderCatalogCache(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class M3UPlaylist(Base):
+    __tablename__ = "m3u_playlists"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    source_url_encrypted: Mapped[str] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    entry_count: Mapped[int] = mapped_column(Integer, default=0)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class M3UEntry(Base):
+    __tablename__ = "m3u_entries"
+    __table_args__ = (
+        UniqueConstraint("playlist_id", "stable_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    playlist_id: Mapped[int] = mapped_column(
+        ForeignKey("m3u_playlists.id", ondelete="CASCADE"), index=True
+    )
+    stable_key: Mapped[str] = mapped_column(String(64))
+    position: Mapped[int] = mapped_column(Integer)
+    group_title: Mapped[str] = mapped_column(String(512), default="Uncategorized")
+    kind: Mapped[str] = mapped_column(String(16), default="vod", index=True)
+    title: Mapped[str] = mapped_column(String(1024))
+    tvg_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    tvg_name: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    tvg_logo: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stream_url_encrypted: Mapped[str] = mapped_column(Text)
+    extension: Mapped[str] = mapped_column(String(32), default="mkv")
+    series_name: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    season: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    episode: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    attributes_json: Mapped[str] = mapped_column(Text, default="{}")
+    directives_json: Mapped[str] = mapped_column(Text, default="[]")
+
+
 class Proxy(Base):
     __tablename__ = "proxies"
 

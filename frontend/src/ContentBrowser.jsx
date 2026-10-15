@@ -26,6 +26,7 @@ function InventoryBadge({ status }) {
 
 export default function ContentBrowser({
   api,
+  playlists,
   routing,
   onQueued,
   proxies,
@@ -35,6 +36,8 @@ export default function ContentBrowser({
   providerProxyReady,
 }) {
   const [type, setType] = useState("series");
+  const [sourceType, setSourceType] = useState("xtream");
+  const [sourcePlaylistId, setSourcePlaylistId] = useState("");
   const [providerAccounts, setProviderAccounts] = useState([]);
   const [sourceAccountId, setSourceAccountId] = useState("");
   const [categories, setCategories] = useState([]);
@@ -82,6 +85,14 @@ export default function ContentBrowser({
   }, [api]);
 
   useEffect(() => {
+    setSourcePlaylistId((selected) =>
+      playlists.some((playlist) => String(playlist.id) === selected)
+        ? selected
+        : String(playlists[0]?.id || "")
+    );
+  }, [playlists]);
+
+  useEffect(() => {
     let current = true;
     setCategories([]);
     setSelectedCategories(new Set());
@@ -89,12 +100,14 @@ export default function ContentBrowser({
     setSelectedItems(new Set());
     setDetails(null);
     setNotice("");
-    if (!providerProxyReady) {
+    if (sourceType === "m3u") {
+      if (!sourcePlaylistId) return () => { current = false; };
+      api.get(`/playlists/${sourcePlaylistId}/categories`, { params: { type } })
+        .then(({ data }) => { if (current) setCategories(data); })
+        .catch((error) => { if (current) setNotice(error.response?.data?.detail || "Could not load M3U categories."); });
       return () => { current = false; };
     }
-    if (!sourceAccountId) {
-      return () => { current = false; };
-    }
+    if (!providerProxyReady || !sourceAccountId) return () => { current = false; };
     api.get("/content/categories", {
       params: {
         type,
@@ -105,7 +118,7 @@ export default function ContentBrowser({
       .then(({ data }) => { if (current) setCategories(data); })
       .catch((error) => { if (current) setNotice(error.response?.data?.detail || "Could not load provider categories."); });
     return () => { current = false; };
-  }, [api, type, sourceAccountId, providerProxyId, providerProxyReady]);
+  }, [api, type, sourceType, sourcePlaylistId, sourceAccountId, providerProxyId, providerProxyReady]);
 
   const visibleCategories = useMemo(() => categories.filter((category) =>
     category.category_name.toLocaleLowerCase().includes(categorySearch.toLocaleLowerCase())
@@ -192,6 +205,25 @@ export default function ContentBrowser({
     setSelectedItems(new Set());
     setItemSearch("");
     try {
+      if (sourceType === "m3u") {
+        if (forceRefresh) {
+          await api.post(`/playlists/${sourcePlaylistId}/refresh`, null, {
+            params: { proxy_id: providerProxyId ? Number(providerProxyId) : 0 },
+          });
+          const { data: refreshedCategories } = await api.get(
+            `/playlists/${sourcePlaylistId}/categories`,
+            { params: { type } },
+          );
+          setCategories(refreshedCategories);
+        }
+        const { data } = await api.get(`/playlists/${sourcePlaylistId}/items`, {
+          params: { type, category_ids: [...selectedCategories].join(",") },
+        });
+        setItems(data);
+        setInventoryFilter("all");
+        setNotice(`Loaded ${data.length} ${type === "series" ? "series" : "movies"} from the local M3U catalog.`);
+        return;
+      }
       if (forceRefresh) {
         const { data: refreshedCategories } = await api.get("/content/categories", {
           params: {
@@ -245,12 +277,16 @@ export default function ContentBrowser({
     setBusy(true);
     setNotice("");
     try {
-      const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
-        params: {
-          account_id: sourceAccountId,
-          proxy_id: providerProxyId ? Number(providerProxyId) : 0,
-        },
-      });
+      const { data } = sourceType === "m3u"
+        ? await api.get(
+          `/playlists/${sourcePlaylistId}/series/${encodeURIComponent(item.source_series_key)}/details`,
+        )
+        : await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
+          params: {
+            account_id: sourceAccountId,
+            proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+          },
+        });
       setDetails({ item, data });
       setSelectedEpisodes(new Map());
     } catch (error) {
@@ -275,7 +311,7 @@ export default function ContentBrowser({
       const { data } = await api.get("/accounts/availability", {
         params: {
           content_type: type === "series" ? "SERIES" : "MOVIE",
-          source_account_id: sourceAccountId,
+          ...(sourceType === "xtream" ? { source_account_id: sourceAccountId } : {}),
         },
       });
       const free = data.accounts.filter((account) => account.free);
@@ -314,7 +350,9 @@ export default function ContentBrowser({
       const accountIds = [...selectedWorkerIds];
       const { data } = await api.post("/queue/manual-batch", {
         content_type: type === "series" ? "SERIES" : "MOVIE",
-        source_account_id: Number(sourceAccountId),
+        ...(sourceType === "m3u"
+          ? { source_playlist_id: Number(sourcePlaylistId) }
+          : { source_account_id: Number(sourceAccountId) }),
         target_node_id: String(nodeId),
         account_ids: accountIds,
         proxy_mode: proxyMode === "node" ? "selected" : "direct",
@@ -353,6 +391,7 @@ export default function ContentBrowser({
         title: `${data.name} S${String(season).padStart(2, "0")}E${String(number).padStart(2, "0")}`,
         series_name: data.name,
         series_id: data.series_id || item.id,
+        source_entry_id: episode.source_entry_id,
         season: String(season),
         episode_num: number,
         filename: episodeFilename(season, number, ext),
@@ -367,6 +406,7 @@ export default function ContentBrowser({
     if (type === "movie") {
       return chosen.map((item) => ({
         stream_id: item.id,
+        source_entry_id: item.source_entry_id,
         title: item.name,
         filename: `${item.name}.${item.container_ext || "mkv"}`,
         container_ext: item.container_ext || "mkv",
@@ -377,9 +417,13 @@ export default function ContentBrowser({
     const entries = [];
     for (let start = 0; start < chosen.length; start += 8) {
       const batch = await Promise.all(chosen.slice(start, start + 8).map(async (item) => {
-        const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
-          params: { account_id: sourceAccountId },
-        });
+        const { data } = sourceType === "m3u"
+          ? await api.get(
+            `/playlists/${sourcePlaylistId}/series/${encodeURIComponent(item.source_series_key)}/details`,
+          )
+          : await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
+            params: { account_id: sourceAccountId },
+          });
         return detailsEntries(item, data);
       }));
       entries.push(...batch.flat());
@@ -391,9 +435,13 @@ export default function ContentBrowser({
     setBusy(true);
     setNotice("");
     try {
-      const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
-        params: { account_id: sourceAccountId },
-      });
+      const { data } = sourceType === "m3u"
+        ? await api.get(
+          `/playlists/${sourcePlaylistId}/series/${encodeURIComponent(item.source_series_key)}/details`,
+        )
+        : await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
+          params: { account_id: sourceAccountId },
+        });
       await queueEntries(detailsEntries(item, data));
     } catch (error) {
       setNotice(error.response?.data?.detail || "Could not load the selected series.");
@@ -490,7 +538,7 @@ export default function ContentBrowser({
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <label className="text-xs text-slate-400">
-              Provider API proxy
+              Provider / M3U fetch proxy
               <select
                 aria-label="Provider API proxy"
                 value={providerProxyId}
@@ -505,6 +553,37 @@ export default function ContentBrowser({
               </select>
             </label>
             <label className="text-xs text-slate-400">
+              Catalog source
+              <select
+                aria-label="Catalog source"
+                value={sourceType}
+                onChange={(event) => setSourceType(event.target.value)}
+                disabled={busy || Boolean(pendingQueue)}
+                className="ml-2 max-w-64 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200"
+              >
+                <option value="xtream">Xtream account</option>
+                <option value="m3u" disabled={!playlists.length}>Saved M3U playlist</option>
+              </select>
+            </label>
+            {sourceType === "m3u" ? (
+              <label className="text-xs text-slate-400">
+                Saved playlist
+                <select
+                  aria-label="Saved M3U playlist"
+                  value={sourcePlaylistId}
+                  onChange={(event) => setSourcePlaylistId(event.target.value)}
+                  disabled={!playlists.length || busy || Boolean(pendingQueue)}
+                  className="ml-2 max-w-64 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
+                >
+                  {!playlists.length && <option value="">No saved M3U playlists</option>}
+                  {playlists.map((playlist) => (
+                    <option key={playlist.id} value={playlist.id}>
+                      {playlist.name} · {playlist.entry_count} entries
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : <label className="text-xs text-slate-400">
               Browse using Xtream account
               <select
                 aria-label="Browse using Xtream account"
@@ -520,7 +599,7 @@ export default function ContentBrowser({
                   </option>
                 ))}
               </select>
-            </label>
+            </label>}
             <div className="inline-flex rounded-lg border border-slate-700 bg-slate-900 p-1">
               {["series", "movie"].map((mediaType) => (
                 <button key={mediaType} onClick={() => setType(mediaType)} className={`rounded-md px-4 py-2 text-sm ${type === mediaType ? "bg-indigo-500 text-white" : "text-slate-400 hover:text-white"}`}>
@@ -530,7 +609,7 @@ export default function ContentBrowser({
             </div>
           </div>
         </div>
-        <p className="mt-3 text-xs text-slate-500">Choose the account used to browse categories and titles, and whether provider API requests should use a proxy. This proxy is for category, title, and series-detail API requests; download proxy settings are chosen separately at queue time. At download time, the selected idle worker account supplies its own Xtream username and password for the same stream ID.</p>
+        <p className="mt-3 text-xs text-slate-500">{sourceType === "m3u" ? "M3U categories and entries are read from the saved SQLite catalog. M3U downloads use each entry's exact stored stream URL; enabled Xtream accounts are only used as worker slots." : "Choose the account used to browse categories and titles, and whether provider API requests should use a proxy. This proxy is for category, title, and series-detail API requests; download proxy settings are chosen separately at queue time. At download time, the selected idle worker account supplies its own Xtream username and password for the same stream ID."}</p>
 
         <div className="mt-5 grid gap-5 lg:grid-cols-[minmax(260px,0.8fr)_minmax(0,1.6fr)]">
           <div className="rounded-xl border border-slate-800 bg-slate-900/40">
@@ -553,12 +632,12 @@ export default function ContentBrowser({
                   {category.monitored && <span className="rounded-full bg-emerald-400/10 px-2 py-0.5 text-[10px] text-emerald-300">Watching</span>}
                 </label>
               ))}
-              {!visibleCategories.length && <p className="px-3 py-8 text-center text-sm text-slate-500">{!providerAccounts.length ? "Add an enabled Xtream account to browse." : categories.length ? "No matching categories." : "No categories available."}</p>}
+              {!visibleCategories.length && <p className="px-3 py-8 text-center text-sm text-slate-500">{sourceType === "m3u" && !playlists.length ? "Import an M3U playlist in Settings & Accounts." : sourceType === "xtream" && !providerAccounts.length ? "Add an enabled Xtream account to browse." : categories.length ? "No matching categories." : "No categories available for this source and type."}</p>}
             </div>
             <div className="grid gap-2 border-t border-slate-800 p-3 sm:grid-cols-2">
-              <button disabled={busy || !selectedCategories.size} onClick={monitorSelected} className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-40">Monitor selected</button>
+              {sourceType === "xtream" && <button disabled={busy || !selectedCategories.size} onClick={monitorSelected} className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-40">Monitor selected</button>}
               <button disabled={busy || !selectedCategories.size} onClick={() => browseSelected()} className="rounded-lg bg-indigo-500 px-3 py-2 text-xs font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">Browse selected</button>
-              <button disabled={busy || !selectedCategories.size} onClick={() => browseSelected(true)} title="Fetch fresh categories and titles from the provider instead of using cached data." className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-300 hover:border-slate-500 hover:text-white disabled:opacity-40">Refresh from provider</button>
+              <button disabled={busy || !selectedCategories.size} onClick={() => browseSelected(true)} title={sourceType === "m3u" ? "Fetch the latest playlist and replace its saved catalog." : "Fetch fresh categories and titles from the provider instead of using cached data."} className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-300 hover:border-slate-500 hover:text-white disabled:opacity-40">{sourceType === "m3u" ? "Refresh playlist" : "Refresh from provider"}</button>
             </div>
           </div>
 
@@ -604,7 +683,7 @@ export default function ContentBrowser({
               </div>
               <div className="flex flex-wrap gap-2">
                 <button type="button" disabled={busy || !selectedTitles.length} onClick={queueSelectedTitles} className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/25 disabled:opacity-40"><Download size={14} />Ingest Selected via Workers</button>
-                <button type="button" disabled={busy || !selectedTitles.length} onClick={exportSelectedScript} className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-400/40 bg-indigo-500/10 px-3 py-2 text-xs font-medium text-indigo-200 hover:bg-indigo-500/20 disabled:opacity-40"><Download size={14} />Export / Run as Direct Bash Script</button>
+                {sourceType === "xtream" && <button type="button" disabled={busy || !selectedTitles.length} onClick={exportSelectedScript} className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-400/40 bg-indigo-500/10 px-3 py-2 text-xs font-medium text-indigo-200 hover:bg-indigo-500/20 disabled:opacity-40"><Download size={14} />Export / Run as Direct Bash Script</button>}
               </div>
             </div>}
             {!items.length ? <div className="grid min-h-64 place-items-center px-4 text-center text-sm text-slate-500">Choose categories and select <span className="text-indigo-300">Browse selected</span> to see provider content.</div> :
@@ -719,7 +798,7 @@ export default function ContentBrowser({
       {pendingQueue && <div role="dialog" aria-modal="true" aria-labelledby="queue-confirm-title" className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4">
         <section className="w-full max-w-xl rounded-2xl border border-slate-700 bg-[#0d1320] shadow-2xl">
           <header className="flex items-start justify-between gap-4 border-b border-slate-800 px-5 py-4">
-            <div><h2 id="queue-confirm-title" className="font-semibold text-white">Confirm download assignment</h2><p className="mt-1 text-xs text-slate-400">{pendingQueue.length} item{pendingQueue.length === 1 ? "" : "s"} will be queued across the free accounts you select.</p><p className="mt-1 text-[11px] text-indigo-300">Browsing with {providerAccounts.find((account) => String(account.id) === sourceAccountId)?.username || "the selected account"}; each download uses the credentials of its assigned account.</p></div>
+            <div><h2 id="queue-confirm-title" className="font-semibold text-white">Confirm download assignment</h2><p className="mt-1 text-xs text-slate-400">{pendingQueue.length} item{pendingQueue.length === 1 ? "" : "s"} will be queued across the free accounts you select.</p><p className="mt-1 text-[11px] text-indigo-300">{sourceType === "m3u" ? `Using stream URLs saved from ${playlists.find((playlist) => String(playlist.id) === sourcePlaylistId)?.name || "the M3U playlist"}.` : `Browsing with ${providerAccounts.find((account) => String(account.id) === sourceAccountId)?.username || "the selected account"}; each download uses the credentials of its assigned account.`}</p></div>
             <button type="button" onClick={() => setPendingQueue(null)} disabled={busy} aria-label="Cancel queue confirmation" className="rounded-lg p-2 text-slate-400 hover:bg-slate-800"><X size={16} /></button>
           </header>
           <div className="space-y-5 p-5">

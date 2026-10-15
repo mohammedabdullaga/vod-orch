@@ -1,19 +1,23 @@
 import asyncio
+import hashlib
 import logging
 import re
 import shlex
+from collections import defaultdict
 from pathlib import PurePosixPath
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.models import (
     Account,
+    M3UEntry,
+    M3UPlaylist,
     MonitoredCategory,
     Node,
     Proxy,
@@ -24,6 +28,7 @@ from app.models import (
 )
 from app.provider import cached_provider_action, resolve_provider_proxy_selection, stream_url
 from app.security import decrypt_secret, encrypt_secret
+from app.services.m3u import fetch_playlist, replace_playlist_entries
 from app.services.content_paths import (
     category_directory_name,
     clean_content_name,
@@ -37,6 +42,7 @@ from app.services.content_paths import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/content", tags=["content"])
 queue_router = APIRouter(prefix="/api/queue", tags=["queue"])
+playlist_router = APIRouter(prefix="/api/playlists", tags=["playlists"])
 
 
 def _provider_account(account_id: int | None) -> Account:
@@ -111,6 +117,269 @@ def _provider_kind(content_type: str) -> tuple[str, str, str]:
     if content_type == "series":
         return "series", "get_series_categories", "get_series"
     return "vod", "get_vod_categories", "get_vod_streams"
+
+
+class M3UPlaylistCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    url: str = Field(min_length=8, max_length=4096)
+    proxy_id: int | None = Field(default=None, ge=0)
+
+
+def _playlist_category_id(playlist_id: int, group_title: str) -> str:
+    group_hash = hashlib.sha256(group_title.encode("utf-8")).hexdigest()[:16]
+    return f"m3u:{playlist_id}:{group_hash}"
+
+
+def _playlist_entry_json(entry: M3UEntry, category_id: str) -> dict[str, Any]:
+    return {
+        "id": str(entry.id),
+        "source_entry_id": entry.id,
+        "name": entry.title,
+        "category_id": category_id,
+        "category_name": entry.group_title,
+        "kind": entry.kind,
+        "container_ext": safe_extension(entry.extension),
+        "tvg_id": entry.tvg_id,
+        "tvg_name": entry.tvg_name,
+        "tvg_logo": decrypt_secret(entry.tvg_logo) if entry.tvg_logo else None,
+        "season": entry.season,
+        "episode_num": entry.episode,
+        "series_name": entry.series_name,
+    }
+
+
+@playlist_router.get("")
+def list_m3u_playlists() -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        playlists = db.scalars(select(M3UPlaylist).order_by(M3UPlaylist.id)).all()
+        return [
+            {
+                "id": playlist.id,
+                "name": playlist.name,
+                "enabled": playlist.enabled,
+                "entry_count": playlist.entry_count,
+                "fetched_at": playlist.fetched_at.isoformat(),
+            }
+            for playlist in playlists
+        ]
+
+
+@playlist_router.post("/import")
+async def import_m3u_playlist(payload: M3UPlaylistCreate) -> dict[str, Any]:
+    if not payload.name.strip():
+        raise HTTPException(status_code=422, detail="Playlist name cannot be blank.")
+    try:
+        proxy_url = resolve_provider_proxy_selection(payload.proxy_id)
+        entries = await fetch_playlist(payload.url, proxy_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("M3U import failed (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Could not fetch or parse the M3U playlist.") from exc
+    if not entries:
+        raise HTTPException(status_code=422, detail="The M3U playlist contains no usable HTTP streams.")
+    with SessionLocal() as db:
+        playlist = M3UPlaylist(
+            name=payload.name.strip(),
+            source_url_encrypted=encrypt_secret(payload.url),
+            entry_count=0,
+            fetched_at=utc_now(),
+        )
+        db.add(playlist)
+        db.commit()
+        db.refresh(playlist)
+        playlist_id = playlist.id
+    count = await asyncio.to_thread(replace_playlist_entries, playlist_id, entries)
+    return {"id": playlist_id, "name": payload.name.strip(), "entry_count": count}
+
+
+@playlist_router.post("/{playlist_id}/refresh")
+async def refresh_m3u_playlist(
+    playlist_id: int,
+    proxy_id: int | None = Query(default=None, ge=0),
+) -> dict[str, Any]:
+    with SessionLocal() as db:
+        playlist = db.get(M3UPlaylist, playlist_id)
+        if not playlist:
+            raise HTTPException(status_code=404, detail="M3U playlist not found.")
+        source_url = decrypt_secret(playlist.source_url_encrypted)
+    try:
+        proxy_url = resolve_provider_proxy_selection(proxy_id)
+        entries = await fetch_playlist(source_url, proxy_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("M3U refresh failed for playlist %s (%s)", playlist_id, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Could not refresh the M3U playlist.") from exc
+    if not entries:
+        raise HTTPException(status_code=422, detail="The refreshed playlist contains no usable HTTP streams.")
+    count = await asyncio.to_thread(replace_playlist_entries, playlist_id, entries)
+    return {"id": playlist_id, "entry_count": count}
+
+
+@playlist_router.delete("/{playlist_id}")
+def delete_m3u_playlist(playlist_id: int) -> dict[str, bool]:
+    with SessionLocal() as db:
+        playlist = db.get(M3UPlaylist, playlist_id)
+        if not playlist:
+            raise HTTPException(status_code=404, detail="M3U playlist not found.")
+        db.delete(playlist)
+        db.commit()
+    return {"ok": True}
+
+
+@playlist_router.get("/{playlist_id}/categories")
+def get_m3u_categories(
+    playlist_id: int,
+    type: Literal["series", "movie"] = Query(...),
+) -> list[dict[str, Any]]:
+    expected_kind = "series" if type == "series" else "vod"
+    with SessionLocal() as db:
+        playlist = db.get(M3UPlaylist, playlist_id)
+        if not playlist or not playlist.enabled:
+            raise HTTPException(status_code=404, detail="Enabled M3U playlist not found.")
+        groups = db.execute(
+            select(M3UEntry.group_title, func.count(M3UEntry.id))
+            .where(M3UEntry.playlist_id == playlist_id, M3UEntry.kind == expected_kind)
+            .group_by(M3UEntry.group_title)
+            .order_by(M3UEntry.group_title)
+        ).all()
+    return [
+        {
+            "category_id": _playlist_category_id(playlist_id, group_title),
+            "category_name": group_title,
+            "name": group_title,
+            "kind": expected_kind,
+            "entry_count": count,
+            "monitored": False,
+            "destination_path": None,
+            "match_existing_series": False,
+            "strip_prefixes": "",
+        }
+        for group_title, count in groups
+    ]
+
+
+@playlist_router.get("/{playlist_id}/items")
+def get_m3u_items(
+    playlist_id: int,
+    type: Literal["series", "movie"] = Query(...),
+    category_ids: str = Query(..., min_length=1, max_length=5000),
+) -> list[dict[str, Any]]:
+    expected_kind = "series" if type == "series" else "vod"
+    requested_ids = set(part.strip() for part in category_ids.split(",") if part.strip())
+    if not requested_ids or len(requested_ids) > 50:
+        raise HTTPException(status_code=422, detail="Select between 1 and 50 category IDs.")
+    with SessionLocal() as db:
+        playlist = db.get(M3UPlaylist, playlist_id)
+        if not playlist or not playlist.enabled:
+            raise HTTPException(status_code=404, detail="Enabled M3U playlist not found.")
+        available_groups = db.scalars(
+            select(M3UEntry.group_title)
+            .where(M3UEntry.playlist_id == playlist_id, M3UEntry.kind == expected_kind)
+            .distinct()
+        ).all()
+        selected_groups = [
+            group_title for group_title in available_groups
+            if _playlist_category_id(playlist_id, group_title) in requested_ids
+        ]
+        selected = db.scalars(
+            select(M3UEntry)
+            .where(
+                M3UEntry.playlist_id == playlist_id,
+                M3UEntry.kind == expected_kind,
+                M3UEntry.group_title.in_(selected_groups),
+            )
+            .order_by(M3UEntry.position)
+        ).all() if selected_groups else []
+    if not selected:
+        raise HTTPException(status_code=404, detail="No entries found for the selected M3U categories.")
+    if expected_kind == "vod":
+        return [
+            _playlist_entry_json(
+                row, _playlist_category_id(playlist_id, row.group_title)
+            )
+            for row in selected
+        ]
+    grouped: dict[tuple[str, str], list[M3UEntry]] = defaultdict(list)
+    for row in selected:
+        grouped[(row.group_title, row.series_name or row.title)].append(row)
+    result = []
+    for (group_title, series_name), episodes in grouped.items():
+        category_id = _playlist_category_id(playlist_id, group_title)
+        series_key = hashlib.sha256(
+            f"{playlist_id}\0{group_title}\0{series_name}".encode("utf-8")
+        ).hexdigest()[:24]
+        result.append({
+            "id": f"m3u-series:{series_key}",
+            "name": series_name,
+            "category_id": category_id,
+            "category_name": group_title,
+            "kind": "series",
+            "total_episodes": len(episodes),
+            "container_ext": "mkv",
+            "download_status": "unknown",
+            "storage_match": None,
+            "source_series_key": series_key,
+        })
+    return result
+
+
+@playlist_router.get("/{playlist_id}/series/{series_key}/details")
+def get_m3u_series_details(
+    playlist_id: int,
+    series_key: str,
+) -> dict[str, Any]:
+    with SessionLocal() as db:
+        playlist = db.get(M3UPlaylist, playlist_id)
+        if not playlist or not playlist.enabled:
+            raise HTTPException(status_code=404, detail="Enabled M3U playlist not found.")
+        series_names = db.execute(
+            select(M3UEntry.group_title, M3UEntry.series_name)
+            .where(M3UEntry.playlist_id == playlist_id, M3UEntry.kind == "series")
+            .group_by(M3UEntry.group_title, M3UEntry.series_name)
+        ).all()
+        matching_series = next(
+            (
+                (group_title, series_name)
+                for group_title, series_name in series_names
+                if hashlib.sha256(
+                    f"{playlist_id}\0{group_title}\0{series_name or ''}".encode("utf-8")
+                ).hexdigest()[:24] == series_key
+            ),
+            None,
+        )
+        if matching_series is None:
+            raise HTTPException(status_code=404, detail="M3U series not found.")
+        group_title, series_name = matching_series
+        matching = db.scalars(
+            select(M3UEntry)
+            .where(
+                M3UEntry.playlist_id == playlist_id,
+                M3UEntry.kind == "series",
+                M3UEntry.group_title == group_title,
+                M3UEntry.series_name == series_name,
+            )
+            .order_by(M3UEntry.position)
+        ).all()
+    seasons: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in matching:
+        season = row.season or 0
+        seasons[str(season)].append({
+            "episode_num": row.episode or row.position + 1,
+            "id": str(row.id),
+            "source_entry_id": row.id,
+            "ext": safe_extension(row.extension),
+            "title": row.title,
+            "season": season,
+        })
+    return {
+        "series_id": series_key,
+        "name": matching[0].series_name or matching[0].title,
+        "category_id": _playlist_category_id(playlist_id, matching[0].group_title),
+        "category_name": matching[0].group_title,
+        "seasons": dict(seasons),
+    }
 
 
 @router.get("/categories")
@@ -437,6 +706,7 @@ async def get_series_details(
 
 class ManualQueueItem(BaseModel):
     stream_id: str = Field(min_length=1, max_length=512)
+    source_entry_id: int | None = Field(default=None, ge=1)
     title: str = Field(min_length=1, max_length=1024)
     series_name: str | None = Field(default=None, max_length=1024)
     series_id: str | None = Field(default=None, max_length=512)
@@ -451,6 +721,7 @@ class ManualQueueItem(BaseModel):
 class ManualBatchRequest(BaseModel):
     content_type: Literal["SERIES", "MOVIE"]
     source_account_id: int | None = Field(default=None, ge=1)
+    source_playlist_id: int | None = Field(default=None, ge=1)
     target_node_id: str | None = Field(default=None, max_length=64)
     account_ids: list[int] | None = Field(default=None, min_length=1, max_length=100)
     proxy_mode: Literal["node", "selected", "direct"] | None = None
@@ -464,22 +735,41 @@ class ManualBatchRequest(BaseModel):
 def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[str, Any]:
     kind = "series" if payload.content_type == "SERIES" else "vod"
     with SessionLocal() as db:
-        account = (
-            db.get(Account, payload.source_account_id)
-            if payload.source_account_id is not None
-            else db.scalar(
-                select(Account)
-                .where(Account.enabled.is_(True))
-                .order_by(Account.id)
-                .limit(1)
-            )
+        playlist = (
+            db.get(M3UPlaylist, payload.source_playlist_id)
+            if payload.source_playlist_id is not None
+            else None
         )
-        if not account or not account.enabled:
+        if payload.source_playlist_id is not None and (
+            not playlist or not playlist.enabled
+        ):
+            raise HTTPException(status_code=409, detail="The selected M3U playlist is unavailable.")
+        account = None
+        if playlist is None:
+            account = (
+                db.get(Account, payload.source_account_id)
+                if payload.source_account_id is not None
+                else db.scalar(
+                    select(Account)
+                    .where(Account.enabled.is_(True))
+                    .order_by(Account.id)
+                    .limit(1)
+                )
+            )
+            if not account or not account.enabled:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The selected browsing Xtream account is not enabled.",
+                )
+        elif payload.source_account_id is not None:
             raise HTTPException(
-                status_code=409,
-                detail="The selected browsing Xtream account is not enabled.",
+                status_code=422,
+                detail="Select either an M3U playlist or an Xtream account, not both.",
             )
         kind = "series" if payload.content_type == "SERIES" else "vod"
+        source_provider_url = (
+            f"m3u:{playlist.id}" if playlist is not None else account.provider_url
+        )
         route = db.get(StorageRoute, kind)
         node = db.get(Node, route.node_id) if route else None
         if not node:
@@ -572,9 +862,64 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
         seen: set[str] = set()
         assigned_count = 0
         for entry in payload.items:
-            identity = stream_identity(account.provider_url, kind, entry.stream_id)
+            provider_stream_id = entry.stream_id
+            title = entry.title
+            category_id = entry.category_id
+            category_name_input = entry.category_name
+            series_id = entry.series_id
+            series_name_input = entry.series_name
+            season_input = entry.season
+            episode_input = entry.episode_num
+            filename_input = entry.filename
+            extension_input = entry.container_ext
+            resolved_stream_url = None
+            if playlist is not None:
+                if entry.source_entry_id is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="M3U queue items must reference a stored playlist entry.",
+                    )
+                playlist_entry = db.get(M3UEntry, entry.source_entry_id)
+                if (
+                    not playlist_entry
+                    or playlist_entry.playlist_id != playlist.id
+                    or playlist_entry.kind != kind
+                ):
+                    raise HTTPException(
+                        status_code=404,
+                        detail="An M3U playlist entry is missing or does not match the selected content type.",
+                    )
+                provider_stream_id = playlist_entry.stable_key
+                title = playlist_entry.title
+                category_id = _playlist_category_id(
+                    playlist.id, playlist_entry.group_title
+                )
+                category_name_input = playlist_entry.group_title
+                series_name_input = playlist_entry.series_name
+                series_id = (
+                    hashlib.sha256(
+                        f"{playlist.id}\0{playlist_entry.group_title}\0"
+                        f"{playlist_entry.series_name or playlist_entry.title}".encode("utf-8")
+                    ).hexdigest()[:24]
+                    if kind == "series"
+                    else None
+                )
+                season_input = playlist_entry.season
+                episode_input = playlist_entry.episode
+                extension_input = playlist_entry.extension
+                filename_input = (
+                    f"S{playlist_entry.season or 0:02d}"
+                    f"E{playlist_entry.episode or playlist_entry.position + 1:02d}."
+                    f"{safe_extension(playlist_entry.extension)}"
+                    if kind == "series"
+                    else f"{playlist_entry.title}.{safe_extension(playlist_entry.extension)}"
+                )
+                resolved_stream_url = decrypt_secret(
+                    playlist_entry.stream_url_encrypted
+                )
+            identity = stream_identity(source_provider_url, kind, provider_stream_id)
             if identity in seen:
-                skipped.append({"stream_id": entry.stream_id, "reason": "duplicate_in_request"})
+                skipped.append({"stream_id": provider_stream_id, "reason": "duplicate_in_request"})
                 continue
             seen.add(identity)
 
@@ -583,64 +928,66 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                     (QueueItem.stream_id == identity)
                     | (
                         QueueItem.provider_stream_id.is_(None)
-                        & (QueueItem.stream_id == entry.stream_id)
+                        & (QueueItem.stream_id == provider_stream_id)
                     )
                 )
             )
             if existing and existing.status not in ("FAILED", "CANCELLED"):
-                skipped.append({"stream_id": entry.stream_id, "reason": existing.status.lower()})
+                skipped.append({"stream_id": provider_stream_id, "reason": existing.status.lower()})
                 continue
 
             category = None
-            if entry.category_id:
+            if category_id:
                 category = db.scalar(
                     select(MonitoredCategory).where(
                         MonitoredCategory.kind == kind,
-                        MonitoredCategory.category_id == entry.category_id,
+                        MonitoredCategory.category_id == category_id,
                     )
                 )
             category_name = (
-                category.name if category else entry.category_name
+                category.name if category else category_name_input
             )
-            extension = safe_extension(entry.container_ext)
-            series_name = entry.series_name or (entry.title if kind == "series" else None)
+            extension = safe_extension(extension_input)
+            series_name = series_name_input or (title if kind == "series" else None)
             file_name, season, episode = normalized_episode_path(
                 kind=kind,
-                title=entry.title,
+                title=title,
                 category_name=(
                     (category_name or "Uncategorized")
                     if not (category and category.destination_path)
                     else None
                 ),
-                provider_stream_id=entry.stream_id,
-                provider_url=account.provider_url,
+                provider_stream_id=provider_stream_id,
+                provider_url=source_provider_url,
                 extension=extension,
                 series_name=series_name,
-                series_id=entry.series_id,
-                season=entry.season,
-                episode_num=entry.episode_num,
-                filename=entry.filename,
+                series_id=series_id,
+                season=season_input,
+                episode_num=episode_input,
+                filename=filename_input,
                 strip_prefixes=category.strip_prefixes if category else None,
             )
             if kind == "series":
                 series_name = clean_content_name(
-                    series_name or entry.title,
+                    series_name or title,
                     category.strip_prefixes if category else None,
                 )
             item_values = {
                 "stream_id": identity,
-                "provider_stream_id": entry.stream_id,
-                "title": entry.title,
+                "provider_stream_id": provider_stream_id,
+                "title": title,
                 "kind": kind,
-                "source_provider_url": account.provider_url,
-                "category_id": entry.category_id,
+                "source_provider_url": source_provider_url,
+                "category_id": category_id,
                 "category_name": category_name,
-                "series_id": entry.series_id,
+                "series_id": series_id,
                 "proxy_mode": payload.proxy_mode,
                 "proxy_id": selected_proxy_id,
                 "downloader": payload.downloader,
                 "stream_url_encrypted": encrypt_secret(
-                    stream_url(account, kind, entry.stream_id, extension)
+                    resolved_stream_url
+                    if resolved_stream_url is not None
+                    else stream_url(account, kind, provider_stream_id, extension)
                 ),
                 "file_size_bytes": None,
                 "speed_bytes_per_second": None,
@@ -667,7 +1014,7 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                 existing.created_at = utc_now()
             else:
                 db.add(QueueItem(**item_values, created_at=utc_now()))
-            queued.append({"stream_id": entry.stream_id, "title": entry.title})
+            queued.append({"stream_id": provider_stream_id, "title": title})
             assigned_count += 1
 
         try:
