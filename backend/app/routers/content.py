@@ -8,6 +8,7 @@ from pathlib import PurePosixPath
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+import httpx
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -113,6 +114,30 @@ async def _request_provider(
         return payload
     except HTTPException:
         raise
+    except httpx.HTTPStatusError as exc:
+        upstream_status = exc.response.status_code
+        logger.warning(
+            "Provider request %s returned HTTP %s",
+            action,
+            upstream_status,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Provider request {action} returned HTTP {upstream_status}. Check the provider and selected proxy.",
+        ) from exc
+    except httpx.TimeoutException as exc:
+        logger.warning("Provider request %s timed out", action)
+        raise HTTPException(
+            status_code=504,
+            detail=f"Provider request {action} timed out. Check the provider and selected proxy.",
+        ) from exc
+    except httpx.RequestError as exc:
+        error_type = type(exc).__name__
+        logger.warning("Provider request %s failed (%s)", action, error_type)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Provider request {action} failed ({error_type}). Check the provider and selected proxy.",
+        ) from exc
     except Exception as exc:
         logger.error("Provider request %s failed (%s)", action, type(exc).__name__)
         raise HTTPException(status_code=502, detail=f"Provider request {action} failed.") from exc
@@ -132,6 +157,34 @@ class M3UPlaylistCreate(BaseModel):
 
 class M3UPlaylistProxyUpdate(BaseModel):
     proxy_id: int | None = Field(default=None, ge=0)
+
+
+def _m3u_fetch_http_exception(exc: Exception, operation: str) -> HTTPException:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        logger.warning("M3U %s source returned HTTP %s", operation, status_code)
+        return HTTPException(
+            status_code=502,
+            detail=f"M3U source returned HTTP {status_code}. Check the playlist URL and assigned proxy.",
+        )
+    if isinstance(exc, httpx.TimeoutException):
+        logger.warning("M3U %s request timed out", operation)
+        return HTTPException(
+            status_code=504,
+            detail="M3U source request timed out. Check the source and assigned proxy.",
+        )
+    if isinstance(exc, httpx.RequestError):
+        error_type = type(exc).__name__
+        logger.warning("M3U %s network request failed (%s)", operation, error_type)
+        return HTTPException(
+            status_code=502,
+            detail=f"M3U network request failed ({error_type}). Check the source URL and assigned proxy.",
+        )
+    logger.error("M3U %s failed (%s)", operation, type(exc).__name__)
+    return HTTPException(
+        status_code=502,
+        detail=f"Could not fetch or parse the M3U playlist ({type(exc).__name__}).",
+    )
 
 
 def _playlist_category_id(playlist_id: int, group_title: str) -> str:
@@ -188,8 +241,7 @@ async def import_m3u_playlist(payload: M3UPlaylistCreate) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
-        logger.error("M3U import failed (%s)", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Could not fetch or parse the M3U playlist.") from exc
+        raise _m3u_fetch_http_exception(exc, "import") from exc
     if not entries:
         raise HTTPException(status_code=422, detail="The M3U playlist contains no usable HTTP streams.")
     with SessionLocal() as db:
@@ -228,8 +280,8 @@ async def refresh_m3u_playlist(playlist_id: int) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
-        logger.error("M3U refresh failed for playlist %s (%s)", playlist_id, type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Could not refresh the M3U playlist.") from exc
+        exception = _m3u_fetch_http_exception(exc, f"refresh for playlist {playlist_id}")
+        raise exception from exc
     if not entries:
         raise HTTPException(status_code=422, detail="The refreshed playlist contains no usable HTTP streams.")
     count = await asyncio.to_thread(replace_playlist_entries, playlist_id, entries)
@@ -694,6 +746,10 @@ async def get_series_details(
         response=response,
         series_id=series_id,
     )
+    return _normalize_series_details(info, series_id)
+
+
+def _normalize_series_details(info: Any, series_id: str) -> dict[str, Any]:
     if not isinstance(info, dict):
         raise HTTPException(status_code=502, detail="Provider returned invalid series details.")
 
@@ -770,8 +826,35 @@ class ManualBatchRequest(BaseModel):
     items: list[ManualQueueItem] = Field(min_length=1, max_length=5000)
 
 
+class SeriesQueueSelection(BaseModel):
+    series_id: str = Field(min_length=1, max_length=512)
+    title: str = Field(min_length=1, max_length=1024)
+    category_id: str | None = Field(default=None, max_length=255)
+    category_name: str | None = Field(default=None, max_length=512)
+
+
+class SeriesQueueBatchRequest(BaseModel):
+    source_account_id: int | None = Field(default=None, ge=1)
+    source_playlist_id: int | None = Field(default=None, ge=1)
+    provider_proxy_id: int | None = Field(default=None, ge=0)
+    account_ids: list[int] = Field(min_length=1, max_length=100)
+    proxy_mode: Literal["selected", "direct"] = "direct"
+    proxy_id: int | None = Field(default=None, ge=1)
+    downloader: Literal["axel", "wget"] = "axel"
+    series: list[SeriesQueueSelection] = Field(min_length=1, max_length=500)
+
+
 @queue_router.post("/manual-batch")
 def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[str, Any]:
+    return _queue_manual_batch(payload, request)
+
+
+def _queue_manual_batch(
+    payload: ManualBatchRequest,
+    request: Request,
+    *,
+    allow_existing_account_queue: bool = False,
+) -> dict[str, Any]:
     kind = "series" if payload.content_type == "SERIES" else "vod"
     with SessionLocal() as db:
         playlist = (
@@ -838,19 +921,20 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                     status_code=409,
                     detail="Selected download accounts must be enabled.",
                 )
-            busy_ids = set(db.scalars(
-                select(QueueItem.account_id).where(
-                    QueueItem.account_id.in_(payload.account_ids),
-                    QueueItem.status.in_(
-                        ("PENDING", "DOWNLOADING", "VERIFYING", "CANCELLING")
-                    ),
-                ).distinct()
-            ).all())
-            if busy_ids:
-                raise HTTPException(
-                    status_code=409,
-                    detail="One or more selected accounts already have queued or active work. Refresh account availability.",
-                )
+            if not allow_existing_account_queue:
+                busy_ids = set(db.scalars(
+                    select(QueueItem.account_id).where(
+                        QueueItem.account_id.in_(payload.account_ids),
+                        QueueItem.status.in_(
+                            ("PENDING", "DOWNLOADING", "VERIFYING", "CANCELLING")
+                        ),
+                    ).distinct()
+                ).all())
+                if busy_ids:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="One or more selected accounts already have queued or active work. Refresh account availability.",
+                    )
         selected_proxy_id = None
         if payload.proxy_mode == "node":
             if payload.proxy_id is not None:
@@ -1069,6 +1153,178 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
     if queued:
         request.app.state.worker_pool.wake()
     return {"queued": queued, "skipped": skipped, "queued_count": len(queued)}
+
+
+@queue_router.post("/prepare-series-batch")
+async def prepare_series_batch(
+    payload: SeriesQueueBatchRequest,
+    request: Request,
+) -> dict[str, Any]:
+    if len(set(payload.account_ids)) != len(payload.account_ids):
+        raise HTTPException(status_code=422, detail="Selected account IDs must be unique.")
+    series_ids = [series.series_id for series in payload.series]
+    if len(set(series_ids)) != len(series_ids):
+        raise HTTPException(status_code=422, detail="Selected series IDs must be unique.")
+    if (payload.source_account_id is None) == (payload.source_playlist_id is None):
+        raise HTTPException(
+            status_code=422,
+            detail="Select exactly one source account or M3U playlist.",
+        )
+    if payload.proxy_mode == "selected" and payload.proxy_id is None:
+        raise HTTPException(status_code=422, detail="Select a download proxy or choose direct connection.")
+    if payload.proxy_mode == "direct" and payload.proxy_id is not None:
+        raise HTTPException(status_code=422, detail="Direct connection cannot include a proxy ID.")
+
+    with SessionLocal() as db:
+        selected_accounts = db.scalars(
+            select(Account).where(
+                Account.id.in_(payload.account_ids),
+                Account.enabled.is_(True),
+            )
+        ).all()
+        if len(selected_accounts) != len(payload.account_ids):
+            raise HTTPException(status_code=409, detail="Selected download accounts must be enabled.")
+        busy_ids = set(db.scalars(
+            select(QueueItem.account_id).where(
+                QueueItem.account_id.in_(payload.account_ids),
+                QueueItem.status.in_(("PENDING", "DOWNLOADING", "VERIFYING", "CANCELLING")),
+            ).distinct()
+        ).all())
+        if busy_ids:
+            raise HTTPException(
+                status_code=409,
+                detail="One or more selected accounts already have queued or active work. Refresh account availability.",
+            )
+        route = db.get(StorageRoute, "series")
+        if not route or not db.get(Node, route.node_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Assign a storage node for series content before queueing.",
+            )
+        if payload.proxy_mode == "selected":
+            proxy = db.get(Proxy, payload.proxy_id)
+            if not proxy or not proxy.enabled:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The selected download proxy is no longer enabled. Choose another proxy or direct connection.",
+                )
+            if (
+                payload.downloader == "wget"
+                and urlsplit(decrypt_secret(proxy.url_encrypted)).scheme.lower()
+                in ("socks5", "socks5h")
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Wget does not support SOCKS5 proxies. Choose Axel/aria2c or an HTTP(S) proxy.",
+                )
+
+    account = None
+    playlist = None
+    provider_proxy_url = None
+    if payload.source_playlist_id is not None:
+        with SessionLocal() as db:
+            playlist = db.get(M3UPlaylist, payload.source_playlist_id)
+            if not playlist or not playlist.enabled:
+                raise HTTPException(status_code=409, detail="The selected M3U playlist is unavailable.")
+    else:
+        account = _provider_account(payload.source_account_id)
+        provider_proxy_url = _resolve_api_proxy(payload.provider_proxy_id)
+
+    queued: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    failed: list[dict[str, str]] = []
+    enqueued_first_series = False
+
+    for selection in payload.series:
+        try:
+            if playlist is not None:
+                details = get_m3u_series_details(
+                    playlist.id,
+                    selection.series_id,
+                )
+            else:
+                if account is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="The selected Xtream account is unavailable.",
+                    )
+                provider_info = await _request_provider(
+                    account,
+                    "get_series_info",
+                    proxy_url=provider_proxy_url,
+                    series_id=selection.series_id,
+                )
+                details = _normalize_series_details(provider_info, selection.series_id)
+
+            entries: list[ManualQueueItem] = []
+            for season_key, episodes in details["seasons"].items():
+                for episode in episodes:
+                    season = episode.get("season")
+                    if season is None:
+                        season = parse_season_number(season_key) or 0
+                    episode_num = int(episode["episode_num"])
+                    extension = safe_extension(episode["ext"])
+                    entries.append(ManualQueueItem(
+                        stream_id=episode["id"],
+                        source_entry_id=episode.get("source_entry_id"),
+                        title=(
+                            f"{details['name']} S{season:02d}E{episode_num:02d}"
+                        ),
+                        series_name=details["name"],
+                        series_id=details["series_id"],
+                        season=str(season),
+                        episode_num=episode_num,
+                        filename=f"S{season:02d}E{episode_num:02d}.{extension}",
+                        container_ext=extension,
+                        category_id=selection.category_id,
+                        category_name=selection.category_name,
+                    ))
+            if not entries:
+                failed.append({
+                    "series_id": selection.series_id,
+                    "title": selection.title,
+                    "error": "No episodes were returned for this series.",
+                })
+                continue
+
+            result = _queue_manual_batch(
+                ManualBatchRequest(
+                    content_type="SERIES",
+                    source_account_id=payload.source_account_id,
+                    source_playlist_id=payload.source_playlist_id,
+                    account_ids=payload.account_ids,
+                    proxy_mode=payload.proxy_mode,
+                    proxy_id=payload.proxy_id,
+                    downloader=payload.downloader,
+                    items=entries,
+                ),
+                request,
+                allow_existing_account_queue=enqueued_first_series,
+            )
+            enqueued_first_series = True
+            queued.extend(result["queued"])
+            skipped.extend(result["skipped"])
+        except HTTPException as exc:
+            failed.append({
+                "series_id": selection.series_id,
+                "title": selection.title,
+                "error": str(exc.detail),
+            })
+            logger.warning(
+                "Series queue preparation failed for series %s (HTTP %s)",
+                selection.series_id,
+                exc.status_code,
+            )
+
+    return {
+        "queued": queued,
+        "queued_count": len(queued),
+        "skipped": skipped,
+        "failed": failed,
+        "processed_series": len(payload.series) - len(failed),
+    }
+
+
 def _integer_or_none(value: Any) -> int | None:
     try:
         parsed = int(value)

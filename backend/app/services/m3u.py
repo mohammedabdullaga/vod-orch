@@ -134,7 +134,10 @@ async def fetch_playlist(source_url: str, proxy_url: str | None) -> list[dict]:
                 payload.extend(chunk)
                 if len(payload) > MAX_PLAYLIST_BYTES:
                     raise ValueError("Playlist exceeds the 32 MiB import limit.")
-    decoded = bytes(payload).decode("utf-8-sig")
+    try:
+        decoded = bytes(payload).decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("The M3U playlist is not valid UTF-8 text.") from exc
     if not decoded.lstrip().startswith("#EXTM3U"):
         raise ValueError("The URL did not return an extended M3U playlist.")
     return await asyncio.to_thread(parse_m3u, decoded)

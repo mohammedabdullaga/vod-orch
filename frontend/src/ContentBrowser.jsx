@@ -51,6 +51,7 @@ export default function ContentBrowser({
   const [details, setDetails] = useState(null);
   const [selectedEpisodes, setSelectedEpisodes] = useState(new Map());
   const [pendingQueue, setPendingQueue] = useState(null);
+  const [pendingSeries, setPendingSeries] = useState(null);
   const [availableAccounts, setAvailableAccounts] = useState([]);
   const [selectedWorkerIds, setSelectedWorkerIds] = useState(new Set());
   const [availableProxies, setAvailableProxies] = useState([]);
@@ -61,6 +62,7 @@ export default function ContentBrowser({
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const selectedProxy = availableProxies.find((proxy) => String(proxy.id) === selectedProxyId);
+  const pendingCount = pendingSeries?.length ?? pendingQueue?.length ?? 0;
   const wgetProxyUnsupported = downloader === "wget"
     && proxyMode === "node"
     && /^socks5h?:/i.test(selectedProxy?.url || "");
@@ -320,6 +322,49 @@ export default function ContentBrowser({
         return;
       }
       setPendingQueue(entries);
+      setPendingSeries(null);
+      setAvailableAccounts(free);
+      setSelectedWorkerIds(new Set(free.map((account) => account.id)));
+      const proxies = data.proxies || [];
+      setAvailableProxies(proxies);
+      setProxyAvailable(proxies.length > 0);
+      const preferredProxy = proxies.find(
+        (proxy) => proxy.id === data.assigned_proxy_id,
+      ) || proxies[0];
+      setSelectedProxyId(preferredProxy ? String(preferredProxy.id) : "");
+      setProxyMode(proxies.length > 0 ? "node" : "direct");
+    } catch (error) {
+      setNotice(error.response?.data?.detail || "Could not check free provider accounts.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const prepareSeriesQueue = async (series) => {
+    if (!nodeId) {
+      setNotice(`Assign a storage server for ${nodeLabel} in Settings & Accounts before adding downloads.`);
+      return;
+    }
+    if (!series.length) {
+      setNotice("Select at least one series to queue.");
+      return;
+    }
+    setBusy(true);
+    setNotice("");
+    try {
+      const { data } = await api.get("/accounts/availability", {
+        params: {
+          content_type: "SERIES",
+          ...(sourceType === "xtream" ? { source_account_id: sourceAccountId } : {}),
+        },
+      });
+      const free = data.accounts.filter((account) => account.free);
+      if (!free.length) {
+        setNotice("No idle Xtream accounts are available for downloading. Wait for current downloads or add an account.");
+        return;
+      }
+      setPendingQueue([]);
+      setPendingSeries(series);
       setAvailableAccounts(free);
       setSelectedWorkerIds(new Set(free.map((account) => account.id)));
       const proxies = data.proxies || [];
@@ -338,7 +383,7 @@ export default function ContentBrowser({
   };
 
   const confirmQueueEntries = async () => {
-    if (!pendingQueue?.length || !selectedWorkerIds.size) {
+    if ((!pendingQueue?.length && !pendingSeries?.length) || !selectedWorkerIds.size) {
       setNotice("Choose at least one free provider account.");
       return;
     }
@@ -348,6 +393,42 @@ export default function ContentBrowser({
       let queued = 0;
       let skipped = 0;
       const accountIds = [...selectedWorkerIds];
+      if (pendingSeries?.length) {
+        const { data } = await api.post("/queue/prepare-series-batch", {
+          ...(sourceType === "m3u"
+            ? { source_playlist_id: Number(sourcePlaylistId) }
+            : {
+              source_account_id: Number(sourceAccountId),
+              provider_proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+            }),
+          account_ids: accountIds,
+          proxy_mode: proxyMode === "node" ? "selected" : "direct",
+          proxy_id: proxyMode === "node" ? Number(selectedProxyId) : null,
+          downloader,
+          series: pendingSeries.map((item) => ({
+            series_id: sourceType === "m3u" ? item.source_series_key : item.id,
+            title: item.name,
+            category_id: item.category_id,
+            category_name: item.category_name,
+          })),
+        });
+        queued = data.queued_count;
+        skipped = data.skipped.length;
+        const failed = data.failed || [];
+        const firstFailure = failed[0]?.title
+          ? ` First failed series: ${failed[0].title} — ${failed[0].error}`
+          : "";
+        setNotice(
+          `Prepared ${data.processed_series}/${pendingSeries.length} series; `
+          + `queued ${queued} episode${queued === 1 ? "" : "s"}; `
+          + `skipped ${skipped} duplicate${skipped === 1 ? "" : "s"}; `
+          + `failed ${failed.length}.${firstFailure}`
+        );
+        setPendingQueue(null);
+        setPendingSeries(null);
+        if (queued) onQueued?.();
+        return;
+      }
       const { data } = await api.post("/queue/manual-batch", {
         content_type: type === "series" ? "SERIES" : "MOVIE",
         ...(sourceType === "m3u"
@@ -364,12 +445,18 @@ export default function ContentBrowser({
       skipped = data.skipped.length;
       setNotice(`Queued ${queued} item${queued === 1 ? "" : "s"}; skipped ${skipped} duplicate${skipped === 1 ? "" : "s"}.`);
       setPendingQueue(null);
+      setPendingSeries(null);
       onQueued?.();
     } catch (error) {
       setNotice(error.response?.data?.detail || "Could not queue downloads. Refresh free account availability and retry.");
     } finally {
       setBusy(false);
     }
+  };
+
+  const cancelQueueConfirmation = () => {
+    setPendingQueue(null);
+    setPendingSeries(null);
   };
 
   const toggleWorker = (accountId) => {
@@ -415,42 +502,26 @@ export default function ContentBrowser({
       }));
     }
     const entries = [];
-    for (let start = 0; start < chosen.length; start += 8) {
-      const batch = await Promise.all(chosen.slice(start, start + 8).map(async (item) => {
-        const { data } = sourceType === "m3u"
-          ? await api.get(
-            `/playlists/${sourcePlaylistId}/series/${encodeURIComponent(item.source_series_key)}/details`,
-          )
-          : await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
-            params: { account_id: sourceAccountId },
-          });
-        return detailsEntries(item, data);
-      }));
-      entries.push(...batch.flat());
-    }
-    return entries;
-  };
-
-  const queueFullSeries = async (item) => {
-    setBusy(true);
-    setNotice("");
-    try {
+    for (const item of chosen) {
       const { data } = sourceType === "m3u"
         ? await api.get(
           `/playlists/${sourcePlaylistId}/series/${encodeURIComponent(item.source_series_key)}/details`,
         )
         : await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
-          params: { account_id: sourceAccountId },
+          params: { account_id: sourceAccountId, proxy_id: providerProxyId ? Number(providerProxyId) : 0 },
         });
-      await queueEntries(detailsEntries(item, data));
-    } catch (error) {
-      setNotice(error.response?.data?.detail || "Could not load the selected series.");
-      setBusy(false);
+      entries.push(...detailsEntries(item, data));
     }
+    return entries;
+  };
+
+  const queueFullSeries = async (item) => {
+    await prepareSeriesQueue([item]);
   };
 
   const queueSelectedTitles = async () => {
     if (!selectedTitles.length) return setNotice("Select at least one title to queue.");
+    if (type === "series") return prepareSeriesQueue(selectedTitles);
     setBusy(true);
     setNotice("");
     try {
@@ -795,13 +866,14 @@ export default function ContentBrowser({
           </footer>
         </div>
       </div>}
-      {pendingQueue && <div role="dialog" aria-modal="true" aria-labelledby="queue-confirm-title" className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4">
+      {(pendingQueue !== null || pendingSeries !== null) && <div role="dialog" aria-modal="true" aria-labelledby="queue-confirm-title" className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4">
         <section className="w-full max-w-xl rounded-2xl border border-slate-700 bg-[#0d1320] shadow-2xl">
           <header className="flex items-start justify-between gap-4 border-b border-slate-800 px-5 py-4">
-            <div><h2 id="queue-confirm-title" className="font-semibold text-white">Confirm download assignment</h2><p className="mt-1 text-xs text-slate-400">{pendingQueue.length} item{pendingQueue.length === 1 ? "" : "s"} will be queued across the free accounts you select.</p><p className="mt-1 text-[11px] text-indigo-300">{sourceType === "m3u" ? `Using stream URLs saved from ${playlists.find((playlist) => String(playlist.id) === sourcePlaylistId)?.name || "the M3U playlist"}.` : `Browsing with ${providerAccounts.find((account) => String(account.id) === sourceAccountId)?.username || "the selected account"}; each download uses the credentials of its assigned account.`}</p></div>
-            <button type="button" onClick={() => setPendingQueue(null)} disabled={busy} aria-label="Cancel queue confirmation" className="rounded-lg p-2 text-slate-400 hover:bg-slate-800"><X size={16} /></button>
+            <div><h2 id="queue-confirm-title" className="font-semibold text-white">Confirm download assignment</h2><p className="mt-1 text-xs text-slate-400">{pendingSeries ? `${pendingCount} series will be prepared and queued as each finishes.` : `${pendingCount} item${pendingCount === 1 ? "" : "s"} will be queued across the free accounts you select.`}</p><p className="mt-1 text-[11px] text-indigo-300">{sourceType === "m3u" ? `Using stream URLs saved from ${playlists.find((playlist) => String(playlist.id) === sourcePlaylistId)?.name || "the M3U playlist"}.` : `Browsing with ${providerAccounts.find((account) => String(account.id) === sourceAccountId)?.username || "the selected account"}; each download uses the credentials of its assigned account.`}</p></div>
+            <button type="button" onClick={cancelQueueConfirmation} disabled={busy} aria-label="Cancel queue confirmation" className="rounded-lg p-2 text-slate-400 hover:bg-slate-800"><X size={16} /></button>
           </header>
           <div className="space-y-5 p-5">
+            {pendingSeries && <p className="rounded-lg border border-indigo-900/70 bg-indigo-950/30 px-3 py-2 text-xs text-indigo-200">Series details are requested at least 3 seconds apart. Each series is added to the download queue as soon as its details are ready.</p>}
             <div>
               <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-medium text-slate-200">Idle Xtream accounts</h3><span className="text-xs text-slate-500">{selectedWorkerIds.size} selected</span></div>
               <p className="mb-3 text-xs text-slate-500">Jobs are distributed round-robin. Each account runs at most one download at a time; selecting more free accounts increases parallel downloads.</p>
@@ -809,7 +881,7 @@ export default function ContentBrowser({
               <div className="max-h-48 space-y-2 overflow-y-auto">
                 {availableAccounts.map((account) => {
                   const sortedWorkers = [...selectedWorkerIds].sort((left, right) => left - right);
-                  const assignedCount = [...pendingQueue.keys()].filter((index) =>
+                  const assignedCount = Array.from({ length: pendingCount }, (_, index) => index).filter((index) =>
                     index % Math.max(1, sortedWorkers.length) === sortedWorkers.indexOf(account.id)
                   ).length;
                   return <label key={account.id} className="flex cursor-pointer items-center gap-3 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2.5">
@@ -859,10 +931,10 @@ export default function ContentBrowser({
             </fieldset>
           </div>
           <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 px-5 py-4">
-            <button type="button" onClick={() => setPendingQueue(null)} disabled={busy} className="rounded-lg border border-slate-700 px-4 py-2.5 text-sm text-slate-300 hover:bg-slate-800">Cancel</button>
+            <button type="button" onClick={cancelQueueConfirmation} disabled={busy} className="rounded-lg border border-slate-700 px-4 py-2.5 text-sm text-slate-300 hover:bg-slate-800">Cancel</button>
             <button type="button" onClick={confirmQueueEntries} disabled={busy || !selectedWorkerIds.size || (proxyMode === "node" && !selectedProxyId) || wgetProxyUnsupported} className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">
               {busy ? <LoaderCircle size={15} className="animate-spin" /> : <Download size={15} />}
-              Confirm &amp; queue {pendingQueue.length} downloads
+              {pendingSeries ? `Prepare & queue ${pendingCount} series` : `Confirm & queue ${pendingCount} downloads`}
             </button>
           </footer>
         </section>

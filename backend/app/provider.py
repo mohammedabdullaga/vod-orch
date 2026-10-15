@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -20,6 +21,8 @@ from app.models import (
 from app.security import decrypt_secret
 
 logger = logging.getLogger(__name__)
+_series_details_lock = asyncio.Lock()
+_last_series_details_request_at = 0.0
 
 
 def resolve_provider_proxy(proxy_id: int | None) -> str | None:
@@ -126,12 +129,31 @@ async def cached_provider_action(
             return cached_payload, "hit"
 
     try:
-        payload = await provider_action(
-            account,
-            action,
-            proxy_url=proxy_url,
-            **params,
-        )
+        if action == "get_series_info":
+            global _last_series_details_request_at
+            async with _series_details_lock:
+                loop = asyncio.get_running_loop()
+                wait_seconds = (
+                    _last_series_details_request_at
+                    + settings.provider_series_details_interval_seconds
+                    - loop.time()
+                )
+                if wait_seconds > 0:
+                    await asyncio.sleep(wait_seconds)
+                _last_series_details_request_at = loop.time()
+                payload = await provider_action(
+                    account,
+                    action,
+                    proxy_url=proxy_url,
+                    **params,
+                )
+        else:
+            payload = await provider_action(
+                account,
+                action,
+                proxy_url=proxy_url,
+                **params,
+            )
         serialized_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     except Exception as exc:
         if cached_payload is None:

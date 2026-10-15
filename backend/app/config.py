@@ -17,6 +17,9 @@ class Settings:
     provider_series_details_ttl_seconds: int = int(
         os.getenv("PROVIDER_SERIES_DETAILS_TTL_SECONDS", "21600")
     )
+    provider_series_details_interval_seconds: float = float(
+        os.getenv("PROVIDER_SERIES_DETAILS_INTERVAL_SECONDS", "3")
+    )
     worker_poll_seconds: int = int(os.getenv("WORKER_POLL_SECONDS", "2"))
     max_retries: int = int(os.getenv("MAX_RETRIES", "5"))
     request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
@@ -37,6 +40,8 @@ class Settings:
     def __post_init__(self) -> None:
         if not 1 <= self.default_axel_connections <= 12:
             raise ValueError("DEFAULT_AXEL_CONNECTIONS must be between 1 and 12.")
+        if self.provider_series_details_interval_seconds < 0:
+            raise ValueError("PROVIDER_SERIES_DETAILS_INTERVAL_SECONDS cannot be negative.")
 
 
 settings = Settings()
