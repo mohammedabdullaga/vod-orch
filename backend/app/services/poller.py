@@ -3,8 +3,8 @@ import logging
 from sqlalchemy import or_, select
 
 from app.config import settings
-from app.models import Account, MonitoredCategory, QueueItem, SessionLocal, utc_now
-from app.provider import provider_action, stream_url
+from app.models import Account, AppSettings, MonitoredCategory, QueueItem, SessionLocal, utc_now
+from app.provider import provider_action, resolve_provider_proxy, stream_url
 from app.security import encrypt_secret
 from app.services.content_paths import (
     clean_content_name,
@@ -46,11 +46,14 @@ class CategoryPoller:
             monitored = db.scalars(
                 select(MonitoredCategory).where(MonitoredCategory.monitored.is_(True))
             ).all()
+            setting = db.get(AppSettings, 1)
+            provider_proxy_id = setting.provider_proxy_id if setting else None
         if not accounts:
             return
+        proxy_url = resolve_provider_proxy(provider_proxy_id)
         for account in accounts:
             try:
-                await self._poll_account(account, monitored)
+                await self._poll_account(account, monitored, proxy_url)
             except Exception as exc:
                 logger.error(
                     "Provider poll failed for account %s (%s)",
@@ -58,10 +61,23 @@ class CategoryPoller:
                     type(exc).__name__,
                 )
 
-    async def _poll_account(self, account: Account, monitored: list[MonitoredCategory]) -> None:
+    async def _poll_account(
+        self,
+        account: Account,
+        monitored: list[MonitoredCategory],
+        proxy_url: str | None,
+    ) -> None:
         source_categories = {
-            "series": await provider_action(account, "get_series_categories"),
-            "vod": await provider_action(account, "get_vod_categories"),
+            "series": await provider_action(
+                account,
+                "get_series_categories",
+                proxy_url=proxy_url,
+            ),
+            "vod": await provider_action(
+                account,
+                "get_vod_categories",
+                proxy_url=proxy_url,
+            ),
         }
         available = {
             (kind, str(item.get("category_id", item.get("id", ""))))
@@ -73,21 +89,40 @@ class CategoryPoller:
         ]
         for category in active_categories:
             if category.kind == "series":
-                series_list = await provider_action(account, "get_series", category_id=category.category_id)
+                series_list = await provider_action(
+                    account,
+                    "get_series",
+                    proxy_url=proxy_url,
+                    category_id=category.category_id,
+                )
                 for series in series_list:
-                    await self._enqueue_series(account, category, series)
+                    await self._enqueue_series(account, category, series, proxy_url)
             else:
-                streams = await provider_action(account, "get_vod_streams", category_id=category.category_id)
+                streams = await provider_action(
+                    account,
+                    "get_vod_streams",
+                    proxy_url=proxy_url,
+                    category_id=category.category_id,
+                )
                 for stream in streams:
                     await self._enqueue_vod(account, category, stream)
 
     async def _enqueue_series(
-        self, account: Account, category: MonitoredCategory, series: dict
+        self,
+        account: Account,
+        category: MonitoredCategory,
+        series: dict,
+        proxy_url: str | None,
     ) -> None:
         series_id = series.get("series_id", series.get("id"))
         if series_id is None:
             return
-        info = await provider_action(account, "get_series_info", series_id=series_id)
+        info = await provider_action(
+            account,
+            "get_series_info",
+            proxy_url=proxy_url,
+            series_id=series_id,
+        )
         episodes = info.get("episodes", {}) if isinstance(info, dict) else {}
         for season_key, season_rows in episodes.items():
             season_key_number = _int_or_none(season_key)

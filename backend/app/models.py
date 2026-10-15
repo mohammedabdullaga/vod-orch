@@ -65,6 +65,15 @@ class Proxy(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class AppSettings(Base):
+    __tablename__ = "app_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    provider_proxy_id: Mapped[int | None] = mapped_column(
+        ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True
+    )
+
+
 class MonitoredCategory(Base):
     __tablename__ = "monitored_categories"
     __table_args__ = (UniqueConstraint("category_id", "kind"),)

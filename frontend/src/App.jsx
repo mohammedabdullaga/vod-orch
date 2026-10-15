@@ -61,6 +61,8 @@ function App() {
   const [categories, setCategories] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [proxies, setProxies] = useState([]);
+  const [providerProxyId, setProviderProxyId] = useState("");
+  const [providerProxyReady, setProviderProxyReady] = useState(false);
   const [nodes, setNodes] = useState([]);
   const [routing, setRouting] = useState({ series_node_id: null, movie_node_id: null });
   const [editingNodeId, setEditingNodeId] = useState(null);
@@ -104,15 +106,35 @@ function App() {
 
   const loadSettings = async () => {
     try {
-      const [a, p, n, r] = await Promise.all([
-        api.get("/accounts"), api.get("/proxies"), api.get("/nodes"), api.get("/settings/storage-routing"),
+      const [a, p, n, r, providerProxy] = await Promise.all([
+        api.get("/accounts"),
+        api.get("/proxies"),
+        api.get("/nodes"),
+        api.get("/settings/storage-routing"),
+        api.get("/settings/provider-proxy"),
       ]);
-      setAccounts(a.data); setProxies(p.data); setNodes(n.data); setRouting(r.data);
-    } catch (error) { setNotice(error.response?.data?.detail || "Unable to load settings."); }
+      setAccounts(a.data);
+      setProxies(p.data);
+      setProviderProxyId((selected) =>
+        p.data.some((proxy) => proxy.enabled && String(proxy.id) === String(providerProxy.data.proxy_id))
+          ? String(providerProxy.data.proxy_id)
+          : ""
+      );
+      setNodes(n.data); setRouting(r.data);
+      setProviderProxyReady(true);
+      return p.data.some((proxy) =>
+        proxy.enabled && String(proxy.id) === String(providerProxy.data.proxy_id)
+      ) ? String(providerProxy.data.proxy_id) : "";
+    } catch (error) {
+      setNotice(error.response?.data?.detail || "Unable to load settings.");
+      return null;
+    }
   };
-  const loadCategories = async () => {
+  const loadCategories = async (proxyId = providerProxyId) => {
     try {
-      const categoryResponse = await api.get("/categories");
+      const categoryResponse = await api.get("/categories", {
+        params: proxyId ? { proxy_id: Number(proxyId) } : {},
+      });
       setCategories(categoryResponse.data);
     }
     catch (error) { setNotice(error.response?.data?.detail || "Unable to load categories."); }
@@ -121,8 +143,9 @@ function App() {
     if (!authenticated) return;
     if (tab === tabs[1]) loadSettings();
     if (tab === tabs[2]) {
-      loadCategories();
-      loadSettings();
+      loadSettings().then((proxyId) => {
+        if (proxyId !== null) loadCategories(proxyId);
+      });
     }
     if (tab === tabs[3]) loadSettings();
   }, [authenticated, tab]);
@@ -136,6 +159,22 @@ function App() {
     }
     catch (error) { setNotice(error.response?.data?.detail || error.message || "Request failed."); }
     finally { setBusy(false); }
+  };
+
+  const changeProviderProxy = async (proxyId) => {
+    setBusy(true);
+    setNotice("");
+    try {
+      const id = proxyId ? Number(proxyId) : null;
+      await api.put("/settings/provider-proxy", { proxy_id: id });
+      setProviderProxyId(proxyId);
+      setNotice(id ? `Provider API requests will use proxy #${id}.` : "Provider API requests will use a direct connection.");
+      if (tab === tabs[2]) await loadCategories(proxyId);
+    } catch (error) {
+      setNotice(error.response?.data?.detail || "Could not update the provider API proxy.");
+    } finally {
+      setBusy(false);
+    }
   };
 
   const toggleCategory = async (category) => {
@@ -352,10 +391,27 @@ function App() {
           </section>
         </>}
 
-        {tab === tabs[1] && <ContentBrowser api={api} routing={routing} onQueued={refresh} />}
+        {tab === tabs[1] && <ContentBrowser
+          api={api}
+          routing={routing}
+          onQueued={refresh}
+          proxies={proxies.filter((proxy) => proxy.enabled)}
+          providerProxyId={providerProxyId}
+          setProviderProxyId={changeProviderProxy}
+          providerProxyBusy={busy}
+          providerProxyReady={providerProxyReady}
+        />}
 
         {tab === tabs[2] && <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
           <div className="border-b border-slate-800 px-5 py-4"><h2 className="font-semibold text-white">Category watcher</h2><p className="mt-1 text-xs text-slate-500">Watched items inherit the storage root unless this category has its own remote path. Series can optionally match existing folders beneath a custom path; ambiguous matches are skipped. Configure leading labels to remove from downloaded names.</p>
+            <label className="mt-4 flex flex-wrap items-center gap-3 text-xs text-slate-400">
+              Fetch categories using
+              <select value={providerProxyId} onChange={(event) => setProviderProxyId(event.target.value)} disabled={busy} className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 disabled:opacity-50">
+                <option value="">Direct connection</option>
+                {proxies.filter((proxy) => proxy.enabled).map((proxy) => <option key={proxy.id} value={proxy.id}>Proxy #{proxy.id} · {proxy.url}</option>)}
+              </select>
+              <span className="text-slate-500">This also applies to provider lists and series details in Browse &amp; Ingest.</span>
+            </label>
             <p className="mt-2 text-xs text-slate-400">Series storage: <code className="text-indigo-300">{nodes.find((node) => node.id === routing.series_node_id)?.watch_path || "Unassigned"}</code> · Movies storage: <code className="text-indigo-300">{nodes.find((node) => node.id === routing.movie_node_id)?.watch_path || "Unassigned"}</code></p>
           </div>
           <div className="grid gap-3 p-5 sm:grid-cols-2 lg:grid-cols-3">{categories.map((category) => <div key={`${category.kind}-${category.category_id}`} className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">

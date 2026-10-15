@@ -24,7 +24,16 @@ function InventoryBadge({ status }) {
   return <span className={`ml-2 inline-flex rounded-full px-2 py-0.5 align-middle text-[10px] font-medium ${badge[1]}`}>{badge[0]}</span>;
 }
 
-export default function ContentBrowser({ api, routing, onQueued }) {
+export default function ContentBrowser({
+  api,
+  routing,
+  onQueued,
+  proxies,
+  providerProxyId,
+  setProviderProxyId,
+  providerProxyBusy,
+  providerProxyReady,
+}) {
   const [type, setType] = useState("series");
   const [providerAccounts, setProviderAccounts] = useState([]);
   const [sourceAccountId, setSourceAccountId] = useState("");
@@ -80,14 +89,23 @@ export default function ContentBrowser({ api, routing, onQueued }) {
     setSelectedItems(new Set());
     setDetails(null);
     setNotice("");
+    if (!providerProxyReady) {
+      return () => { current = false; };
+    }
     if (!sourceAccountId) {
       return () => { current = false; };
     }
-    api.get("/content/categories", { params: { type, account_id: sourceAccountId } })
+    api.get("/content/categories", {
+      params: {
+        type,
+        account_id: sourceAccountId,
+        ...(providerProxyId ? { proxy_id: Number(providerProxyId) } : {}),
+      },
+    })
       .then(({ data }) => { if (current) setCategories(data); })
       .catch((error) => { if (current) setNotice(error.response?.data?.detail || "Could not load provider categories."); });
     return () => { current = false; };
-  }, [api, type, sourceAccountId]);
+  }, [api, type, sourceAccountId, providerProxyId, providerProxyReady]);
 
   const visibleCategories = useMemo(() => categories.filter((category) =>
     category.category_name.toLocaleLowerCase().includes(categorySearch.toLocaleLowerCase())
@@ -179,6 +197,7 @@ export default function ContentBrowser({ api, routing, onQueued }) {
           type,
           account_id: sourceAccountId,
           category_ids: [...selectedCategories].join(","),
+          ...(providerProxyId ? { proxy_id: Number(providerProxyId) } : {}),
         },
       });
       setItems(data);
@@ -215,7 +234,10 @@ export default function ContentBrowser({ api, routing, onQueued }) {
     setNotice("");
     try {
       const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
-        params: { account_id: sourceAccountId },
+        params: {
+          account_id: sourceAccountId,
+          ...(providerProxyId ? { proxy_id: Number(providerProxyId) } : {}),
+        },
       });
       setDetails({ item, data });
       setSelectedEpisodes(new Map());
@@ -456,6 +478,21 @@ export default function ContentBrowser({ api, routing, onQueued }) {
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <label className="text-xs text-slate-400">
+              Provider API proxy
+              <select
+                aria-label="Provider API proxy"
+                value={providerProxyId}
+                onChange={(event) => setProviderProxyId(event.target.value)}
+                disabled={!providerProxyReady || busy || providerProxyBusy || Boolean(pendingQueue)}
+                className="ml-2 max-w-64 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
+              >
+                <option value="">Direct connection</option>
+                {proxies.map((proxy) => (
+                  <option key={proxy.id} value={proxy.id}>Proxy #{proxy.id} · {proxy.url}</option>
+                ))}
+              </select>
+            </label>
+            <label className="text-xs text-slate-400">
               Browse using Xtream account
               <select
                 aria-label="Browse using Xtream account"
@@ -481,7 +518,7 @@ export default function ContentBrowser({ api, routing, onQueued }) {
             </div>
           </div>
         </div>
-        <p className="mt-3 text-xs text-slate-500">Choose the account used to browse categories and titles. At download time, the selected idle worker account supplies its own Xtream username and password for the same stream ID.</p>
+        <p className="mt-3 text-xs text-slate-500">Choose the account used to browse categories and titles, and whether provider API requests should use a proxy. This proxy is for category, title, and series-detail API requests; download proxy settings are chosen separately at queue time. At download time, the selected idle worker account supplies its own Xtream username and password for the same stream ID.</p>
 
         <div className="mt-5 grid gap-5 lg:grid-cols-[minmax(260px,0.8fr)_minmax(0,1.6fr)]">
           <div className="rounded-xl border border-slate-800 bg-slate-900/40">

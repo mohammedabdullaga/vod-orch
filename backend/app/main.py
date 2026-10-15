@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from pydantic import BaseModel, Field, HttpUrl
@@ -27,6 +27,7 @@ from app.auth import (
 )
 from app.models import (
     Account,
+    AppSettings,
     MonitoredCategory,
     Node,
     Proxy,
@@ -36,7 +37,7 @@ from app.models import (
     init_db,
     utc_now,
 )
-from app.provider import provider_action
+from app.provider import provider_action, resolve_provider_proxy
 from app.security import decrypt_secret, encrypt_secret, mask_secret
 from app.services.dispatcher import RemoteDispatcher
 from app.services.poller import CategoryPoller
@@ -175,6 +176,10 @@ class ProxyEnabled(BaseModel):
     enabled: bool
 
 
+class ProviderProxyUpdate(BaseModel):
+    proxy_id: int | None = Field(default=None, ge=1)
+
+
 class CategoryToggle(BaseModel):
     category_id: str = Field(min_length=1, max_length=255)
     name: str = Field(min_length=1, max_length=512)
@@ -276,7 +281,7 @@ def get_status():
 
 
 @app.get("/api/categories")
-async def get_categories():
+async def get_categories(proxy_id: int | None = Query(default=None, ge=1)):
     with SessionLocal() as db:
         account = db.scalar(select(Account).where(Account.enabled.is_(True)).order_by(Account.id).limit(1))
         states = {
@@ -286,9 +291,13 @@ async def get_categories():
     if not account:
         raise HTTPException(status_code=409, detail="Add an enabled provider account first.")
     try:
+        proxy_url = resolve_provider_proxy(proxy_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
         result = []
         for kind, action in (("series", "get_series_categories"), ("vod", "get_vod_categories")):
-            for row in await provider_action(account, action):
+            for row in await provider_action(account, action, proxy_url=proxy_url):
                 category_id = str(row.get("category_id", row.get("id", "")))
                 state = states.get((kind, category_id))
                 result.append({
@@ -558,6 +567,32 @@ def list_proxies():
     return [{"id": item.id, "url": mask_secret(decrypt_secret(item.url_encrypted)), "enabled": item.enabled} for item in rows]
 
 
+@app.get("/api/settings/provider-proxy")
+def get_provider_proxy_setting():
+    with SessionLocal() as db:
+        setting = db.get(AppSettings, 1)
+        return {"proxy_id": setting.provider_proxy_id if setting else None}
+
+
+@app.put("/api/settings/provider-proxy")
+def update_provider_proxy_setting(payload: ProviderProxyUpdate):
+    with SessionLocal() as db:
+        if payload.proxy_id is not None:
+            proxy = db.get(Proxy, payload.proxy_id)
+            if not proxy or not proxy.enabled:
+                raise HTTPException(
+                    status_code=404,
+                    detail="The selected provider API proxy is unavailable or disabled.",
+                )
+        setting = db.get(AppSettings, 1)
+        if setting is None:
+            setting = AppSettings(id=1)
+            db.add(setting)
+        setting.provider_proxy_id = payload.proxy_id
+        db.commit()
+    return {"proxy_id": payload.proxy_id}
+
+
 @app.post("/api/proxies")
 def add_proxy(payload: ProxyCreate):
     with SessionLocal() as db:
@@ -575,6 +610,10 @@ def set_proxy_enabled(proxy_id: int, payload: ProxyEnabled):
         if not proxy:
             raise HTTPException(status_code=404, detail="Proxy not found.")
         proxy.enabled = payload.enabled
+        if not payload.enabled:
+            setting = db.get(AppSettings, 1)
+            if setting and setting.provider_proxy_id == proxy_id:
+                setting.provider_proxy_id = None
         db.commit()
     return {"ok": True, "id": proxy_id, "enabled": payload.enabled}
 

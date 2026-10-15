@@ -22,7 +22,7 @@ from app.models import (
     StorageRoute,
     utc_now,
 )
-from app.provider import provider_action, stream_url
+from app.provider import provider_action, resolve_provider_proxy, stream_url
 from app.security import decrypt_secret, encrypt_secret
 from app.services.content_paths import (
     category_directory_name,
@@ -70,9 +70,22 @@ def _provider_rows(value: Any, action: str) -> list[dict[str, Any]]:
     return value
 
 
-async def _request_provider(account: Account, action: str, **params: Any) -> Any:
+def _resolve_api_proxy(proxy_id: int | None) -> str | None:
     try:
-        return await provider_action(account, action, **params)
+        return resolve_provider_proxy(proxy_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+async def _request_provider(
+    account: Account,
+    action: str,
+    *,
+    proxy_url: str | None = None,
+    **params: Any,
+) -> Any:
+    try:
+        return await provider_action(account, action, proxy_url=proxy_url, **params)
     except HTTPException:
         raise
     except Exception as exc:
@@ -90,10 +103,12 @@ def _provider_kind(content_type: str) -> tuple[str, str, str]:
 async def get_content_categories(
     type: Literal["series", "movie"] = Query(...),
     account_id: int | None = Query(default=None, ge=1),
+    proxy_id: int | None = Query(default=None, ge=1),
 ) -> list[dict[str, Any]]:
     kind, action, _ = _provider_kind(type)
     account = _provider_account(account_id)
-    rows = _provider_rows(await _request_provider(account, action), action)
+    proxy_url = _resolve_api_proxy(proxy_id)
+    rows = _provider_rows(await _request_provider(account, action, proxy_url=proxy_url), action)
     with SessionLocal() as db:
         states = {
             item.category_id: item
@@ -128,14 +143,18 @@ async def get_content_items(
     type: Literal["series", "movie"] = Query(...),
     category_ids: str = Query(..., min_length=1, max_length=5000),
     account_id: int | None = Query(default=None, ge=1),
+    proxy_id: int | None = Query(default=None, ge=1),
 ) -> list[dict[str, Any]]:
     kind, _, items_action = _provider_kind(type)
     ids = list(dict.fromkeys(part.strip() for part in category_ids.split(",") if part.strip()))
     if not ids or len(ids) > 50:
         raise HTTPException(status_code=422, detail="Select between 1 and 50 category IDs.")
     account = _provider_account(account_id)
+    proxy_url = _resolve_api_proxy(proxy_id)
     categories_response = await _request_provider(
-        account, "get_series_categories" if kind == "series" else "get_vod_categories"
+        account,
+        "get_series_categories" if kind == "series" else "get_vod_categories",
+        proxy_url=proxy_url,
     )
     category_rows = _provider_rows(
         categories_response,
@@ -156,7 +175,12 @@ async def get_content_items(
     seen_item_ids: set[str] = set()
     for category_id in ids:
         rows = _provider_rows(
-            await _request_provider(account, items_action, category_id=category_id),
+            await _request_provider(
+                account,
+                items_action,
+                proxy_url=proxy_url,
+                category_id=category_id,
+            ),
             items_action,
         )
         for row in rows:
@@ -320,11 +344,18 @@ async def get_content_items(
 async def get_series_details(
     series_id: str,
     account_id: int | None = Query(default=None, ge=1),
+    proxy_id: int | None = Query(default=None, ge=1),
 ) -> dict[str, Any]:
     if not series_id or len(series_id) > 512:
         raise HTTPException(status_code=422, detail="Invalid series ID.")
     account = _provider_account(account_id)
-    info = await _request_provider(account, "get_series_info", series_id=series_id)
+    proxy_url = _resolve_api_proxy(proxy_id)
+    info = await _request_provider(
+        account,
+        "get_series_info",
+        proxy_url=proxy_url,
+        series_id=series_id,
+    )
     if not isinstance(info, dict):
         raise HTTPException(status_code=502, detail="Provider returned invalid series details.")
 

@@ -4,11 +4,27 @@ from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 import httpx
 
 from app.config import settings
-from app.models import Account
+from app.models import Account, Proxy, SessionLocal
 from app.security import decrypt_secret
 
 
-async def provider_action(account: Account, action: str, **params: Any) -> Any:
+def resolve_provider_proxy(proxy_id: int | None) -> str | None:
+    if proxy_id is None:
+        return None
+    with SessionLocal() as db:
+        proxy = db.get(Proxy, proxy_id)
+        if not proxy or not proxy.enabled:
+            raise ValueError("The selected provider proxy is unavailable or disabled.")
+        return decrypt_secret(proxy.url_encrypted)
+
+
+async def provider_action(
+    account: Account,
+    action: str,
+    *,
+    proxy_url: str | None = None,
+    **params: Any,
+) -> Any:
     base_url = account.provider_url.rstrip("/") + "/"
     api_url = urljoin(base_url, "player_api.php")
     query = {
@@ -17,7 +33,10 @@ async def provider_action(account: Account, action: str, **params: Any) -> Any:
         "action": action,
         **params,
     }
-    async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
+    async with httpx.AsyncClient(
+        timeout=settings.request_timeout_seconds,
+        proxy=proxy_url,
+    ) as client:
         response = await client.get(
             api_url,
             params=query,
