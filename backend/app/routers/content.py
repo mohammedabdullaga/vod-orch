@@ -22,7 +22,7 @@ from app.models import (
     StorageRoute,
     utc_now,
 )
-from app.provider import provider_action, resolve_provider_proxy, stream_url
+from app.provider import provider_action, resolve_provider_proxy_selection, stream_url
 from app.security import decrypt_secret, encrypt_secret
 from app.services.content_paths import (
     category_directory_name,
@@ -72,7 +72,7 @@ def _provider_rows(value: Any, action: str) -> list[dict[str, Any]]:
 
 def _resolve_api_proxy(proxy_id: int | None) -> str | None:
     try:
-        return resolve_provider_proxy(proxy_id)
+        return resolve_provider_proxy_selection(proxy_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -103,7 +103,7 @@ def _provider_kind(content_type: str) -> tuple[str, str, str]:
 async def get_content_categories(
     type: Literal["series", "movie"] = Query(...),
     account_id: int | None = Query(default=None, ge=1),
-    proxy_id: int | None = Query(default=None, ge=1),
+    proxy_id: int | None = Query(default=None, ge=0),
 ) -> list[dict[str, Any]]:
     kind, action, _ = _provider_kind(type)
     account = _provider_account(account_id)
@@ -143,7 +143,7 @@ async def get_content_items(
     type: Literal["series", "movie"] = Query(...),
     category_ids: str = Query(..., min_length=1, max_length=5000),
     account_id: int | None = Query(default=None, ge=1),
-    proxy_id: int | None = Query(default=None, ge=1),
+    proxy_id: int | None = Query(default=None, ge=0),
 ) -> list[dict[str, Any]]:
     kind, _, items_action = _provider_kind(type)
     ids = list(dict.fromkeys(part.strip() for part in category_ids.split(",") if part.strip()))
@@ -344,7 +344,7 @@ async def get_content_items(
 async def get_series_details(
     series_id: str,
     account_id: int | None = Query(default=None, ge=1),
-    proxy_id: int | None = Query(default=None, ge=1),
+    proxy_id: int | None = Query(default=None, ge=0),
 ) -> dict[str, Any]:
     if not series_id or len(series_id) > 512:
         raise HTTPException(status_code=422, detail="Invalid series ID.")

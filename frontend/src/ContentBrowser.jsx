@@ -99,7 +99,7 @@ export default function ContentBrowser({
       params: {
         type,
         account_id: sourceAccountId,
-        ...(providerProxyId ? { proxy_id: Number(providerProxyId) } : {}),
+        proxy_id: providerProxyId ? Number(providerProxyId) : 0,
       },
     })
       .then(({ data }) => { if (current) setCategories(data); })
@@ -197,7 +197,7 @@ export default function ContentBrowser({
           type,
           account_id: sourceAccountId,
           category_ids: [...selectedCategories].join(","),
-          ...(providerProxyId ? { proxy_id: Number(providerProxyId) } : {}),
+          proxy_id: providerProxyId ? Number(providerProxyId) : 0,
         },
       });
       setItems(data);
@@ -236,7 +236,7 @@ export default function ContentBrowser({
       const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
         params: {
           account_id: sourceAccountId,
-          ...(providerProxyId ? { proxy_id: Number(providerProxyId) } : {}),
+          proxy_id: providerProxyId ? Number(providerProxyId) : 0,
         },
       });
       setDetails({ item, data });

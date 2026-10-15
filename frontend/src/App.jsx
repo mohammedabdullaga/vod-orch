@@ -133,7 +133,7 @@ function App() {
   const loadCategories = async (proxyId = providerProxyId) => {
     try {
       const categoryResponse = await api.get("/categories", {
-        params: proxyId ? { proxy_id: Number(proxyId) } : {},
+        params: { proxy_id: proxyId ? Number(proxyId) : 0 },
       });
       setCategories(categoryResponse.data);
     }

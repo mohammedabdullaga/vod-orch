@@ -37,7 +37,7 @@ from app.models import (
     init_db,
     utc_now,
 )
-from app.provider import provider_action, resolve_provider_proxy
+from app.provider import provider_action, resolve_provider_proxy, resolve_provider_proxy_selection
 from app.security import decrypt_secret, encrypt_secret, mask_secret
 from app.services.dispatcher import RemoteDispatcher
 from app.services.poller import CategoryPoller
@@ -281,7 +281,7 @@ def get_status():
 
 
 @app.get("/api/categories")
-async def get_categories(proxy_id: int | None = Query(default=None, ge=1)):
+async def get_categories(proxy_id: int | None = Query(default=None, ge=0)):
     with SessionLocal() as db:
         account = db.scalar(select(Account).where(Account.enabled.is_(True)).order_by(Account.id).limit(1))
         states = {
@@ -291,7 +291,7 @@ async def get_categories(proxy_id: int | None = Query(default=None, ge=1)):
     if not account:
         raise HTTPException(status_code=409, detail="Add an enabled provider account first.")
     try:
-        proxy_url = resolve_provider_proxy(proxy_id)
+        proxy_url = resolve_provider_proxy_selection(proxy_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:

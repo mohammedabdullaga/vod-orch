@@ -4,7 +4,7 @@ from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 import httpx
 
 from app.config import settings
-from app.models import Account, Proxy, SessionLocal
+from app.models import Account, AppSettings, Proxy, SessionLocal
 from app.security import decrypt_secret
 
 
@@ -16,6 +16,16 @@ def resolve_provider_proxy(proxy_id: int | None) -> str | None:
         if not proxy or not proxy.enabled:
             raise ValueError("The selected provider proxy is unavailable or disabled.")
         return decrypt_secret(proxy.url_encrypted)
+
+
+def resolve_provider_proxy_selection(proxy_id: int | None) -> str | None:
+    if proxy_id == 0:
+        return None
+    if proxy_id is None:
+        with SessionLocal() as db:
+            setting = db.get(AppSettings, 1)
+            proxy_id = setting.provider_proxy_id if setting else None
+    return resolve_provider_proxy(proxy_id)
 
 
 async def provider_action(
