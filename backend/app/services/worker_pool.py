@@ -200,6 +200,7 @@ class WorkerPool:
                         QueueItem.account_id == account_id,
                     ),
                     or_(
+                        QueueItem.account_id == account_id,
                         QueueItem.source_provider_url == account.provider_url,
                         QueueItem.source_provider_url.is_(None),
                     ),

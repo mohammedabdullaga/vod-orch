@@ -443,23 +443,27 @@ def list_accounts():
 
 
 @app.get("/api/accounts/availability")
-def get_account_availability(content_type: Literal["SERIES", "MOVIE"]):
+def get_account_availability(
+    content_type: Literal["SERIES", "MOVIE"],
+    source_account_id: int | None = None,
+):
     kind = "series" if content_type == "SERIES" else "vod"
     with SessionLocal() as db:
-        source_account = db.scalar(
-            select(Account)
-            .where(Account.enabled.is_(True))
-            .order_by(Account.id)
-            .limit(1)
+        source_account = (
+            db.get(Account, source_account_id)
+            if source_account_id is not None
+            else db.scalar(
+                select(Account)
+                .where(Account.enabled.is_(True))
+                .order_by(Account.id)
+                .limit(1)
+            )
         )
-        if not source_account:
+        if not source_account or not source_account.enabled:
             raise HTTPException(status_code=409, detail="Add an enabled provider account first.")
         accounts = db.scalars(
             select(Account)
-            .where(
-                Account.enabled.is_(True),
-                Account.provider_url == source_account.provider_url,
-            )
+            .where(Account.enabled.is_(True))
             .order_by(Account.id)
         ).all()
         account_ids = [account.id for account in accounts]
@@ -468,7 +472,9 @@ def get_account_availability(content_type: Literal["SERIES", "MOVIE"]):
             busy_ids = set(db.scalars(
                 select(QueueItem.account_id).where(
                     QueueItem.account_id.in_(account_ids),
-                    QueueItem.status.in_(("PENDING", "DOWNLOADING", "VERIFYING")),
+                    QueueItem.status.in_(
+                        ("PENDING", "DOWNLOADING", "VERIFYING", "CANCELLING")
+                    ),
                 ).distinct()
             ).all())
         route = db.get(StorageRoute, kind)

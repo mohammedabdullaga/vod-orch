@@ -16,6 +16,8 @@ function episodeFilename(season, number, extension) {
 
 export default function ContentBrowser({ api, routing, onQueued }) {
   const [type, setType] = useState("series");
+  const [providerAccounts, setProviderAccounts] = useState([]);
+  const [sourceAccountId, setSourceAccountId] = useState("");
   const [categories, setCategories] = useState([]);
   const [selectedCategories, setSelectedCategories] = useState(new Set());
   const [categorySearch, setCategorySearch] = useState("");
@@ -42,17 +44,39 @@ export default function ContentBrowser({ api, routing, onQueued }) {
 
   useEffect(() => {
     let current = true;
+    api.get("/accounts")
+      .then(({ data }) => {
+        if (!current) return;
+        const enabled = data.filter((account) => account.enabled);
+        setProviderAccounts(enabled);
+        setSourceAccountId((selected) =>
+          enabled.some((account) => String(account.id) === selected)
+            ? selected
+            : String(enabled[0]?.id || "")
+        );
+      })
+      .catch((error) => {
+        if (current) setNotice(error.response?.data?.detail || "Could not load Xtream accounts.");
+      });
+    return () => { current = false; };
+  }, [api]);
+
+  useEffect(() => {
+    let current = true;
     setCategories([]);
     setSelectedCategories(new Set());
     setItems([]);
     setSelectedItems(new Set());
     setDetails(null);
     setNotice("");
-    api.get("/content/categories", { params: { type } })
+    if (!sourceAccountId) {
+      return () => { current = false; };
+    }
+    api.get("/content/categories", { params: { type, account_id: sourceAccountId } })
       .then(({ data }) => { if (current) setCategories(data); })
       .catch((error) => { if (current) setNotice(error.response?.data?.detail || "Could not load provider categories."); });
     return () => { current = false; };
-  }, [api, type]);
+  }, [api, type, sourceAccountId]);
 
   const visibleCategories = useMemo(() => categories.filter((category) =>
     category.category_name.toLocaleLowerCase().includes(categorySearch.toLocaleLowerCase())
@@ -131,7 +155,11 @@ export default function ContentBrowser({ api, routing, onQueued }) {
     setItemSearch("");
     try {
       const { data } = await api.get("/content/items", {
-        params: { type, category_ids: [...selectedCategories].join(",") },
+        params: {
+          type,
+          account_id: sourceAccountId,
+          category_ids: [...selectedCategories].join(","),
+        },
       });
       setItems(data);
       setNotice(`Loaded ${data.length} ${type === "series" ? "series" : "movies"}.`);
@@ -159,7 +187,9 @@ export default function ContentBrowser({ api, routing, onQueued }) {
     setBusy(true);
     setNotice("");
     try {
-      const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`);
+      const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
+        params: { account_id: sourceAccountId },
+      });
       setDetails({ item, data });
       setSelectedEpisodes(new Map());
     } catch (error) {
@@ -182,11 +212,14 @@ export default function ContentBrowser({ api, routing, onQueued }) {
     setNotice("");
     try {
       const { data } = await api.get("/accounts/availability", {
-        params: { content_type: type === "series" ? "SERIES" : "MOVIE" },
+        params: {
+          content_type: type === "series" ? "SERIES" : "MOVIE",
+          source_account_id: sourceAccountId,
+        },
       });
       const free = data.accounts.filter((account) => account.free);
       if (!free.length) {
-        setNotice("No idle accounts are available for this provider. Wait for current downloads or add an account.");
+        setNotice("No idle Xtream accounts are available for downloading. Wait for current downloads or add an account.");
         return;
       }
       setPendingQueue(entries);
@@ -220,6 +253,7 @@ export default function ContentBrowser({ api, routing, onQueued }) {
       const accountIds = [...selectedWorkerIds];
       const { data } = await api.post("/queue/manual-batch", {
         content_type: type === "series" ? "SERIES" : "MOVIE",
+        source_account_id: Number(sourceAccountId),
         target_node_id: String(nodeId),
         account_ids: accountIds,
         proxy_mode: proxyMode === "node" ? "selected" : "direct",
@@ -282,7 +316,9 @@ export default function ContentBrowser({ api, routing, onQueued }) {
     const entries = [];
     for (let start = 0; start < chosen.length; start += 8) {
       const batch = await Promise.all(chosen.slice(start, start + 8).map(async (item) => {
-        const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`);
+        const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
+          params: { account_id: sourceAccountId },
+        });
         return detailsEntries(item, data);
       }));
       entries.push(...batch.flat());
@@ -294,7 +330,9 @@ export default function ContentBrowser({ api, routing, onQueued }) {
     setBusy(true);
     setNotice("");
     try {
-      const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`);
+      const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
+        params: { account_id: sourceAccountId },
+      });
       await queueEntries(detailsEntries(item, data));
     } catch (error) {
       setNotice(error.response?.data?.detail || "Could not load the selected series.");
@@ -324,6 +362,7 @@ export default function ContentBrowser({ api, routing, onQueued }) {
       if (!entries.length) throw new Error("No downloadable episodes or movies were found.");
       const { data } = await api.post("/content/generate-script", {
         content_type: type === "series" ? "SERIES" : "MOVIE",
+        source_account_id: Number(sourceAccountId),
         items: entries,
       }, { responseType: "blob" });
       const content = new Blob([data], { type: "text/x-shellscript;charset=utf-8" });
@@ -388,14 +427,34 @@ export default function ContentBrowser({ api, routing, onQueued }) {
             <h2 className="font-semibold text-white">Browse &amp; Ingest</h2>
             <p className="mt-1 text-xs text-slate-500">Explore provider content and queue specific titles or episodes. {nodeId ? `${nodeLabel} will be sent to storage server #${nodeId}.` : `No ${nodeLabel.toLowerCase()} storage server is assigned.`}</p>
           </div>
-          <div className="inline-flex rounded-lg border border-slate-700 bg-slate-900 p-1">
-            {["series", "movie"].map((mediaType) => (
-              <button key={mediaType} onClick={() => setType(mediaType)} className={`rounded-md px-4 py-2 text-sm ${type === mediaType ? "bg-indigo-500 text-white" : "text-slate-400 hover:text-white"}`}>
-                {mediaType === "series" ? <><Tv size={14} className="mr-2 inline" />Series</> : <><Film size={14} className="mr-2 inline" />Movies</>}
-              </button>
-            ))}
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="text-xs text-slate-400">
+              Browse using Xtream account
+              <select
+                aria-label="Browse using Xtream account"
+                value={sourceAccountId}
+                onChange={(event) => setSourceAccountId(event.target.value)}
+                disabled={!providerAccounts.length || busy || Boolean(pendingQueue)}
+                className="ml-2 max-w-64 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
+              >
+                {!providerAccounts.length && <option value="">No enabled Xtream accounts</option>}
+                {providerAccounts.map((account) => (
+                  <option key={account.id} value={account.id}>
+                    #{account.id} · {account.username} · {account.provider_url}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="inline-flex rounded-lg border border-slate-700 bg-slate-900 p-1">
+              {["series", "movie"].map((mediaType) => (
+                <button key={mediaType} onClick={() => setType(mediaType)} className={`rounded-md px-4 py-2 text-sm ${type === mediaType ? "bg-indigo-500 text-white" : "text-slate-400 hover:text-white"}`}>
+                  {mediaType === "series" ? <><Tv size={14} className="mr-2 inline" />Series</> : <><Film size={14} className="mr-2 inline" />Movies</>}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
+        <p className="mt-3 text-xs text-slate-500">Choose the account used to browse categories and titles. At download time, the selected idle worker account supplies its own Xtream username and password for the same stream ID.</p>
 
         <div className="mt-5 grid gap-5 lg:grid-cols-[minmax(260px,0.8fr)_minmax(0,1.6fr)]">
           <div className="rounded-xl border border-slate-800 bg-slate-900/40">
@@ -418,7 +477,7 @@ export default function ContentBrowser({ api, routing, onQueued }) {
                   {category.monitored && <span className="rounded-full bg-emerald-400/10 px-2 py-0.5 text-[10px] text-emerald-300">Watching</span>}
                 </label>
               ))}
-              {!visibleCategories.length && <p className="px-3 py-8 text-center text-sm text-slate-500">{categories.length ? "No matching categories." : "No categories available."}</p>}
+              {!visibleCategories.length && <p className="px-3 py-8 text-center text-sm text-slate-500">{!providerAccounts.length ? "Add an enabled Xtream account to browse." : categories.length ? "No matching categories." : "No categories available."}</p>}
             </div>
             <div className="grid gap-2 border-t border-slate-800 p-3 sm:grid-cols-2">
               <button disabled={busy || !selectedCategories.size} onClick={monitorSelected} className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-40">Monitor selected</button>
@@ -563,13 +622,14 @@ export default function ContentBrowser({ api, routing, onQueued }) {
       {pendingQueue && <div role="dialog" aria-modal="true" aria-labelledby="queue-confirm-title" className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4">
         <section className="w-full max-w-xl rounded-2xl border border-slate-700 bg-[#0d1320] shadow-2xl">
           <header className="flex items-start justify-between gap-4 border-b border-slate-800 px-5 py-4">
-            <div><h2 id="queue-confirm-title" className="font-semibold text-white">Confirm download assignment</h2><p className="mt-1 text-xs text-slate-400">{pendingQueue.length} item{pendingQueue.length === 1 ? "" : "s"} will be queued across the free accounts you select.</p></div>
+            <div><h2 id="queue-confirm-title" className="font-semibold text-white">Confirm download assignment</h2><p className="mt-1 text-xs text-slate-400">{pendingQueue.length} item{pendingQueue.length === 1 ? "" : "s"} will be queued across the free accounts you select.</p><p className="mt-1 text-[11px] text-indigo-300">Browsing with {providerAccounts.find((account) => String(account.id) === sourceAccountId)?.username || "the selected account"}; each download uses the credentials of its assigned account.</p></div>
             <button type="button" onClick={() => setPendingQueue(null)} disabled={busy} aria-label="Cancel queue confirmation" className="rounded-lg p-2 text-slate-400 hover:bg-slate-800"><X size={16} /></button>
           </header>
           <div className="space-y-5 p-5">
             <div>
               <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-medium text-slate-200">Idle Xtream accounts</h3><span className="text-xs text-slate-500">{selectedWorkerIds.size} selected</span></div>
               <p className="mb-3 text-xs text-slate-500">Jobs are distributed round-robin. Each account runs at most one download at a time; selecting more free accounts increases parallel downloads.</p>
+              <p className="mb-3 text-[11px] text-indigo-300">Worker credentials are used for the stream request even when they differ from the browsing account.</p>
               <div className="max-h-48 space-y-2 overflow-y-auto">
                 {availableAccounts.map((account) => {
                   const sortedWorkers = [...selectedWorkerIds].sort((left, right) => left - right);

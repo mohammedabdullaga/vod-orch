@@ -35,17 +35,28 @@ router = APIRouter(prefix="/api/content", tags=["content"])
 queue_router = APIRouter(prefix="/api/queue", tags=["queue"])
 
 
-def _primary_account() -> Account:
+def _provider_account(account_id: int | None) -> Account:
     with SessionLocal() as db:
-        account = db.scalar(
-            select(Account)
-            .where(Account.enabled.is_(True))
-            .order_by(Account.id)
-            .limit(1)
+        account = (
+            db.get(Account, account_id)
+            if account_id is not None
+            else db.scalar(
+                select(Account)
+                .where(Account.enabled.is_(True))
+                .order_by(Account.id)
+                .limit(1)
+            )
         )
-    if not account:
-        raise HTTPException(status_code=409, detail="Add an enabled provider account first.")
-    return account
+        if not account or not account.enabled:
+            raise HTTPException(
+                status_code=404 if account_id is not None else 409,
+                detail=(
+                    "The selected Xtream account is not available."
+                    if account_id is not None
+                    else "Add an enabled provider account first."
+                ),
+            )
+        return account
 
 
 def _provider_rows(value: Any, action: str) -> list[dict[str, Any]]:
@@ -74,9 +85,10 @@ def _provider_kind(content_type: str) -> tuple[str, str, str]:
 @router.get("/categories")
 async def get_content_categories(
     type: Literal["series", "movie"] = Query(...),
+    account_id: int | None = Query(default=None, ge=1),
 ) -> list[dict[str, Any]]:
     kind, action, _ = _provider_kind(type)
-    account = _primary_account()
+    account = _provider_account(account_id)
     rows = _provider_rows(await _request_provider(account, action), action)
     with SessionLocal() as db:
         states = {
@@ -110,12 +122,13 @@ async def get_content_categories(
 async def get_content_items(
     type: Literal["series", "movie"] = Query(...),
     category_ids: str = Query(..., min_length=1, max_length=5000),
+    account_id: int | None = Query(default=None, ge=1),
 ) -> list[dict[str, Any]]:
     kind, _, items_action = _provider_kind(type)
     ids = list(dict.fromkeys(part.strip() for part in category_ids.split(",") if part.strip()))
     if not ids or len(ids) > 50:
         raise HTTPException(status_code=422, detail="Select between 1 and 50 category IDs.")
-    account = _primary_account()
+    account = _provider_account(account_id)
     categories_response = await _request_provider(
         account, "get_series_categories" if kind == "series" else "get_vod_categories"
     )
@@ -184,10 +197,13 @@ async def get_content_items(
 
 
 @router.get("/series/{series_id}/details")
-async def get_series_details(series_id: str) -> dict[str, Any]:
+async def get_series_details(
+    series_id: str,
+    account_id: int | None = Query(default=None, ge=1),
+) -> dict[str, Any]:
     if not series_id or len(series_id) > 512:
         raise HTTPException(status_code=422, detail="Invalid series ID.")
-    account = _primary_account()
+    account = _provider_account(account_id)
     info = await _request_provider(account, "get_series_info", series_id=series_id)
     if not isinstance(info, dict):
         raise HTTPException(status_code=502, detail="Provider returned invalid series details.")
@@ -253,6 +269,7 @@ class ManualQueueItem(BaseModel):
 
 class ManualBatchRequest(BaseModel):
     content_type: Literal["SERIES", "MOVIE"]
+    source_account_id: int | None = Field(default=None, ge=1)
     target_node_id: str | None = Field(default=None, max_length=64)
     account_ids: list[int] | None = Field(default=None, min_length=1, max_length=100)
     proxy_mode: Literal["node", "selected", "direct"] | None = None
@@ -265,8 +282,22 @@ class ManualBatchRequest(BaseModel):
 @queue_router.post("/manual-batch")
 def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[str, Any]:
     kind = "series" if payload.content_type == "SERIES" else "vod"
-    account = _primary_account()
     with SessionLocal() as db:
+        account = (
+            db.get(Account, payload.source_account_id)
+            if payload.source_account_id is not None
+            else db.scalar(
+                select(Account)
+                .where(Account.enabled.is_(True))
+                .order_by(Account.id)
+                .limit(1)
+            )
+        )
+        if not account or not account.enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="The selected browsing Xtream account is not enabled.",
+            )
         kind = "series" if payload.content_type == "SERIES" else "vod"
         route = db.get(StorageRoute, kind)
         node = db.get(Node, route.node_id) if route else None
@@ -290,18 +321,19 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
                 select(Account).where(
                     Account.id.in_(payload.account_ids),
                     Account.enabled.is_(True),
-                    Account.provider_url == account.provider_url,
                 ).order_by(Account.id)
             ).all()
             if len(selected_accounts) != len(payload.account_ids):
                 raise HTTPException(
                     status_code=409,
-                    detail="Selected accounts must be enabled and use the content provider endpoint.",
+                    detail="Selected download accounts must be enabled.",
                 )
             busy_ids = set(db.scalars(
                 select(QueueItem.account_id).where(
                     QueueItem.account_id.in_(payload.account_ids),
-                    QueueItem.status.in_(("PENDING", "DOWNLOADING", "VERIFYING")),
+                    QueueItem.status.in_(
+                        ("PENDING", "DOWNLOADING", "VERIFYING", "CANCELLING")
+                    ),
                 ).distinct()
             ).all())
             if busy_ids:
@@ -488,13 +520,14 @@ def _media_year(row: dict[str, Any]) -> str | None:
 
 class GenerateScriptRequest(BaseModel):
     content_type: Literal["SERIES", "MOVIE"]
+    source_account_id: int | None = Field(default=None, ge=1)
     items: list[ManualQueueItem] = Field(min_length=1, max_length=5000)
 
 
 @router.post("/generate-script")
 def generate_bash_script(payload: GenerateScriptRequest) -> Response:
     kind = "series" if payload.content_type == "SERIES" else "vod"
-    account = _primary_account()
+    account = _provider_account(payload.source_account_id)
     with SessionLocal() as db:
         route = db.get(StorageRoute, kind)
         node = db.get(Node, route.node_id) if route else None
