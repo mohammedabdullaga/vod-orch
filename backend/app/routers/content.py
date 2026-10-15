@@ -1,6 +1,8 @@
+import asyncio
 import logging
 import re
 import shlex
+from pathlib import PurePosixPath
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -23,7 +25,9 @@ from app.models import (
 from app.provider import provider_action, stream_url
 from app.security import decrypt_secret, encrypt_secret
 from app.services.content_paths import (
+    category_directory_name,
     clean_content_name,
+    library_name_matches,
     normalized_episode_path,
     safe_extension,
     season_number as parse_season_number,
@@ -120,6 +124,7 @@ async def get_content_categories(
 
 @router.get("/items")
 async def get_content_items(
+    request: Request,
     type: Literal["series", "movie"] = Query(...),
     category_ids: str = Query(..., min_length=1, max_length=5000),
     account_id: int | None = Query(default=None, ge=1),
@@ -193,6 +198,121 @@ async def get_content_items(
                 "year": _media_year(row),
                 "container_ext": safe_extension(str(row.get("container_extension") or "mkv")),
             })
+
+    with SessionLocal() as db:
+        states = {
+            item.category_id: item
+            for item in db.scalars(
+                select(MonitoredCategory).where(
+                    MonitoredCategory.kind == kind,
+                    MonitoredCategory.category_id.in_(ids),
+                )
+            ).all()
+        }
+        route = db.get(StorageRoute, kind)
+        node = db.get(Node, route.node_id) if route else None
+
+    roots: dict[str, str] = {}
+    category_prefixes: dict[str, str] = {}
+    if node:
+        for category_id in ids:
+            state = states.get(category_id)
+            prefixes = state.strip_prefixes if state else ""
+            category_prefixes[category_id] = prefixes
+            category_name = category_names[category_id]
+            configured_path = state.destination_path if state else None
+            roots[category_id] = (
+                configured_path
+                if configured_path
+                else str(PurePosixPath(node.watch_path) / category_directory_name(category_name, prefixes))
+            )
+
+    inventory: dict[str, list[str]] = {}
+    inventory_available = False
+    if roots:
+        try:
+            inventory = await asyncio.to_thread(
+                request.app.state.dispatcher.scan_library_files,
+                node,
+                roots,
+            )
+            inventory_available = True
+        except Exception as exc:
+            logger.warning(
+                "Storage library scan failed for %s categories (%s)",
+                len(roots),
+                type(exc).__name__,
+            )
+
+    for item in result:
+        category_id = item["category_id"]
+        files = inventory.get(category_id)
+        item["download_status"] = "unknown"
+        item["storage_match"] = None
+        if not inventory_available or files is None:
+            continue
+
+        if kind == "series":
+            series_directory = next(
+                (
+                    entry.split("/", 1)[0]
+                    for entry in files
+                    if "/" in entry
+                    and library_name_matches(
+                        item["name"],
+                        entry.split("/", 1)[0],
+                        category_prefixes.get(category_id, ""),
+                    )
+                ),
+                None,
+            )
+            if not series_directory:
+                item["download_status"] = "missing"
+                continue
+
+            episode_ids = set()
+            for entry in files:
+                if not entry.startswith(f"{series_directory}/"):
+                    continue
+                filename = entry.rsplit("/", 1)[-1]
+                episode_ids.update(
+                    (int(season), int(episode))
+                    for season, episode in re.findall(
+                        r"(?:^|[^A-Za-z0-9])S(\d{1,3})E(\d{1,3})(?=[^A-Za-z0-9]|$)",
+                        filename,
+                        flags=re.IGNORECASE,
+                    )
+                )
+            total_episodes = item["total_episodes"]
+            is_complete = (
+                total_episodes is not None
+                and total_episodes > 0
+                and len(episode_ids) >= total_episodes
+            )
+            item["download_status"] = "downloaded" if is_complete else "partial"
+            item["storage_match"] = series_directory
+            continue
+
+        movie_candidates = []
+        for entry in files:
+            filename = entry.rsplit("/", 1)[-1]
+            if "." not in filename:
+                continue
+            movie_candidates.append((filename.rsplit(".", 1)[0], entry))
+        match = next(
+            (
+                stored_path
+                for candidate, stored_path in movie_candidates
+                if library_name_matches(
+                    item["name"],
+                    candidate,
+                    category_prefixes.get(category_id, ""),
+                )
+            ),
+            None,
+        )
+        item["download_status"] = "downloaded" if match else "missing"
+        item["storage_match"] = match
     return result
 
 

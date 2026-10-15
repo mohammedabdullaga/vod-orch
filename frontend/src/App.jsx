@@ -383,7 +383,8 @@ function App() {
                 item.category_id === category.category_id && item.kind === category.kind
                   ? { ...item, strip_prefixes: event.target.value }
                   : item
-              ))} placeholder="4K-ar-fast, [4K], Arabic Dub" className="field" />
+              ))} placeholder="AR-SUBS, Fuiries, 4K-ar-fast" className="field" />
+              <p className="text-[11px] text-slate-500">Known tag patterns are detected automatically. Add unusual leading labels here; this cleans new names and inventory matching but does not rename existing files.</p>
               <button disabled={busy} className="secondary w-full">Save path · blank uses root</button>
             </form>
           </div>)}{!categories.length && <div className="col-span-full py-12 text-center text-sm text-slate-500">Add an enabled provider account to load categories.</div>}</div>

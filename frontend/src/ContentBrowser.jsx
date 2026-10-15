@@ -14,6 +14,16 @@ function episodeFilename(season, number, extension) {
   return `S${String(season || 0).padStart(2, "0")}E${String(number || 0).padStart(2, "0")}.${extension}`;
 }
 
+function InventoryBadge({ status }) {
+  const badge = {
+    downloaded: ["On storage", "bg-emerald-500/15 text-emerald-300"],
+    partial: ["Partial", "bg-sky-500/15 text-sky-200"],
+    missing: ["Missing", "bg-amber-500/15 text-amber-200"],
+    unknown: ["Storage unknown", "bg-slate-700 text-slate-300"],
+  }[status] || ["Storage unknown", "bg-slate-700 text-slate-300"];
+  return <span className={`ml-2 inline-flex rounded-full px-2 py-0.5 align-middle text-[10px] font-medium ${badge[1]}`}>{badge[0]}</span>;
+}
+
 export default function ContentBrowser({ api, routing, onQueued }) {
   const [type, setType] = useState("series");
   const [providerAccounts, setProviderAccounts] = useState([]);
@@ -25,6 +35,7 @@ export default function ContentBrowser({ api, routing, onQueued }) {
   const [selectedItems, setSelectedItems] = useState(new Set());
   const [viewMode, setViewMode] = useState("grid");
   const [itemSearch, setItemSearch] = useState("");
+  const [inventoryFilter, setInventoryFilter] = useState("all");
   const [details, setDetails] = useState(null);
   const [selectedEpisodes, setSelectedEpisodes] = useState(new Map());
   const [pendingQueue, setPendingQueue] = useState(null);
@@ -84,6 +95,15 @@ export default function ContentBrowser({ api, routing, onQueued }) {
   const visibleItems = useMemo(() => items.filter((item) =>
     `${item.name} ${item.category_name}`.toLocaleLowerCase().includes(itemSearch.toLocaleLowerCase())
   ), [items, itemSearch]);
+  const inventoryCounts = useMemo(() => ({
+    downloaded: items.filter((item) => item.download_status === "downloaded").length,
+    partial: items.filter((item) => item.download_status === "partial").length,
+    missing: items.filter((item) => item.download_status === "missing").length,
+    unknown: items.filter((item) => item.download_status === "unknown").length,
+  }), [items]);
+  const displayedItems = useMemo(() => visibleItems.filter((item) =>
+    inventoryFilter === "all" || item.download_status === inventoryFilter
+  ), [visibleItems, inventoryFilter]);
   const selectedTitles = useMemo(
     () => items.filter((item) => selectedItems.has(item.id)),
     [items, selectedItems],
@@ -162,7 +182,14 @@ export default function ContentBrowser({ api, routing, onQueued }) {
         },
       });
       setItems(data);
-      setNotice(`Loaded ${data.length} ${type === "series" ? "series" : "movies"}.`);
+      setInventoryFilter("all");
+      const missing = data.filter((item) => item.download_status === "missing").length;
+      const partial = data.filter((item) => item.download_status === "partial").length;
+      const unknown = data.filter((item) => item.download_status === "unknown").length;
+      setNotice(
+        `Loaded ${data.length} ${type === "series" ? "series" : "movies"}; `
+        + `${missing} not found · ${partial} incomplete${unknown ? ` · ${unknown} storage status${unknown === 1 ? "" : "es"} unavailable` : ""}.`
+      );
     } catch (error) {
       setNotice(error.response?.data?.detail || "Could not load content.");
     } finally {
@@ -180,7 +207,7 @@ export default function ContentBrowser({ api, routing, onQueued }) {
   };
 
   const selectAllVisible = () => {
-    setSelectedItems((current) => new Set([...current, ...visibleItems.map((item) => item.id)]));
+    setSelectedItems((current) => new Set([...current, ...displayedItems.map((item) => item.id)]));
   };
 
   const fetchDetails = async (item) => {
@@ -487,7 +514,7 @@ export default function ContentBrowser({ api, routing, onQueued }) {
 
           <div className="min-w-0 rounded-xl border border-slate-800 bg-slate-900/40">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 p-4">
-              <div><h3 className="text-sm font-medium text-slate-200">2. Select {type === "series" ? "series" : "movies"}</h3><p className="mt-1 text-xs text-slate-500">{items.length} results</p></div>
+              <div><h3 className="text-sm font-medium text-slate-200">2. Select {type === "series" ? "series" : "movies"}</h3><p className="mt-1 text-xs text-slate-500">{items.length} results · {inventoryCounts.downloaded} complete · {inventoryCounts.partial} partial · {inventoryCounts.missing} missing</p></div>
               <div className="flex flex-wrap items-center gap-3">
                 <div className="inline-flex rounded-lg border border-slate-700 bg-[#090d16] p-1" aria-label="Items view">
                   <button type="button" aria-pressed={viewMode === "grid"} onClick={() => setViewMode("grid")} className={`rounded-md px-2.5 py-1.5 text-xs ${viewMode === "grid" ? "bg-indigo-500 text-white" : "text-slate-400 hover:text-white"}`}><LayoutGrid size={14} className="mr-1.5 inline" />Grid</button>
@@ -499,9 +526,29 @@ export default function ContentBrowser({ api, routing, onQueued }) {
                 </div>
               </div>
             </div>
+            {items.length > 0 && <div role="status" aria-live="polite" className={`flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-4 py-3 ${inventoryCounts.missing ? "bg-amber-500/5" : "bg-slate-900/40"}`}>
+              <p className={`text-xs ${inventoryCounts.missing ? "text-amber-200" : inventoryCounts.partial ? "text-sky-200" : inventoryCounts.unknown ? "text-slate-400" : "text-emerald-300"}`}>
+                {inventoryCounts.missing
+                  ? `${inventoryCounts.missing} provider ${type === "series" ? "series" : "titles"} were not found in the selected storage folders.`
+                  : inventoryCounts.partial
+                    ? `${inventoryCounts.partial} series are present but do not have all known episodes on storage.`
+                    : inventoryCounts.unknown
+                    ? "Storage inventory could not be checked; unknown items are not marked as missing."
+                    : "All listed provider content is complete in the selected storage folders."}
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  ["all", `All (${items.length})`],
+                  ["missing", `Missing (${inventoryCounts.missing})`],
+                  ["partial", `Partial (${inventoryCounts.partial})`],
+                  ["downloaded", `On storage (${inventoryCounts.downloaded})`],
+                  ["unknown", `Unknown (${inventoryCounts.unknown})`],
+                ].map(([filter, label]) => <button key={filter} type="button" aria-pressed={inventoryFilter === filter} onClick={() => setInventoryFilter(filter)} className={`rounded-md px-2.5 py-1.5 text-[11px] ${inventoryFilter === filter ? "bg-indigo-500/20 text-indigo-200" : "text-slate-400 hover:bg-slate-800"}`}>{label}</button>)}
+              </div>
+            </div>}
             {items.length > 0 && <div className="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 bg-[#101827]/95 px-4 py-3 backdrop-blur">
               <div className="flex flex-wrap items-center gap-2">
-                <button type="button" onClick={selectAllVisible} disabled={!visibleItems.length} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40">Select All ({visibleItems.length} items)</button>
+                <button type="button" onClick={selectAllVisible} disabled={!displayedItems.length} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40">Select All ({displayedItems.length} items)</button>
                 <button type="button" onClick={() => setSelectedItems(new Set())} disabled={!selectedItems.size} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40">Deselect All</button>
                 <span className="text-xs text-slate-400">Selected: {selectedTitles.length} {type === "series" ? `shows · ${knownEpisodeCount} known episodes${unknownEpisodeCount ? ` · ${unknownEpisodeCount} count${unknownEpisodeCount === 1 ? "" : "s"} unavailable` : ""}` : "movies"}</span>
               </div>
@@ -511,16 +558,16 @@ export default function ContentBrowser({ api, routing, onQueued }) {
               </div>
             </div>}
             {!items.length ? <div className="grid min-h-64 place-items-center px-4 text-center text-sm text-slate-500">Choose categories and select <span className="text-indigo-300">Browse selected</span> to see provider content.</div> :
-              !visibleItems.length ? <div className="grid min-h-64 place-items-center px-4 text-center text-sm text-slate-500">No titles match your search.</div> :
+              !displayedItems.length ? <div className="grid min-h-64 place-items-center px-4 text-center text-sm text-slate-500">No titles match this search and storage filter.</div> :
                 viewMode === "list" ? <div className="max-h-[660px] overflow-auto">
                   <table className="w-full min-w-[760px] text-left text-sm">
                     <thead className="sticky top-0 z-[1] bg-slate-900 text-xs uppercase tracking-wide text-slate-500"><tr><th className="w-12 px-4 py-3">Select</th><th className="px-4 py-3">Title</th><th className="px-4 py-3">Category</th><th className="px-4 py-3">Season Count</th><th className="px-4 py-3">Episode Count</th><th className="px-4 py-3">Actions</th></tr></thead>
                     <tbody className="divide-y divide-slate-800/80">
-                      {visibleItems.map((item) => {
+                      {displayedItems.map((item) => {
                         const isSelected = selectedItems.has(item.id);
                         return <tr key={`${item.kind}-${item.id}`} role="button" tabIndex={0} aria-pressed={isSelected} onClick={() => toggleItemSelection(item.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggleItemSelection(item.id); } }} className={`cursor-pointer transition ${isSelected ? "bg-indigo-950/40 outline outline-1 -outline-offset-1 outline-indigo-500" : "hover:bg-slate-800/40"}`}>
                           <td className="px-4 py-3"><span className={`grid h-5 w-5 place-items-center rounded border ${isSelected ? "border-indigo-400 bg-indigo-500 text-white" : "border-slate-600 text-transparent"}`}><Check size={13} /></span></td>
-                          <td className="max-w-[280px] truncate px-4 py-3 font-medium text-slate-200">{item.name}{item.year && <span className="ml-2 text-xs font-normal text-slate-500">{item.year}</span>}</td>
+                          <td className="max-w-[280px] truncate px-4 py-3 font-medium text-slate-200">{item.name}{item.year && <span className="ml-2 text-xs font-normal text-slate-500">{item.year}</span>}<InventoryBadge status={item.download_status} /></td>
                           <td className="max-w-[180px] truncate px-4 py-3 text-slate-400">{item.category_name}</td>
                           <td className="px-4 py-3 text-slate-400">{type === "series" ? item.total_seasons ?? "—" : "—"}</td>
                           <td className="px-4 py-3 text-slate-400">{type === "series" ? item.total_episodes ?? "—" : "—"}</td>
@@ -536,7 +583,7 @@ export default function ContentBrowser({ api, routing, onQueued }) {
                     </tbody>
                   </table>
                 </div> : <div className="grid max-h-[660px] gap-3 overflow-y-auto p-4 sm:grid-cols-2 xl:grid-cols-3">
-                  {visibleItems.map((item) => {
+                  {displayedItems.map((item) => {
                     const isSelected = selectedItems.has(item.id);
                     return <article key={`${item.kind}-${item.id}`} role="button" tabIndex={0} aria-pressed={isSelected} onClick={() => toggleItemSelection(item.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggleItemSelection(item.id); } }} className={`group cursor-pointer overflow-hidden rounded-xl border transition ${isSelected ? "border-indigo-500 bg-indigo-950/40" : "border-slate-800 bg-[#0b111d] hover:border-slate-600"}`}>
                       <div className="relative grid h-40 place-items-center bg-slate-900">
@@ -545,7 +592,7 @@ export default function ContentBrowser({ api, routing, onQueued }) {
                         {item.year && <span className="absolute bottom-3 left-3 rounded-md bg-black/70 px-2 py-1 text-xs text-white">{item.year}</span>}
                       </div>
                       <div className="p-4">
-                        <h4 className="line-clamp-2 min-h-10 text-sm font-semibold text-slate-100">{item.name}</h4>
+                        <h4 className="line-clamp-2 min-h-10 text-sm font-semibold text-slate-100">{item.name}<InventoryBadge status={item.download_status} /></h4>
                         <p className="mt-1 truncate text-xs text-slate-500">{item.category_name}</p>
                         {type === "series" ? <div className="mt-2 flex gap-2">
                           <span className="rounded-full bg-slate-800 px-2 py-1 text-[10px] text-slate-300">{item.total_seasons ?? "—"} seasons</span>

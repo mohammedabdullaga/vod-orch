@@ -4,6 +4,13 @@ import unicodedata
 from difflib import SequenceMatcher
 
 
+_AUTO_RELEASE_PREFIX = re.compile(
+    r"^(?:(?:[A-Z0-9]{2,4}[-_]){1,3}[A-Z0-9]{2,8}"
+    r"|(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{1,8}(?:-[a-z0-9]{1,8}){1,3})"
+    r"(?::|\s+-\s+|\s+)"
+)
+
+
 def parse_strip_prefixes(value: str | None) -> tuple[str, ...]:
     if not value:
         return ()
@@ -17,6 +24,7 @@ def parse_strip_prefixes(value: str | None) -> tuple[str, ...]:
 
 def clean_content_name(value: str, prefixes: str | None = None) -> str:
     cleaned = value.strip()
+    cleaned = _AUTO_RELEASE_PREFIX.sub("", cleaned, count=1)
     strip_prefixes = tuple(
         sorted(set(parse_strip_prefixes(prefixes)) | {"4k"}, key=len, reverse=True)
     )
@@ -31,12 +39,42 @@ def clean_content_name(value: str, prefixes: str | None = None) -> str:
     return cleaned.strip(" -_.") or value
 
 
+def category_directory_name(value: str, prefixes: str | None = None) -> str:
+    return safe_filename(clean_content_name(value, prefixes))
+
+
 def normalize_match_name(value: str, prefixes: str | None = None) -> str:
     cleaned = unicodedata.normalize("NFKD", clean_content_name(value, prefixes)).casefold()
     return "".join(
         char for char in cleaned
         if not unicodedata.combining(char) and char.isalnum()
     )
+
+
+def _library_match_key(value: str, prefixes: str | None = None) -> str:
+    name = re.sub(r"\.(?:mkv|mp4|avi|mov|m4v|ts|webm|mpg|mpeg|wmv|flv)$", "", value, flags=re.IGNORECASE)
+    name = re.sub(r"\s*\[[^\]]+\]\s*$", "", name)
+    name = re.sub(r"\s*[\(\[]?(?:19|20)\d{2}[\)\]]?\s*$", "", name)
+    return normalize_match_name(name, prefixes)
+
+
+def library_name_matches(
+    expected: str,
+    candidate: str,
+    prefixes: str | None = None,
+) -> bool:
+    expected_key = _library_match_key(expected, prefixes)
+    candidate_key = _library_match_key(candidate, prefixes)
+    if not expected_key or not candidate_key:
+        return False
+    if expected_key == candidate_key:
+        return True
+    shorter, longer = sorted((expected_key, candidate_key), key=len)
+    if len(shorter) < 8:
+        return False
+    if longer.startswith(shorter) and len(longer) - len(shorter) <= 4:
+        return True
+    return SequenceMatcher(None, expected_key, candidate_key).ratio() >= 0.94
 
 
 def match_series_directory(
@@ -144,11 +182,7 @@ def normalized_episode_path(
     if not stem:
         stem = title
     stem = safe_filename(clean_content_name(stem, strip_prefixes), max_length=160)
-    category_segment = (
-        safe_filename(clean_content_name(category_name, strip_prefixes))
-        if category_name
-        else None
-    )
+    category_segment = category_directory_name(category_name, strip_prefixes) if category_name else None
     category_path = f"{category_segment}/" if category_segment else ""
 
     if kind == "series":

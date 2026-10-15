@@ -142,8 +142,10 @@ class RemoteDispatcher:
             time.sleep(0.1)
         while channel.recv_ready():
             output.extend(channel.recv(65536))
+            del output[:-max_output_bytes]
         while channel.recv_stderr_ready():
             error_output.extend(channel.recv_stderr(65536))
+            del error_output[:-65536]
         final_metrics = _parse_transfer_metrics(output + error_output)
         if on_transfer_metrics:
             on_transfer_metrics(*final_metrics)
@@ -169,6 +171,61 @@ class RemoteDispatcher:
             )
         finally:
             client.close()
+
+    def scan_library_files(
+        self,
+        node: Node,
+        roots: dict[str, str],
+    ) -> dict[str, list[str]]:
+        if not roots:
+            return {}
+        command_parts = []
+        for index, root in enumerate(roots.values()):
+            quoted_root = shlex.quote(root)
+            command_parts.append(
+                f"printf '\\036MEDIA_LIBRARY_BEGIN_{index}\\0'; "
+                f"if [ -e {quoted_root} ]; then "
+                f"if [ ! -d {quoted_root} ] || [ ! -r {quoted_root} ]; then "
+                f"printf 'Library directory is not readable.\\n' >&2; exit 23; fi; "
+                f"find {quoted_root} -type f \\( "
+                "-iname '*.mkv' -o -iname '*.mp4' -o -iname '*.avi' "
+                "-o -iname '*.mov' -o -iname '*.m4v' -o -iname '*.ts' "
+                "-o -iname '*.webm' -o -iname '*.mpg' -o -iname '*.mpeg' "
+                "-o -iname '*.wmv' -o -iname '*.flv' "
+                f"\\) -printf '%P\\0'; "
+                "find_status=$?; "
+                "if [ \"$find_status\" -ne 0 ]; then exit \"$find_status\"; fi; "
+                "fi; "
+                f"printf '\\036MEDIA_LIBRARY_END_{index}\\0'"
+            )
+        client = self._connect(node)
+        try:
+            output = self._run(
+                client,
+                "; ".join(command_parts),
+                max_output_bytes=16 * 1024 * 1024,
+            )
+        finally:
+            client.close()
+
+        records = output.split("\0")
+        entries: dict[str, list[str]] = {}
+        offset = 0
+        for index, key in enumerate(roots):
+            begin = f"\x1eMEDIA_LIBRARY_BEGIN_{index}"
+            end = f"\x1eMEDIA_LIBRARY_END_{index}"
+            if offset >= len(records) or records[offset] != begin:
+                raise RuntimeError("Remote library inventory was incomplete.")
+            offset += 1
+            try:
+                end_offset = records.index(end, offset)
+            except ValueError as exc:
+                raise RuntimeError("Remote library inventory was incomplete.") from exc
+            entries[key] = [entry for entry in records[offset:end_offset] if entry]
+            offset = end_offset + 1
+        if any(record for record in records[offset:]):
+            raise RuntimeError("Remote library inventory contained unexpected data.")
+        return entries
 
     def dispatch(
         self,

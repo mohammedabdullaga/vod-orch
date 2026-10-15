@@ -75,6 +75,7 @@ app.add_middleware(
     allow_credentials=True,
 )
 app.state.worker_pool = worker_pool
+app.state.dispatcher = dispatcher
 app.include_router(content_router)
 app.include_router(queue_router)
 
