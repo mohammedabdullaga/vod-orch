@@ -16,7 +16,7 @@ from app.models import (
     StorageRoute,
     utc_now,
 )
-from app.provider import stream_url
+from app.services.provider_client import stream_url
 from app.security import decrypt_secret
 from app.services.content_paths import safe_extension
 from app.services.dispatcher import DispatchCancelled, RemoteDispatcher

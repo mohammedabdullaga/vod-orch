@@ -27,8 +27,9 @@ from app.models import (
     StorageRoute,
     utc_now,
 )
-from app.provider import (
+from app.services.provider_client import (
     cached_provider_action,
+    parse_series_episodes,
     resolve_provider_proxy,
     resolve_provider_proxy_selection,
     stream_url,
@@ -752,40 +753,26 @@ async def get_series_details(
 def _normalize_series_details(info: Any, series_id: str) -> dict[str, Any]:
     if not isinstance(info, dict):
         raise HTTPException(status_code=502, detail="Provider returned invalid series details.")
-
-    raw_episodes = info.get("episodes", {})
-    if not isinstance(raw_episodes, dict):
-        raise HTTPException(status_code=502, detail="Provider returned an invalid episode list.")
+    try:
+        parsed_episodes = parse_series_episodes(info)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     series_metadata = info.get("info")
     if not isinstance(series_metadata, dict):
         series_metadata = {}
     seasons: dict[str, list[dict[str, Any]]] = {}
-    for season_key, entries in raw_episodes.items():
-        if not isinstance(entries, list):
-            logger.warning("Ignoring malformed episode list for series %s season %s", series_id, season_key)
-            continue
-        season_value = parse_season_number(season_key)
-        normalized = []
-        for position, episode in enumerate(entries, start=1):
-            if not isinstance(episode, dict):
-                continue
-            episode_id = episode.get("id", episode.get("stream_id"))
-            if episode_id is None:
-                continue
-            episode_num = _integer_or_none(episode.get("episode_num")) or position
-            episode_season = parse_season_number(episode.get("season"))
-            if episode_season is None:
-                episode_season = season_value
-            extension = safe_extension(str(episode.get("container_extension") or "mkv"))
-            normalized.append({
-                "episode_num": episode_num,
-                "id": str(episode_id),
-                "ext": extension,
-                "title": str(episode.get("title") or f"S{episode_season or 0:02d}E{episode_num:02d}"),
-                "season": episode_season,
-            })
-        normalized.sort(key=lambda item: item["episode_num"])
-        seasons[str(season_key)] = normalized
+    for episode in parsed_episodes:
+        season_key = episode["season"]
+        episode_season = parse_season_number(episode["season"])
+        seasons.setdefault(str(season_key), []).append({
+            "episode_num": episode["episode_num"],
+            "id": episode["stream_id"],
+            "ext": safe_extension(episode["container_extension"]),
+            "title": episode["title"],
+            "season": episode_season,
+        })
+    for season_episodes in seasons.values():
+        season_episodes.sort(key=lambda item: item["episode_num"])
     return {
         "series_id": str(info.get("series_id", series_id)),
         "name": str(

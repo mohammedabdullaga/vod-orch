@@ -250,6 +250,12 @@ class RemoteDispatcher:
             raise ValueError("Axel connections must be between 1 and 12.")
         if downloader not in ("axel", "wget"):
             raise ValueError("Downloader must be either axel or wget.")
+        stream_target = urlsplit(stream_url)
+        if (
+            stream_target.scheme.lower() not in ("http", "https")
+            or not stream_target.hostname
+        ):
+            raise ValueError("Stream URL must be an absolute HTTP or HTTPS URL.")
         user_agent = user_agent.strip() or "Mozilla"
         proxy_scheme = urlsplit(proxy_url).scheme.lower() if proxy_url else ""
         if downloader == "wget":

@@ -4,7 +4,12 @@ from sqlalchemy import or_, select
 
 from app.config import settings
 from app.models import Account, AppSettings, MonitoredCategory, QueueItem, SessionLocal, utc_now
-from app.provider import cached_provider_action, resolve_provider_proxy, stream_url
+from app.services.provider_client import (
+    cached_provider_action,
+    parse_series_episodes,
+    resolve_provider_proxy,
+    stream_url,
+)
 from app.security import encrypt_secret
 from app.services.content_paths import (
     clean_content_name,
@@ -123,43 +128,44 @@ class CategoryPoller:
             proxy_url=proxy_url,
             series_id=series_id,
         )
-        episodes = info.get("episodes", {}) if isinstance(info, dict) else {}
-        for season_key, season_rows in episodes.items():
-            season_key_number = _int_or_none(season_key)
-            for episode in season_rows:
-                stream_id = episode.get("id", episode.get("stream_id"))
-                if stream_id is None:
-                    continue
-                extension = episode.get("container_extension", "mkv")
-                series_title = clean_content_name(
-                    str(series.get("name") or "Series"), category.strip_prefixes
-                )
-                season = _int_or_none(episode.get("season")) or season_key_number
-                episode_number = _int_or_none(episode.get("episode_num"))
-                episode_title = safe_filename(
-                    f"{series_title} - S{season or 0:02d}E{episode_number or 0:02d}",
+        try:
+            episodes = parse_series_episodes(info)
+        except ValueError:
+            logger.exception("Invalid episode payload for series %s", series_id)
+            return
+        for episode in episodes:
+            stream_id = episode["stream_id"]
+            extension = episode["container_extension"]
+            series_title = clean_content_name(
+                str(series.get("name") or "Series"), category.strip_prefixes
+            )
+            season = _int_or_none(episode["season"])
+            episode_number = episode["episode_num"]
+            title = episode["title"]
+            if title.startswith("Episode "):
+                title = safe_filename(
+                    f"{series_title} - S{season or 0:02d}E{episode_number:02d}",
                     max_length=140,
                 )
-                title = episode.get("title") or episode_title
-                file_name, season, episode_number = normalized_episode_path(
-                    kind="series",
-                    title=title,
-                    category_name=category.name if not category.destination_path else None,
-                    provider_stream_id=str(stream_id),
-                    provider_url=account.provider_url,
-                    extension=extension,
-                    series_name=series_title,
-                    series_id=str(series_id),
-                    season=season,
-                    episode_num=episode_number,
-                    strip_prefixes=category.strip_prefixes,
-                )
-                self._insert_item(
-                    account, str(stream_id), title, "series",
-                    stream_url(account, "series", str(stream_id), extension),
-                    file_name, str(series_title), season, episode_number,
-                    category.category_id, category.name, str(series_id),
-                )
+            file_name, season, episode_number = normalized_episode_path(
+                kind="series",
+                title=title,
+                category_name=category.name if not category.destination_path else None,
+                provider_stream_id=stream_id,
+                provider_url=account.provider_url,
+                extension=extension,
+                series_name=series_title,
+                series_id=str(series_id),
+                season=season,
+                episode_num=episode_number,
+                strip_prefixes=category.strip_prefixes,
+            )
+            self._insert_item(
+                account, stream_id, title, "series",
+                stream_url(account, "series", stream_id, extension),
+                file_name, str(series_title), season, episode_number,
+                category.category_id, category.name, str(series_id),
+            )
 
     async def _enqueue_vod(
         self, account: Account, category: MonitoredCategory, stream: dict

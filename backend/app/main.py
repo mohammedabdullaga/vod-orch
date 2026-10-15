@@ -38,7 +38,7 @@ from app.models import (
     init_db,
     utc_now,
 )
-from app.provider import (
+from app.services.provider_client import (
     cached_provider_action,
     resolve_provider_proxy,
     resolve_provider_proxy_selection,
