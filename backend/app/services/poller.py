@@ -109,6 +109,7 @@ class CategoryPoller:
                 file_name, season, episode_number = normalized_episode_path(
                     kind="series",
                     title=title,
+                    category_name=category.name if not category.destination_path else None,
                     provider_stream_id=str(stream_id),
                     provider_url=account.provider_url,
                     extension=extension,
@@ -136,6 +137,7 @@ class CategoryPoller:
         file_name, _, _ = normalized_episode_path(
             kind="vod",
             title=title,
+            category_name=category.name if not category.destination_path else None,
             provider_stream_id=str(stream_id),
             provider_url=account.provider_url,
             extension=extension,
@@ -156,11 +158,16 @@ class CategoryPoller:
     ) -> None:
         identity = stream_identity(account.provider_url, kind, provider_stream_id)
         with SessionLocal() as db:
-            if db.scalar(select(QueueItem.id).where(or_(
+            existing = db.scalar(select(QueueItem).where(or_(
                 QueueItem.stream_id == identity,
                 (QueueItem.provider_stream_id.is_(None))
                 & (QueueItem.stream_id == provider_stream_id),
-            ))):
+            )))
+            if existing:
+                if existing.status == "PENDING" and existing.file_name != file_name:
+                    existing.file_name = file_name
+                    existing.updated_at = utc_now()
+                    db.commit()
                 return
             db.add(QueueItem(
                 stream_id=identity, provider_stream_id=provider_stream_id,

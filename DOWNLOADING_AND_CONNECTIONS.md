@@ -84,7 +84,7 @@ The Vite development server uses `localhost:5173` and forwards `/api` to the bac
    - Manually queued **Wget** jobs use resume/output, retry, User-Agent, and explicit direct or HTTP(S)-proxy settings. Wget uses one connection per file and cannot use SOCKS5.
    - New accounts use the `Mozilla` User-Agent unless another value is explicitly entered. Commands use the provider's configured stream host directly, adding explicit default HTTP/HTTPS ports when missing. The VPS does not follow redirects or resolve the edge URL; the storage server's downloader receives the primary provider URL and follows any redirect from its own network.
    - Only the explicitly selected/configured proxy is supplied to the remote downloader. Direct jobs clear inherited proxy environment variables before starting the downloader.
-   - The SSH command monitors the staging-file size and returns transfer metrics to the VPS. The file content itself travels from the provider (or proxy) to the storage server, not through the VPS.
+   - Movie files are placed directly in their category directory; series are organized as category / series / season / episode. A category-specific destination path is treated as that category's directory. Leading `4K-` labels and configured category prefixes are removed from new category, series, and movie names. The SSH command monitors the staging-file size and returns transfer metrics to the VPS. The file content itself travels from the provider (or proxy) to the storage server, not through the VPS.
 
 6. **Verify and promote**
    - After the downloader exits successfully, the VPS asks the storage server to run `ffprobe` against the staged file.

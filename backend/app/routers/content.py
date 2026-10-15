@@ -394,6 +394,11 @@ def queue_manual_batch(payload: ManualBatchRequest, request: Request) -> dict[st
             file_name, season, episode = normalized_episode_path(
                 kind=kind,
                 title=entry.title,
+                category_name=(
+                    (category_name or "Uncategorized")
+                    if not (category and category.destination_path)
+                    else None
+                ),
                 provider_stream_id=entry.stream_id,
                 provider_url=account.provider_url,
                 extension=extension,
@@ -550,9 +555,19 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
                 detail=f"Season and episode numbers are required for series stream {entry.stream_id}.",
             )
         extension = safe_extension(entry.container_ext)
+        category = category_overrides.get(entry.category_id or "")
         relative_path, _season, _episode = normalized_episode_path(
             kind=kind,
             title=entry.title,
+            category_name=(
+                (
+                    entry.category_name
+                    or (category.name if category else None)
+                    or "Uncategorized"
+                )
+                if not (category and category.destination_path)
+                else None
+            ),
             provider_stream_id=entry.stream_id,
             provider_url=account.provider_url,
             extension=extension,
@@ -570,7 +585,6 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
         if relative_path in added:
             continue
         added.add(relative_path)
-        category = category_overrides.get(entry.category_id or "")
         root = (category.destination_path if category else None) or node.watch_path
         destination = f"{root.rstrip('/')}/{relative_path}"
         parent = destination.rsplit("/", 1)[0]

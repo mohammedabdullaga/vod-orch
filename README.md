@@ -72,7 +72,7 @@ Existing single-server installations are migrated automatically: the existing se
 
 Each watched category can inherit its assigned server's storage root (leave its override blank) or set a category-specific absolute remote path in **Category Watcher**. Category and server roots are read when each queued job starts, so changing them routes pending/retried jobs to the new path; already-running and completed jobs are not moved automatically. Category paths must be absolute Linux paths, cannot be `/` or contain `..`, and are created on the assigned server as needed. Jobs with no server assigned remain pending until a route is configured.
 
-For a watched **series** category, enable **Match new episodes to an existing series folder** to search immediate subfolders of that category's custom destination path. The worker compares the provider series title with existing directory names, applies the category's configured strip prefixes first, and routes an episode into the best close match only when it is unique. No match or an ambiguous match fails explicitly instead of silently creating or choosing a potentially incorrect series folder. Prefixes are comma-separated leading labels (for example `4K-ar-fast`); they are stripped from series and movie names when building new paths and filenames. Existing completed files and folders are not renamed.
+For a watched **series** category, enable **Match new episodes to an existing series folder** to search immediate subfolders of that category's custom destination path. The worker compares the provider series title with existing directory names, applies the category's configured strip prefixes first, and routes an episode into the best close match only when it is unique. No match or an ambiguous match fails explicitly instead of silently creating or choosing a potentially incorrect series folder. Prefixes are comma-separated leading labels (for example `4K-ar-fast`); configured prefixes and a leading `4K-` label are stripped from category, series, and movie names when building new paths and filenames. Existing completed files and folders are not renamed.
 
 The **Browse & Ingest** tab supports poster-grid and compact-list views. Clicking a title card or row selects it; use **Inspect / Episodes** to inspect series seasons and choose individual episodes. **Ingest Selected via Workers** queues content immediately through the configured type-to-server route. **Export / Run as Direct Bash Script** downloads a standalone script for execution on that storage server (for example inside `tmux`); it is not executed by the VPS. The export contains provider stream URLs with account credentials, so confirm the warning, store the file securely, and delete it after use.
 
@@ -82,15 +82,15 @@ Each storage server defaults to 12 Axel connections (configurable from 1 to 12 p
 
 Use **Clear downloaded list** in **Overview & Queue** to hide completed items from the dashboard and completed count. This does not remove media files or completion records, so cleared streams remain protected from duplicate queueing.
 
-The dispatcher does not match items by title alone. It sanitizes names and uses the provider's stable IDs and metadata to create paths like:
+Each storage root contains a folder per provider category. Movie files are placed directly inside their category folder; series use a series folder and season subfolders:
 
 ```text
 <destination root>/
-  Series/<series name> [<series id>-<source digest>]/Season 01/S01E01.mkv
-  Movies/<movie name> [<stream id>-<source digest>]/<movie name>.mkv
+  <movie category>/<movie title>.mkv
+  <series category>/<series name> [<series id>-<source digest>]/Season 01/S01E01.mkv
 ```
 
-Series and movies are separated, and same-named shows/movies with different provider IDs get separate directories. Queue deduplication keys include provider base URL, content type, and stream ID so a movie ID cannot suppress a series episode with the same ID. A no-clobber atomic move prevents an existing final file from being silently overwritten. The app does not infer identity from a title or merge folders with similar names.
+If a category-specific destination path is set, that path is used as the category folder itself. Otherwise the cleaned category name is created beneath the storage root. Movie titles never create their own directories. Queue deduplication keys include provider base URL, content type, and stream ID, and a no-clobber atomic move prevents an existing final file from being silently overwritten. The app does not infer identity from a title or merge series folders with similar names.
 
 Staging follows the same relative directory layout as the final destination. Each temporary filename has a `.part-<job id>` suffix so concurrent work cannot collide; after `ffprobe` succeeds, the file is atomically promoted to its final name.
 

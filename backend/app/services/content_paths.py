@@ -17,7 +17,9 @@ def parse_strip_prefixes(value: str | None) -> tuple[str, ...]:
 
 def clean_content_name(value: str, prefixes: str | None = None) -> str:
     cleaned = value.strip()
-    strip_prefixes = parse_strip_prefixes(prefixes)
+    strip_prefixes = tuple(
+        sorted(set(parse_strip_prefixes(prefixes)) | {"4k"}, key=len, reverse=True)
+    )
     while strip_prefixes:
         for prefix in strip_prefixes:
             pattern = rf"^{re.escape(prefix)}(?=$|[\s._\-\[\]()])[\s._\-]*"
@@ -123,6 +125,7 @@ def normalized_episode_path(
     *,
     kind: str,
     title: str,
+    category_name: str | None = None,
     provider_stream_id: str,
     provider_url: str,
     extension: str,
@@ -141,6 +144,12 @@ def normalized_episode_path(
     if not stem:
         stem = title
     stem = safe_filename(clean_content_name(stem, strip_prefixes), max_length=160)
+    category_segment = (
+        safe_filename(clean_content_name(category_name, strip_prefixes))
+        if category_name
+        else None
+    )
+    category_path = f"{category_segment}/" if category_segment else ""
 
     if kind == "series":
         actual_series_name = clean_content_name(series_name or title, strip_prefixes)
@@ -149,13 +158,9 @@ def normalized_episode_path(
         if season_value is not None and episode_value is not None:
             stem = f"S{season_value:02d}E{episode_value:02d}"
         path = (
-            f"Series/{identity_segment(actual_series_name, actual_series_id, provider_url)}/"
+            f"{category_path}{identity_segment(actual_series_name, actual_series_id, provider_url)}/"
             f"{season_name}/{stem}.{ext}"
         )
     else:
-        actual_title = clean_content_name(title or f"Movie {provider_stream_id}", strip_prefixes)
-        path = (
-            f"Movies/{identity_segment(actual_title, provider_stream_id, provider_url)}/"
-            f"{stem}.{ext}"
-        )
+        path = f"{category_path}{stem}.{ext}"
     return path, season_value, episode_value
