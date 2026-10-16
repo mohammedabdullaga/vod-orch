@@ -408,14 +408,30 @@ def toggle_category(payload: CategoryToggle):
 
 
 @app.get("/api/queue")
-def get_queue():
+def get_queue(
+    status: Literal[
+        "PENDING",
+        "DOWNLOADING",
+        "VERIFYING",
+        "COMPLETED",
+        "FAILED",
+        "CLEANING",
+        "CANCELLED",
+        "CANCELLING",
+    ] | None = None,
+):
     with SessionLocal() as db:
-        rows = db.execute(
+        query = (
             select(QueueItem, Account.username, Node.host)
             .outerjoin(Account, QueueItem.account_id == Account.id)
             .outerjoin(StorageRoute, StorageRoute.kind == QueueItem.kind)
             .outerjoin(Node, Node.id == StorageRoute.node_id)
             .where(QueueItem.hidden_from_dashboard.is_(False))
+        )
+        if status is not None:
+            query = query.where(QueueItem.status == status)
+        rows = db.execute(
+            query
             .order_by(QueueItem.created_at.desc())
             .limit(500)
         ).all()

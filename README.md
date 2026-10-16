@@ -271,7 +271,7 @@ If the dashboard and API are served from different browser origins, set `CORS_OR
 | `GET` | `/api/status` | Worker, SSH, and queue counters |
 | `GET` | `/api/categories` | Provider categories and monitoring state |
 | `POST` | `/api/categories/toggle` | Enable/disable monitoring and set an optional destination override |
-| `GET` | `/api/queue` | List queue items |
+| `GET` | `/api/queue` | List the latest queue items; optional `status` filter fetches that status independently |
 | `POST` | `/api/queue/retry` | Retry a failed item |
 | `POST` | `/api/queue/requeue-pending` | Reset pending assignments/retry history, wake workers, and report route/account eligibility |
 | `POST` | `/api/queue/{item_id}/cancel` | Cancel a pending or active download |
