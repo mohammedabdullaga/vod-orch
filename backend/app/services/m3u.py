@@ -2,7 +2,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
+import tempfile
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
@@ -45,13 +47,13 @@ def _parse_extinf(line: str) -> tuple[dict[str, str], str]:
     return attributes, payload[comma_index + 1:].strip()
 
 
-def parse_m3u(content: str) -> list[dict]:
-    entries: list[dict] = []
+def iter_m3u_entries(lines):
     duplicate_counts: dict[str, int] = {}
     pending_attributes: dict[str, str] | None = None
     pending_title = ""
     pending_directives: list[str] = []
-    for raw_line in content.lstrip("\ufeff").splitlines():
+    position = 0
+    for raw_line in lines:
         line = raw_line.strip()
         if not line:
             continue
@@ -65,12 +67,12 @@ def parse_m3u(content: str) -> list[dict]:
             continue
         parsed = urlsplit(line)
         if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
-            logger.warning("Skipping non-HTTP M3U stream at entry %s", len(entries) + 1)
+            logger.warning("Skipping non-HTTP M3U stream at entry %s", position + 1)
             pending_attributes = None
             pending_directives = []
             continue
         if pending_attributes is None:
-            logger.warning("Skipping M3U stream without an EXTINF record at entry %s", len(entries) + 1)
+            logger.warning("Skipping M3U stream without an EXTINF record at entry %s", position + 1)
             continue
 
         title = pending_title or pending_attributes.get("tvg-name") or "Untitled"
@@ -80,7 +82,7 @@ def parse_m3u(content: str) -> list[dict]:
         )
         kind = "series" if series_name and season is not None and episode is not None else "vod"
         if is_series_path and kind == "vod":
-            logger.info("M3U entry %s uses a series URL without a recognized episode number", len(entries) + 1)
+            logger.info("M3U entry %s uses a series URL without a recognized episode number", position + 1)
         stable_source = json.dumps(
             [line, pending_attributes.get("tvg-id", ""), title],
             ensure_ascii=False,
@@ -88,11 +90,11 @@ def parse_m3u(content: str) -> list[dict]:
         )
         duplicate_index = duplicate_counts.get(stable_source, 0)
         duplicate_counts[stable_source] = duplicate_index + 1
-        entries.append({
+        yield {
             "stable_key": hashlib.sha256(
                 f"{stable_source}\0{duplicate_index}".encode("utf-8")
             ).hexdigest(),
-            "position": len(entries),
+            "position": position,
             "group_title": pending_attributes.get("group-title") or "Uncategorized",
             "kind": kind,
             "title": title,
@@ -106,41 +108,72 @@ def parse_m3u(content: str) -> list[dict]:
             "episode": episode,
             "attributes_json": json.dumps(pending_attributes, ensure_ascii=False),
             "directives_json": json.dumps(pending_directives, ensure_ascii=False),
-        })
+        }
+        position += 1
         pending_attributes = None
         pending_title = ""
         pending_directives = []
     if pending_attributes is not None:
         logger.warning("Ignoring final M3U EXTINF record without a stream URL.")
-    return entries
 
 
-async def fetch_playlist(source_url: str, proxy_url: str | None) -> list[dict]:
+def parse_m3u(content: str) -> list[dict]:
+    return list(iter_m3u_entries(content.lstrip("\ufeff").splitlines()))
+
+
+def parse_m3u_file(path: str) -> list[dict]:
+    with open(path, "r", encoding="utf-8-sig") as source:
+        return list(iter_m3u_entries(source))
+
+
+async def fetch_playlist_file(
+    source_url: str,
+    proxy_url: str | None,
+    user_agent: str = "Mozilla",
+) -> str:
     parsed = urlsplit(source_url)
     if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
         raise ValueError("Playlist URL must be an absolute HTTP or HTTPS URL.")
-    async with httpx.AsyncClient(
-        timeout=settings.request_timeout_seconds,
-        proxy=proxy_url,
-        follow_redirects=True,
-    ) as client:
-        async with client.stream("GET", source_url, headers={"User-Agent": "Mozilla"}) as response:
-            response.raise_for_status()
-            content_length = response.headers.get("content-length")
-            if content_length and int(content_length) > MAX_PLAYLIST_BYTES:
-                raise ValueError("Playlist exceeds the 32 MiB import limit.")
-            payload = bytearray()
-            async for chunk in response.aiter_bytes():
-                payload.extend(chunk)
-                if len(payload) > MAX_PLAYLIST_BYTES:
-                    raise ValueError("Playlist exceeds the 32 MiB import limit.")
+    descriptor, path = tempfile.mkstemp(prefix="media-ingestion-", suffix=".m3u")
     try:
-        decoded = bytes(payload).decode("utf-8-sig")
+        with os.fdopen(descriptor, "wb") as output:
+            async with httpx.AsyncClient(
+                timeout=settings.request_timeout_seconds,
+                proxy=proxy_url,
+                follow_redirects=True,
+            ) as client:
+                async with client.stream(
+                    "GET",
+                    source_url,
+                    headers={"User-Agent": user_agent or "Mozilla"},
+                ) as response:
+                    response.raise_for_status()
+                    content_length = response.headers.get("content-length")
+                    if content_length and int(content_length) > MAX_PLAYLIST_BYTES:
+                        raise ValueError("Playlist exceeds the 32 MiB size limit.")
+                    total_bytes = 0
+                    async for chunk in response.aiter_bytes():
+                        total_bytes += len(chunk)
+                        if total_bytes > MAX_PLAYLIST_BYTES:
+                            raise ValueError("Playlist exceeds the 32 MiB size limit.")
+                        output.write(chunk)
+        with open(path, "r", encoding="utf-8-sig") as playlist:
+            if not playlist.readline().lstrip().startswith("#EXTM3U"):
+                raise ValueError("The URL did not return an extended M3U playlist.")
+        return path
+    except Exception:
+        os.unlink(path)
+        raise
+
+
+async def fetch_playlist(source_url: str, proxy_url: str | None) -> list[dict]:
+    path = await fetch_playlist_file(source_url, proxy_url)
+    try:
+        return await asyncio.to_thread(parse_m3u_file, path)
     except UnicodeDecodeError as exc:
         raise ValueError("The M3U playlist is not valid UTF-8 text.") from exc
-    if not decoded.lstrip().startswith("#EXTM3U"):
-        raise ValueError("The URL did not return an extended M3U playlist.")
-    return await asyncio.to_thread(parse_m3u, decoded)
+    finally:
+        os.unlink(path)
 
 
 def replace_playlist_entries(playlist_id: int, entries: list[dict]) -> int:
@@ -182,3 +215,52 @@ def replace_playlist_entries(playlist_id: int, entries: list[dict]) -> int:
         playlist.fetched_at = utc_now()
         db.commit()
         return playlist.entry_count
+
+
+def replace_playlist_entries_from_file(
+    playlist_id: int,
+    path: str,
+    source_url_encrypted: str,
+) -> tuple[int, int]:
+    from sqlalchemy import delete, insert
+
+    with SessionLocal() as db:
+        playlist = db.get(M3UPlaylist, playlist_id)
+        if playlist is None:
+            raise LookupError("Playlist not found.")
+        db.execute(delete(M3UEntry).where(M3UEntry.playlist_id == playlist_id))
+        entry_count = 0
+        groups: set[tuple[str, str]] = set()
+        batch: list[dict] = []
+        with open(path, "r", encoding="utf-8-sig") as source:
+            for values in iter_m3u_entries(source):
+                batch.append({
+                    **{
+                        key: value
+                        for key, value in values.items()
+                        if key != "stream_url"
+                    },
+                    "playlist_id": playlist_id,
+                    "stream_url_encrypted": encrypt_secret(values["stream_url"]),
+                    "attributes_json": encrypt_secret(values["attributes_json"]),
+                    "directives_json": encrypt_secret(values["directives_json"]),
+                    "tvg_logo": (
+                        encrypt_secret(values["tvg_logo"])
+                        if values["tvg_logo"]
+                        else None
+                    ),
+                })
+                groups.add((values["group_title"], values["kind"]))
+                entry_count += 1
+                if len(batch) == 500:
+                    db.execute(insert(M3UEntry), batch)
+                    batch.clear()
+            if batch:
+                db.execute(insert(M3UEntry), batch)
+        if not entry_count:
+            raise ValueError("The M3U playlist contains no usable HTTP streams.")
+        playlist.source_url_encrypted = source_url_encrypted
+        playlist.entry_count = entry_count
+        playlist.fetched_at = utc_now()
+        db.commit()
+        return entry_count, len(groups)

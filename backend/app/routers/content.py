@@ -221,8 +221,10 @@ def _catalog_sync_job_json(job: ProviderCatalogSyncJob) -> dict[str, Any]:
     return {
         "job_id": job.id,
         "account_id": job.account_id,
+        "playlist_id": job.playlist_id,
         "status": job.status,
         "phase": job.phase,
+        "entries_processed": job.entries_processed,
         "categories_processed": job.categories_processed,
         "lists_processed": job.lists_processed,
         "cached_items": job.cached_items,
@@ -375,6 +377,7 @@ def list_m3u_playlists() -> list[dict[str, Any]]:
         return [
             {
                 "id": playlist.id,
+                "provider_account_id": playlist.provider_account_id,
                 "name": playlist.name,
                 "proxy_id": playlist.proxy_id,
                 "enabled": playlist.enabled,

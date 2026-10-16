@@ -62,6 +62,7 @@ function App() {
   const [categories, setCategories] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [catalogSyncJobs, setCatalogSyncJobs] = useState({});
+  const [playlists, setPlaylists] = useState([]);
   const [proxies, setProxies] = useState([]);
   const [providerProxyId, setProviderProxyId] = useState("");
   const [providerProxyReady, setProviderProxyReady] = useState(false);
@@ -95,14 +96,16 @@ function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [s, q, syncJobs] = await Promise.all([
+      const [s, q, syncJobs, playlistResponse] = await Promise.all([
         api.get("/status"),
         api.get("/queue"),
         api.get("/content/catalog-sync"),
+        api.get("/playlists"),
       ]);
       setStatus(s.data);
       setQueue(q.data);
       setCatalogSyncJobs(Object.fromEntries(syncJobs.data.map((job) => [job.account_id, job])));
+      setPlaylists(playlistResponse.data);
     } catch (error) { setNotice(error.response?.data?.detail || "Could not reach the backend API."); }
   }, []);
   useEffect(() => {
@@ -114,16 +117,18 @@ function App() {
 
   const loadSettings = async () => {
     try {
-      const [a, p, n, r, providerProxy, syncJobs] = await Promise.all([
+      const [a, p, n, r, providerProxy, syncJobs, playlistResponse] = await Promise.all([
         api.get("/accounts"),
         api.get("/proxies"),
         api.get("/nodes"),
         api.get("/settings/storage-routing"),
         api.get("/settings/provider-proxy"),
         api.get("/content/catalog-sync"),
+        api.get("/playlists"),
       ]);
       setAccounts(a.data);
       setCatalogSyncJobs(Object.fromEntries(syncJobs.data.map((job) => [job.account_id, job])));
+      setPlaylists(playlistResponse.data);
       setProxies(p.data);
       setProviderProxyId((selected) =>
         p.data.some((proxy) => proxy.enabled && String(proxy.id) === String(providerProxy.data.proxy_id))
@@ -269,7 +274,7 @@ function App() {
       account_id: accountId,
       proxy_id: providerProxyId ? Number(providerProxyId) : 0,
     }),
-    "Xtream catalog sync queued. Progress will update here while the VPS caches categories, titles, and series episodes.",
+    "Full M3U playlist sync queued. The VPS will download the playlist once, encrypt its stream URLs, and index it locally.",
   );
   const addProxy = (event) => {
     event.preventDefault();
@@ -455,6 +460,7 @@ function App() {
           api={api}
           routing={routing}
           onQueued={refresh}
+          playlists={playlists}
           proxies={proxies.filter((proxy) => proxy.enabled)}
           providerProxyId={providerProxyId}
           setProviderProxyId={changeProviderProxy}
@@ -525,11 +531,9 @@ function App() {
                 {job && <div className="mt-2 border-t border-slate-800 pt-2 text-[11px]">
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-400">
                     <span className={job.status === "COMPLETED" ? "text-emerald-300" : job.status === "FAILED" ? "text-rose-300" : "text-indigo-300"}>{job.status} · {job.phase}</span>
-                    <span>{job.categories_processed} categories</span>
-                    <span>{job.lists_processed} lists · {job.cached_items} titles</span>
-                    <span>{job.series_details_processed}/{job.total_series_details} series details</span>
+                    <span>{job.categories_processed} groups</span>
+                    <span>{job.entries_processed} entries indexed</span>
                   </div>
-                  {job.stale_responses > 0 && <p className="mt-1 text-amber-300">{job.stale_responses} refresh requests used stale cached data after provider/proxy errors.</p>}
                   {job.error && <p className="mt-1 text-rose-300">{job.error}</p>}
                 </div>}
               </div>;
@@ -543,8 +547,8 @@ function App() {
             </div>
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320] lg:col-span-2">
-            <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Clapperboard size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Xtream catalog cache</h2><p className="text-xs text-slate-500">Catalog syncs run on the VPS and persist provider categories, titles, and episode mappings in SQLite.</p></div></div>
-            <p className="p-5 text-xs leading-5 text-slate-400">Start a sync from an account above. Category and title lists are fetched first, then series episode details are fetched one series at a time and rate-limited to protect the provider. The selected provider API proxy is used for the entire sync. If a refresh fails but cached data exists, the job records and displays the stale response count instead of claiming every response was fresh. Existing saved M3U records are preserved but are no longer part of the primary browsing and import workflow.</p>
+            <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Clapperboard size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Local playlist catalog</h2><p className="text-xs text-slate-500">A single M3U+ request is indexed into encrypted SQLite entries on the VPS.</p></div></div>
+            <p className="p-5 text-xs leading-5 text-slate-400">Start a sync from an account above. The VPS fetches that account's full M3U+ playlist through the selected provider proxy, then atomically replaces its local catalog after successful parsing. Stream URLs and playlist metadata are encrypted at rest. Browse &amp; Ingest automatically uses the indexed catalog and queues directly from its stored entries; it does not issue a request per category or series. The previous catalog remains available if a fetch or parse fails.</p>
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
             <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Gauge size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Proxy pool</h2><p className="text-xs text-slate-500">Proxy URLs are encrypted at rest</p></div></div>

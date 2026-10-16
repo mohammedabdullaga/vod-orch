@@ -79,9 +79,13 @@ class ProviderCatalogSyncJob(Base):
     account_id: Mapped[int] = mapped_column(
         ForeignKey("accounts.id", ondelete="CASCADE"), index=True
     )
+    playlist_id: Mapped[int | None] = mapped_column(
+        ForeignKey("m3u_playlists.id", ondelete="SET NULL"), nullable=True
+    )
     proxy_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
     phase: Mapped[str] = mapped_column(String(32), default="queued")
+    entries_processed: Mapped[int] = mapped_column(Integer, default=0)
     categories_processed: Mapped[int] = mapped_column(Integer, default=0)
     lists_processed: Mapped[int] = mapped_column(Integer, default=0)
     cached_items: Mapped[int] = mapped_column(Integer, default=0)
@@ -99,6 +103,9 @@ class M3UPlaylist(Base):
     __tablename__ = "m3u_playlists"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(255))
     source_url_encrypted: Mapped[str] = mapped_column(Text)
     proxy_id: Mapped[int | None] = mapped_column(
@@ -294,8 +301,15 @@ def init_db() -> None:
             },
             "m3u_playlists": {
                 "proxy_id": "INTEGER",
+                "provider_account_id": (
+                    "INTEGER REFERENCES accounts(id) ON DELETE CASCADE"
+                ),
             },
             "provider_catalog_sync_jobs": {
+                "playlist_id": (
+                    "INTEGER REFERENCES m3u_playlists(id) ON DELETE SET NULL"
+                ),
+                "entries_processed": "INTEGER NOT NULL DEFAULT 0",
                 "stale_responses": "INTEGER NOT NULL DEFAULT 0",
             },
         }
