@@ -466,7 +466,7 @@ def retry_item(payload: RetryRequest):
             .order_by(Account.id)
         ).all()
         provider_url = item.source_provider_url
-        if provider_url is None:
+        if item.provider_stream_id is None and provider_url is None:
             previous_account = db.get(Account, item.account_id) if item.account_id else None
             if not previous_account:
                 raise HTTPException(
@@ -474,7 +474,7 @@ def retry_item(payload: RetryRequest):
                     detail="This legacy item cannot be matched to its provider account. Requeue it from the content browser.",
                 )
             provider_url = previous_account.provider_url
-        if not provider_url.startswith("m3u:"):
+        if item.provider_stream_id is None and provider_url and not provider_url.startswith("m3u:"):
             accounts = [
                 account
                 for account in accounts
@@ -661,29 +661,15 @@ def get_account_availability(
                 "username": account.username,
                 "provider_url": account.provider_url,
                 "enabled": account.enabled,
-                "compatible": (
-                    source_account is None
-                    or account.provider_url.rstrip("/")
-                    == source_account.provider_url.rstrip("/")
-                ),
                 "free": account.id not in busy_statuses,
                 "busy_statuses": sorted(busy_statuses.get(account.id, set())),
                 "eligible": (
                     account.enabled
                     and account.id not in busy_statuses
-                    and (
-                        source_account is None
-                        or account.provider_url.rstrip("/")
-                        == source_account.provider_url.rstrip("/")
-                    )
                 ),
                 "unavailable_reason": (
                     "Account is disabled."
                     if not account.enabled
-                    else "Provider URL differs from the browsing account."
-                    if source_account
-                    and account.provider_url.rstrip("/")
-                    != source_account.provider_url.rstrip("/")
                     else (
                         "Account has queued or active downloads: "
                         + ", ".join(sorted(busy_statuses[account.id]))

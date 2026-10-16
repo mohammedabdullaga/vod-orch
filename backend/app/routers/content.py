@@ -1198,14 +1198,6 @@ def _queue_manual_batch(
                     status_code=409,
                     detail="Selected download accounts must be enabled.",
                 )
-            if account and any(
-                selected.provider_url.rstrip("/") != account.provider_url.rstrip("/")
-                for selected in selected_accounts
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Xtream download accounts must use the same provider endpoint as the source account.",
-                )
             if not allow_existing_account_queue:
                 busy_ids = set(db.scalars(
                     select(QueueItem.account_id).where(
@@ -1520,14 +1512,6 @@ async def prepare_series_batch(
             not source_account or not source_account.enabled
         ):
             raise HTTPException(status_code=409, detail="The source Xtream account is unavailable.")
-        if source_account and any(
-            selected.provider_url.rstrip("/") != source_account.provider_url.rstrip("/")
-            for selected in selected_accounts
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="Xtream download accounts must use the same provider endpoint as the source account.",
-            )
         busy_ids = set(db.scalars(
             select(QueueItem.account_id).where(
                 QueueItem.account_id.in_(payload.account_ids),
@@ -1772,6 +1756,7 @@ def _media_year(row: dict[str, Any]) -> str | None:
 class GenerateScriptRequest(BaseModel):
     content_type: Literal["SERIES", "MOVIE"]
     source_account_id: int | None = Field(default=None, ge=1)
+    account_ids: list[int] | None = Field(default=None, min_length=1, max_length=100)
     items: list[ManualQueueItem] = Field(min_length=1, max_length=5000)
 
 
@@ -1780,6 +1765,27 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
     kind = "series" if payload.content_type == "SERIES" else "vod"
     account = _provider_account(payload.source_account_id)
     with SessionLocal() as db:
+        if payload.account_ids is not None:
+            if len(set(payload.account_ids)) != len(payload.account_ids):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Selected download account IDs must be unique.",
+                )
+            script_accounts = db.scalars(
+                select(Account)
+                .where(
+                    Account.id.in_(payload.account_ids),
+                    Account.enabled.is_(True),
+                )
+                .order_by(Account.id)
+            ).all()
+            if len(script_accounts) != len(payload.account_ids):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Every selected script download account must be enabled.",
+                )
+        else:
+            script_accounts = [account]
         route = db.get(StorageRoute, kind)
         node = db.get(Node, route.node_id) if route else None
         if not node:
@@ -1814,7 +1820,6 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
     })
     host_comment = str(node.host).replace("\n", " ").replace("\r", " ")
     axel_connections = node.axel_connections or settings.default_axel_connections
-    user_agent = account.user_agent or "Mozilla"
     required_downloader = "aria2c" if proxy_scheme == "socks5" else "axel"
     lines = [
         "#!/usr/bin/env bash",
@@ -1832,6 +1837,9 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
         "",
     ]
     added: set[str] = set()
+    commands_by_account: dict[int, list[str]] = {
+        script_account.id: [] for script_account in script_accounts
+    }
     for entry in payload.items:
         if kind == "series" and (entry.season is None or entry.episode_num is None):
             raise HTTPException(
@@ -1840,7 +1848,7 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
             )
         extension = safe_extension(entry.container_ext)
         category = category_overrides.get(entry.category_id or "")
-        relative_path, _season, _episode = normalized_episode_path(
+        relative_path = normalized_episode_path(
             kind=kind,
             title=entry.title,
             category_name=(
@@ -1865,14 +1873,16 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
                 if entry.category_id in category_overrides
                 else None
             ),
-        )
+        )[0]
         if relative_path in added:
             continue
         added.add(relative_path)
+        assigned_account = script_accounts[(len(added) - 1) % len(script_accounts)]
         root = (category.destination_path if category else None) or node.watch_path
         destination = f"{root.rstrip('/')}/{relative_path}"
         parent = destination.rsplit("/", 1)[0]
-        url = stream_url(account, kind, entry.stream_id, extension)
+        url = stream_url(assigned_account, kind, entry.stream_id, extension)
+        user_agent = assigned_account.user_agent or "Mozilla"
         quoted_proxy = shlex.quote(script_proxy_url) if script_proxy_url else None
         q_parent = shlex.quote(parent)
         q_destination = shlex.quote(destination)
@@ -1885,9 +1895,10 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
             .replace("`", "\\`")
             + '"'
         )
-        lines.append(f"mkdir -p {q_parent} && chmod 0755 {q_parent}")
+        account_lines = commands_by_account[assigned_account.id]
+        account_lines.append(f"mkdir -p {q_parent} && chmod 0755 {q_parent}")
         if proxy_scheme == "socks5" and quoted_proxy:
-            lines.append(
+            account_lines.append(
                 f"aria2c --split={axel_connections} "
                 f"--max-connection-per-server={axel_connections} "
                 f"--allow-overwrite=true --auto-file-renaming=false "
@@ -1896,18 +1907,44 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
                 f"--dir={shlex.quote(parent)} --out={shlex.quote(destination.rsplit('/', 1)[-1])} {q_url}"
             )
         elif quoted_proxy:
-            lines.append(
+            account_lines.append(
                 f"http_proxy={quoted_proxy} https_proxy={quoted_proxy} "
                 f"HTTP_PROXY={quoted_proxy} HTTPS_PROXY={quoted_proxy} "
                 f"axel -n {axel_connections} -o {q_destination} "
                 f"--user-agent={q_user_agent} {q_url}"
             )
         else:
-            lines.append(
+            account_lines.append(
                 f"axel -n {axel_connections} -o {q_destination} "
                 f"--user-agent={q_user_agent} {q_url}"
             )
-        lines.append("")
+    process_ids = []
+    for index, script_account in enumerate(script_accounts, start=1):
+        account_commands = commands_by_account[script_account.id]
+        if not account_commands:
+            continue
+        function_name = f"download_account_{index}"
+        account_comment = " ".join(
+            f"{script_account.username} | {script_account.provider_url}".splitlines()
+        )
+        lines.extend([
+            f"# Account {account_comment}",
+            f"{function_name}() {{",
+            *[f"  {command}" for command in account_commands],
+            "}",
+            f"{function_name} &",
+            f"pid_{index}=$!",
+            "",
+        ])
+        process_ids.append(f"$pid_{index}")
+    if process_ids:
+        lines.extend([
+            "download_failed=0",
+            f"for download_pid in {' '.join(process_ids)}; do",
+            "  if ! wait \"$download_pid\"; then download_failed=1; fi",
+            "done",
+            "exit \"$download_failed\"",
+        ])
 
     filename = f"media-ingest-{timestamp.strftime('%Y%m%d-%H%M%S')}.sh"
     return Response(

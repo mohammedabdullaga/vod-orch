@@ -204,30 +204,31 @@ class WorkerPool:
                 if item.account_id not in (None, account_id):
                     continue
                 if item.source_provider_url is None:
-                    try:
-                        stored_url = decrypt_secret(item.stream_url_encrypted)
-                    except Exception as exc:
-                        logger.error(
-                            "Could not inspect legacy queue item %s provider URL (%s).",
-                            item.id,
-                            type(exc).__name__,
-                        )
-                        item.status = "FAILED"
-                        item.error = (
-                            "Could not match this legacy queue item to a provider account. "
-                            "Verify APP_ENCRYPTION_KEY before retrying."
-                        )
-                        item.retry_after = None
-                        item.updated_at = utc_now()
+                    if item.provider_stream_id:
+                        item.source_provider_url = account.provider_url
                         db.flush()
-                        continue
-                    if not stored_url.startswith(account.provider_url.rstrip("/") + "/"):
-                        continue
+                    else:
+                        try:
+                            stored_url = decrypt_secret(item.stream_url_encrypted)
+                        except Exception as exc:
+                            logger.error(
+                                "Could not inspect legacy queue item %s provider URL (%s).",
+                                item.id,
+                                type(exc).__name__,
+                            )
+                            item.status = "FAILED"
+                            item.error = (
+                                "Could not match this legacy queue item to a provider account. "
+                                "Verify APP_ENCRYPTION_KEY before retrying."
+                            )
+                            item.retry_after = None
+                            item.updated_at = utc_now()
+                            db.flush()
+                            continue
+                        if not stored_url.startswith(account.provider_url.rstrip("/") + "/"):
+                            continue
                     item.source_provider_url = account.provider_url
                     db.flush()
-                elif not item.source_provider_url.startswith("m3u:"):
-                    if item.source_provider_url.rstrip("/") != account.provider_url.rstrip("/"):
-                        continue
                 try:
                     attempted_account_ids = {
                         int(value) for value in json.loads(item.attempted_account_ids or "[]")
@@ -385,17 +386,15 @@ class WorkerPool:
                     )
                 )
                 continue
-            accounts_query = select(Account.id, Account.provider_url).where(
-                Account.enabled.is_(True)
-            )
+            accounts_query = select(Account.id).where(Account.enabled.is_(True))
             if source_provider_url and not source_provider_url.startswith("m3u:"):
-                eligible_accounts = [
-                    account_id
-                    for account_id, provider_url in db.execute(accounts_query).all()
-                    if provider_url.rstrip("/") == source_provider_url.rstrip("/")
-                ]
-            else:
-                eligible_accounts = list(db.scalars(accounts_query.with_only_columns(Account.id)).all())
+                item = db.get(QueueItem, item_id)
+                if item and item.provider_stream_id is None:
+                    accounts_query = select(Account.id).where(
+                        Account.enabled.is_(True),
+                        Account.provider_url == source_provider_url,
+                    )
+            eligible_accounts = list(db.scalars(accounts_query).all())
             available_account_ids = set(eligible_accounts)
             if not available_account_ids - attempted_account_ids:
                 attempted_account_ids = set()

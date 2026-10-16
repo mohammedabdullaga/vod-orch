@@ -510,15 +510,28 @@ export default function ContentBrowser({
 
   const exportSelectedScript = async () => {
     if (!selectedTitles.length) return setNotice("Select at least one title to export.");
-    if (!window.confirm("The generated shell script contains provider stream URLs with account credentials. Only save it to a trusted location, and delete it after use. Continue?")) return;
     setBusy(true);
     setNotice("");
     try {
+      const { data: availability } = await api.get("/accounts/availability", {
+        params: {
+          content_type: type === "series" ? "SERIES" : "MOVIE",
+          source_account_id: sourceAccountId,
+        },
+      });
+      const accountIds = availability.accounts
+        .filter((account) => account.eligible)
+        .map((account) => account.id);
+      if (!accountIds.length) {
+        throw new Error("No enabled and currently available download accounts were found.");
+      }
+      if (!window.confirm(`The generated shell script contains provider stream URLs with account credentials and will distribute downloads across ${accountIds.length} available account${accountIds.length === 1 ? "" : "s"}. Only save it to a trusted location, and delete it after use. Continue?`)) return;
       const entries = await entriesForTitles(selectedTitles);
       if (!entries.length) throw new Error("No downloadable episodes or movies were found.");
       const { data } = await api.post("/content/generate-script", {
         content_type: type === "series" ? "SERIES" : "MOVIE",
         source_account_id: Number(sourceAccountId),
+        account_ids: accountIds,
         items: entries,
       }, { responseType: "blob" });
       const content = new Blob([data], { type: "text/x-shellscript;charset=utf-8" });
@@ -848,7 +861,7 @@ export default function ContentBrowser({
             <div>
               <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-medium text-slate-200">Download accounts</h3><span className="text-xs text-slate-500">{selectedWorkerIds.size} selected</span></div>
               <p className="mb-3 text-xs text-slate-500">Jobs are distributed round-robin. Each account runs at most one download at a time; selecting more free accounts increases parallel downloads.</p>
-              <p className="mb-3 text-[11px] text-indigo-300">Catalog sync does not reserve download accounts. All accounts are listed; unavailable accounts show why they cannot be selected. Xtream workers must use the same provider URL as the browsing account.</p>
+              <p className="mb-3 text-[11px] text-indigo-300">Catalog sync does not reserve download accounts. Downloads use each selected worker’s own host and credentials. Cross-host downloading assumes the accounts share compatible catalog stream IDs.</p>
               {!selectedWorkerIds.size && <p className="mb-3 rounded-lg border border-amber-800/60 bg-amber-950/30 px-3 py-2 text-xs text-amber-200">No accounts are currently eligible. Review the reason shown beside each account below.</p>}
               <div className="max-h-48 space-y-2 overflow-y-auto">
                 {availableAccounts.map((account) => {
