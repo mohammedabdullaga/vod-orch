@@ -65,6 +65,7 @@ class WorkerPool:
 
     async def _manage(self) -> None:
         next_reconciliation = time.monotonic() + 15
+        next_pending_recovery = time.monotonic() + 15
         while not self._stopping.is_set():
             try:
                 self._manager_wakeup.clear()
@@ -100,6 +101,9 @@ class WorkerPool:
                 if time.monotonic() >= next_reconciliation:
                     self._reconcile_worker_state()
                     next_reconciliation = time.monotonic() + 15
+                if time.monotonic() >= next_pending_recovery:
+                    self._recover_stalled_pending()
+                    next_pending_recovery = time.monotonic() + 15
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -234,6 +238,120 @@ class WorkerPool:
 
     def _reconcile_orphaned_jobs(self) -> None:
         self._reconcile_worker_state()
+
+    def _recover_stalled_pending(self) -> int:
+        cutoff = utc_now() - timedelta(seconds=60)
+        idle_account_ids = {
+            account_id
+            for account_id, worker in self._workers.items()
+            if not worker.done() and account_id not in self._busy_accounts
+        }
+
+        with SessionLocal() as db:
+            all_accounts = {
+                account.id: account
+                for account in db.scalars(
+                    select(Account).where(Account.enabled.is_(True))
+                ).all()
+            }
+            idle_accounts = {
+                account_id: account
+                for account_id, account in all_accounts.items()
+                if account_id in idle_account_ids
+            }
+            routed_kinds = set(db.scalars(select(StorageRoute.kind)).all())
+            pending = db.scalars(
+                select(QueueItem)
+                .where(
+                    QueueItem.status == "PENDING",
+                    QueueItem.updated_at <= cutoff,
+                )
+                .order_by(QueueItem.created_at, QueueItem.id)
+            ).all()
+            requeued = 0
+            diagnosed = 0
+            for item in pending:
+                if item.kind not in routed_kinds:
+                    reason = (
+                        f"No storage route is configured for {item.kind} tasks; "
+                        "the task remains pending.\n"
+                    )
+                    eligible_ids: set[int] = set()
+                elif item.source_provider_url and item.source_provider_url.startswith("m3u:"):
+                    eligible_ids = set(all_accounts)
+                    reason = ""
+                elif item.provider_stream_id:
+                    eligible_ids = set(all_accounts)
+                    reason = ""
+                else:
+                    source_url = item.source_provider_url
+                    if source_url is None:
+                        try:
+                            stored_url = decrypt_secret(item.stream_url_encrypted)
+                        except Exception as exc:
+                            logger.error(
+                                "Could not inspect stalled queue item %s provider URL (%s).",
+                                item.id,
+                                type(exc).__name__,
+                            )
+                            stored_url = ""
+                        source_url = next(
+                            (
+                                account.provider_url
+                                for account in all_accounts.values()
+                                if stored_url.startswith(account.provider_url.rstrip("/") + "/")
+                            ),
+                            None,
+                        )
+                    eligible_ids = {
+                        account_id
+                        for account_id, account in all_accounts.items()
+                        if source_url
+                        and account.provider_url.rstrip("/") == source_url.rstrip("/")
+                    }
+                    reason = ""
+
+                if item.kind in routed_kinds and not eligible_ids:
+                    reason = (
+                        "No enabled provider account matches this pending task; "
+                        "the task remains pending.\n"
+                    )
+                elif item.kind in routed_kinds:
+                    idle_eligible_ids = eligible_ids & set(idle_accounts)
+                    if not idle_eligible_ids:
+                        reason = (
+                            "All compatible worker accounts are busy or unavailable; "
+                            "the task remains pending until one is idle.\n"
+                        )
+                    else:
+                        previous_account_id = item.account_id
+                        item.account_id = None
+                        reason = (
+                            "Pending task had no dispatch for 60 seconds; "
+                            "scheduler released its account assignment for eligible "
+                            f"idle worker(s) {', '.join(str(value) for value in sorted(idle_eligible_ids))}.\n"
+                        )
+                        requeued += 1
+                        logger.warning(
+                            "Requeued stalled pending task %s (previous account %s; "
+                            "eligible idle accounts %s).",
+                            item.id,
+                            previous_account_id,
+                            sorted(idle_eligible_ids),
+                        )
+
+                if not reason:
+                    continue
+                item.task_log = (item.task_log + reason)[-_TASK_LOG_LIMIT:]
+                item.task_log_offset += len(reason)
+                item.updated_at = utc_now()
+                diagnosed += 1
+            if diagnosed:
+                db.commit()
+
+        if requeued:
+            self.wake()
+        return requeued
 
     def _reconcile_worker_state(self) -> int:
         with self._cancel_lock:

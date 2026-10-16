@@ -56,7 +56,7 @@ function App() {
   const [authenticated, setAuthenticated] = useState(null);
   const [adminUsername, setAdminUsername] = useState("");
   const [tab, setTab] = useState(tabs[0]);
-  const [queueFilter, setQueueFilter] = useState("open");
+  const [queueFilter, setQueueFilter] = useState("all");
   const [status, setStatus] = useState(null);
   const [queue, setQueue] = useState([]);
   const [logTask, setLogTask] = useState(null);
