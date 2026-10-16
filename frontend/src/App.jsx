@@ -528,8 +528,10 @@ function App() {
                     <span>{job.categories_processed} categories</span>
                     <span>{job.lists_processed} lists · {job.cached_items} titles</span>
                     <span>{job.series_details_processed}/{job.total_series_details} series details</span>
+                    {job.cache_hits > 0 && <span>{job.cache_hits} cached responses reused</span>}
                   </div>
                   {job.stale_responses > 0 && <p className="mt-1 text-amber-300">{job.stale_responses} refresh requests used stale cached data after provider/proxy errors.</p>}
+                  {job.invalid_series_details > 0 && <p className="mt-1 text-amber-300">{job.invalid_series_details} series returned malformed episode data and were skipped; other series continued syncing.</p>}
                   {job.error && <p className="mt-1 text-rose-300">{job.error}</p>}
                 </div>}
               </div>;

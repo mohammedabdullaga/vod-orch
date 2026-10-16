@@ -88,6 +88,8 @@ class ProviderCatalogSyncJob(Base):
     series_details_processed: Mapped[int] = mapped_column(Integer, default=0)
     total_series_details: Mapped[int] = mapped_column(Integer, default=0)
     stale_responses: Mapped[int] = mapped_column(Integer, default=0)
+    cache_hits: Mapped[int] = mapped_column(Integer, default=0)
+    invalid_series_details: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
@@ -296,6 +298,8 @@ def init_db() -> None:
                 "proxy_id": "INTEGER",
             },
             "provider_catalog_sync_jobs": {
+                "cache_hits": "INTEGER NOT NULL DEFAULT 0",
+                "invalid_series_details": "INTEGER NOT NULL DEFAULT 0",
                 "stale_responses": "INTEGER NOT NULL DEFAULT 0",
             },
         }

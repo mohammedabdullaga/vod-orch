@@ -14,6 +14,7 @@ from app.models import (
 )
 from app.services.provider_client import (
     cached_provider_action,
+    invalidate_provider_action_cache,
     parse_series_episodes,
     resolve_provider_proxy,
 )
@@ -46,6 +47,8 @@ class ProviderCatalogSyncWorker:
                     series_details_processed=0,
                     total_series_details=0,
                     stale_responses=0,
+                    cache_hits=0,
+                    invalid_series_details=0,
                     error=None,
                     updated_at=utc_now(),
                 )
@@ -123,7 +126,7 @@ class ProviderCatalogSyncWorker:
         proxy_url = resolve_provider_proxy(proxy_id)
         category_records: list[tuple[str, str, str]] = []
         for kind, category_action, list_action in CATALOG_ACTIONS:
-            categories, stale = await self._fetch_action(
+            categories, cache_state = await self._fetch_action(
                 account,
                 category_action,
                 proxy_url,
@@ -131,12 +134,14 @@ class ProviderCatalogSyncWorker:
             if not isinstance(categories, list) or any(
                 not isinstance(row, dict) for row in categories
             ):
+                invalidate_provider_action_cache(account, category_action)
                 raise ValueError(f"Provider returned invalid {category_action} data.")
             self._progress(
                 job_id,
                 phase=f"{kind}_categories",
                 categories_delta=len(categories),
-                stale_delta=int(stale),
+                stale_delta=int(cache_state == "stale"),
+                cache_hits_delta=int(cache_state == "hit"),
             )
             for category in categories:
                 category_id = category.get("category_id", category.get("id"))
@@ -145,13 +150,16 @@ class ProviderCatalogSyncWorker:
 
         series_ids: set[str] = set()
         for kind, category_id, list_action in category_records:
-            rows, stale = await self._fetch_action(
+            rows, cache_state = await self._fetch_action(
                 account,
                 list_action,
                 proxy_url,
                 category_id=category_id,
             )
             if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                invalidate_provider_action_cache(
+                    account, list_action, category_id=category_id
+                )
                 raise ValueError(
                     f"Provider returned invalid {list_action} data for category {category_id}."
                 )
@@ -171,23 +179,41 @@ class ProviderCatalogSyncWorker:
                 phase=f"{kind}_lists",
                 lists_delta=1,
                 cached_items_delta=len(rows),
-                stale_delta=int(stale),
+                stale_delta=int(cache_state == "stale"),
+                cache_hits_delta=int(cache_state == "hit"),
             )
 
         self._progress(job_id, phase="series_details", total_series=len(series_ids))
         for series_id in sorted(series_ids):
-            details, stale = await self._fetch_action(
+            details, cache_state = await self._fetch_action(
                 account,
                 "get_series_info",
                 proxy_url,
                 series_id=series_id,
             )
-            parse_series_episodes(details)
+            invalid_details = False
+            try:
+                parse_series_episodes(details)
+            except ValueError as exc:
+                invalidate_provider_action_cache(
+                    account,
+                    "get_series_info",
+                    series_id=series_id,
+                )
+                logger.warning(
+                    "Skipping invalid series details for account %s series %s (%s)",
+                    account_id,
+                    series_id,
+                    exc,
+                )
+                invalid_details = True
             self._progress(
                 job_id,
                 phase="series_details",
                 series_details_delta=1,
-                stale_delta=int(stale),
+                stale_delta=int(cache_state == "stale"),
+                cache_hits_delta=int(cache_state == "hit"),
+                invalid_series_details_delta=int(invalid_details),
             )
 
         with SessionLocal() as db:
@@ -206,15 +232,15 @@ class ProviderCatalogSyncWorker:
         action: str,
         proxy_url: str | None,
         **params: str,
-    ) -> tuple[Any, bool]:
+    ) -> tuple[Any, str]:
         payload, cache_state = await cached_provider_action(
             account,
             action,
             proxy_url=proxy_url,
-            force_refresh=True,
+            force_refresh=False,
             **params,
         )
-        return payload, cache_state == "stale"
+        return payload, cache_state
 
     @staticmethod
     def _progress(
@@ -227,6 +253,8 @@ class ProviderCatalogSyncWorker:
         total_series: int | None = None,
         series_details_delta: int = 0,
         stale_delta: int = 0,
+        cache_hits_delta: int = 0,
+        invalid_series_details_delta: int = 0,
     ) -> None:
         with SessionLocal() as db:
             job = db.get(ProviderCatalogSyncJob, job_id)
@@ -238,6 +266,8 @@ class ProviderCatalogSyncWorker:
             job.cached_items += cached_items_delta
             job.series_details_processed += series_details_delta
             job.stale_responses += stale_delta
+            job.cache_hits += cache_hits_delta
+            job.invalid_series_details += invalid_series_details_delta
             if total_series is not None:
                 job.total_series_details = total_series
             job.updated_at = utc_now()

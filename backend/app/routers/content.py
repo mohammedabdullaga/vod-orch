@@ -229,6 +229,8 @@ def _catalog_sync_job_json(job: ProviderCatalogSyncJob) -> dict[str, Any]:
         "series_details_processed": job.series_details_processed,
         "total_series_details": job.total_series_details,
         "stale_responses": job.stale_responses,
+        "cache_hits": job.cache_hits,
+        "invalid_series_details": job.invalid_series_details,
         "error": job.error,
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),

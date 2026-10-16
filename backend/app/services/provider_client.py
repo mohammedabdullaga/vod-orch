@@ -6,7 +6,7 @@ from typing import Any
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
@@ -23,6 +23,39 @@ from app.security import decrypt_secret
 logger = logging.getLogger(__name__)
 _series_details_lock = asyncio.Lock()
 _last_series_details_request_at = 0.0
+
+
+def _provider_cache_params_key(account: Account, params: dict[str, Any]) -> str:
+    cache_params = {
+        key: str(value) if key.endswith("_id") and value is not None else value
+        for key, value in params.items()
+    }
+    return json.dumps(
+        {
+            "provider_url": account.provider_url.rstrip("/"),
+            "username": account.username,
+            "params": cache_params,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def invalidate_provider_action_cache(
+    account: Account,
+    action: str,
+    **params: Any,
+) -> None:
+    params_key = _provider_cache_params_key(account, params)
+    with SessionLocal() as db:
+        db.execute(
+            delete(ProviderCatalogCache).where(
+                ProviderCatalogCache.account_id == account.id,
+                ProviderCatalogCache.action == action,
+                ProviderCatalogCache.params_key == params_key,
+            )
+        )
+        db.commit()
 
 
 def parse_series_episodes(data: Any) -> list[dict[str, Any]]:
@@ -111,19 +144,7 @@ async def cached_provider_action(
     force_refresh: bool = False,
     **params: Any,
 ) -> tuple[Any, str]:
-    cache_params = {
-        key: str(value) if key.endswith("_id") and value is not None else value
-        for key, value in params.items()
-    }
-    params_key = json.dumps(
-        {
-            "provider_url": account.provider_url.rstrip("/"),
-            "username": account.username,
-            "params": cache_params,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    params_key = _provider_cache_params_key(account, params)
     with SessionLocal() as db:
         cached = db.scalar(
             select(ProviderCatalogCache).where(
