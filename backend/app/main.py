@@ -621,25 +621,21 @@ def get_account_availability(
             raise HTTPException(status_code=409, detail="The selected Xtream account is unavailable.")
         if source_playlist_id is not None and (not playlist or not playlist.enabled):
             raise HTTPException(status_code=409, detail="The selected M3U playlist is unavailable.")
-        accounts = db.scalars(
-            select(Account).where(Account.enabled.is_(True)).order_by(Account.id)
-        ).all()
-        if source_account:
-            accounts = [
-                account for account in accounts
-                if account.provider_url.rstrip("/") == source_account.provider_url.rstrip("/")
-            ]
+        accounts = db.scalars(select(Account).order_by(Account.id)).all()
         account_ids = [account.id for account in accounts]
-        busy_ids = set()
+        busy_statuses: dict[int, set[str]] = {}
         if account_ids:
-            busy_ids = set(db.scalars(
-                select(QueueItem.account_id).where(
+            busy_rows = db.execute(
+                select(QueueItem.account_id, QueueItem.status).where(
                     QueueItem.account_id.in_(account_ids),
                     QueueItem.status.in_(
                         ("PENDING", "DOWNLOADING", "VERIFYING", "CANCELLING")
                     ),
-                ).distinct()
-            ).all())
+                )
+            ).all()
+            for account_id, status in busy_rows:
+                if account_id is not None:
+                    busy_statuses.setdefault(account_id, set()).add(status)
         route = db.get(StorageRoute, kind)
         node = db.get(Node, route.node_id) if route else None
         assigned_proxy = db.get(Proxy, node.proxy_id) if node and node.proxy_id else None
@@ -664,7 +660,38 @@ def get_account_availability(
                 "id": account.id,
                 "username": account.username,
                 "provider_url": account.provider_url,
-                "free": account.id not in busy_ids,
+                "enabled": account.enabled,
+                "compatible": (
+                    source_account is None
+                    or account.provider_url.rstrip("/")
+                    == source_account.provider_url.rstrip("/")
+                ),
+                "free": account.id not in busy_statuses,
+                "busy_statuses": sorted(busy_statuses.get(account.id, set())),
+                "eligible": (
+                    account.enabled
+                    and account.id not in busy_statuses
+                    and (
+                        source_account is None
+                        or account.provider_url.rstrip("/")
+                        == source_account.provider_url.rstrip("/")
+                    )
+                ),
+                "unavailable_reason": (
+                    "Account is disabled."
+                    if not account.enabled
+                    else "Provider URL differs from the browsing account."
+                    if source_account
+                    and account.provider_url.rstrip("/")
+                    != source_account.provider_url.rstrip("/")
+                    else (
+                        "Account has queued or active downloads: "
+                        + ", ".join(sorted(busy_statuses[account.id]))
+                        + "."
+                    )
+                    if account.id in busy_statuses
+                    else None
+                ),
             }
             for account in accounts
         ],

@@ -295,15 +295,11 @@ export default function ContentBrowser({
           source_account_id: sourceAccountId,
         },
       });
-      const free = data.accounts.filter((account) => account.free);
-      if (!free.length) {
-        setNotice("No idle Xtream accounts are available for downloading. Wait for current downloads or add an account.");
-        return;
-      }
+      const eligible = data.accounts.filter((account) => account.eligible);
       setPendingQueue(entries);
       setPendingSeries(null);
-      setAvailableAccounts(free);
-      setSelectedWorkerIds(new Set(free.map((account) => account.id)));
+      setAvailableAccounts(data.accounts);
+      setSelectedWorkerIds(new Set(eligible.map((account) => account.id)));
       const proxies = data.proxies || [];
       setAvailableProxies(proxies);
       setProxyAvailable(proxies.length > 0);
@@ -337,16 +333,12 @@ export default function ContentBrowser({
           source_account_id: sourceAccountId,
         },
       });
-      const free = data.accounts.filter((account) => account.free);
-      if (!free.length) {
-        setNotice("No idle Xtream accounts are available for downloading. Wait for current downloads or add an account.");
-        return;
-      }
+      const eligible = data.accounts.filter((account) => account.eligible);
       setPendingQueue([]);
       setPendingSeries(series);
       setPendingMissingOnly(missingOnly);
-      setAvailableAccounts(free);
-      setSelectedWorkerIds(new Set(free.map((account) => account.id)));
+      setAvailableAccounts(data.accounts);
+      setSelectedWorkerIds(new Set(eligible.map((account) => account.id)));
       const proxies = data.proxies || [];
       setAvailableProxies(proxies);
       setProxyAvailable(proxies.length > 0);
@@ -854,19 +846,20 @@ export default function ContentBrowser({
           <div className="min-h-0 space-y-5 overflow-y-auto p-5">
             {pendingSeries && <p className="rounded-lg border border-indigo-900/70 bg-indigo-950/30 px-3 py-2 text-xs text-indigo-200">Series details are requested at least 3 seconds apart. Each series is added to the download queue as soon as its details are ready.</p>}
             <div>
-              <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-medium text-slate-200">Idle Xtream accounts</h3><span className="text-xs text-slate-500">{selectedWorkerIds.size} selected</span></div>
+              <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-medium text-slate-200">Download accounts</h3><span className="text-xs text-slate-500">{selectedWorkerIds.size} selected</span></div>
               <p className="mb-3 text-xs text-slate-500">Jobs are distributed round-robin. Each account runs at most one download at a time; selecting more free accounts increases parallel downloads.</p>
-              <p className="mb-3 text-[11px] text-indigo-300">Only accounts for the selected provider endpoint are shown; each worker uses its own credentials.</p>
+              <p className="mb-3 text-[11px] text-indigo-300">Catalog sync does not reserve download accounts. All accounts are listed; unavailable accounts show why they cannot be selected. Xtream workers must use the same provider URL as the browsing account.</p>
+              {!selectedWorkerIds.size && <p className="mb-3 rounded-lg border border-amber-800/60 bg-amber-950/30 px-3 py-2 text-xs text-amber-200">No accounts are currently eligible. Review the reason shown beside each account below.</p>}
               <div className="max-h-48 space-y-2 overflow-y-auto">
                 {availableAccounts.map((account) => {
                   const sortedWorkers = [...selectedWorkerIds].sort((left, right) => left - right);
                   const assignedCount = Array.from({ length: pendingCount }, (_, index) => index).filter((index) =>
                     index % Math.max(1, sortedWorkers.length) === sortedWorkers.indexOf(account.id)
                   ).length;
-                  return <label key={account.id} className="flex cursor-pointer items-center gap-3 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2.5">
-                    <input type="checkbox" checked={selectedWorkerIds.has(account.id)} onChange={() => toggleWorker(account.id)} className="accent-indigo-500" />
-                    <span className="min-w-0 flex-1"><span className="block text-sm text-slate-200">{account.username}</span><span className="block truncate text-[10px] text-slate-500">{account.provider_url}</span></span>
-                    <span className="text-[10px] text-emerald-300">Free</span>
+                  return <label key={account.id} className={`flex items-center gap-3 rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2.5 ${account.eligible ? "cursor-pointer" : "cursor-not-allowed opacity-60"}`}>
+                    <input type="checkbox" checked={selectedWorkerIds.has(account.id)} disabled={!account.eligible} onChange={() => toggleWorker(account.id)} className="accent-indigo-500" />
+                    <span className="min-w-0 flex-1"><span className="block text-sm text-slate-200">{account.username}</span><span className="block truncate text-[10px] text-slate-500">{account.provider_url}</span>{account.unavailable_reason && <span className="mt-0.5 block text-[10px] text-amber-300">{account.unavailable_reason}</span>}</span>
+                    <span className={`text-[10px] ${account.eligible ? "text-emerald-300" : "text-slate-400"}`}>{account.eligible ? "Available" : "Unavailable"}</span>
                     {selectedWorkerIds.has(account.id) && <span className="text-[10px] text-slate-400">~{assignedCount} jobs</span>}
                   </label>;
                 })}
