@@ -260,7 +260,15 @@ function App() {
     )) return;
     act(
       () => api.post("/queue/requeue-pending"),
-      ({ data }) => `${data.message} Requeued ${data.requeued_count} task${data.requeued_count === 1 ? "" : "s"}.`,
+      ({ data }) => {
+        const details = Object.entries(data.blocked_by_kind || {})
+          .map(([kind, reason]) => `${kind}: ${reason}`)
+          .join(" ");
+        const workerStatus = data.worker_pool_running
+          ? `${data.registered_account_workers} account worker(s) registered`
+          : "worker pool is not running";
+        return `${data.message} Reset ${data.requeued_count} pending task${data.requeued_count === 1 ? "" : "s"}; ${data.dispatchable_count} have a storage route and compatible enabled account; ${workerStatus}.${details ? ` Blocked: ${details}` : ""}`;
+      },
     );
   };
   const stopAllAndClearQueue = () => {
@@ -446,7 +454,7 @@ function App() {
             <div><h1 className="text-lg font-semibold text-white">Media Ingestion</h1><p className="text-xs text-slate-500">Stream orchestration control plane</p></div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Pill tone={status?.daemon_running ? "green" : "red"}><span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-current" />Daemon {status?.daemon_running ? "Running" : "Offline"}</Pill>
+            <Pill tone={status?.worker_pool_running ? "green" : "red"}><span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-current" />Workers {status?.worker_pool_running ? `${status.registered_account_workers || 0}/${status.available_accounts || 0} ready` : "Offline"}</Pill>
             <Pill tone={status?.ssh_connected ? "green" : "yellow"}><Wifi size={13} className="mr-1.5" />SSH {status?.ssh_connected ? "Connected" : "Not verified"}</Pill>
             <Pill><Activity size={13} className="mr-1.5" />{status?.active_workers || 0} workers</Pill>
             <button onClick={signOut} className="ml-1 flex items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800"><LogOut size={14} />{adminUsername || "Sign out"}</button>

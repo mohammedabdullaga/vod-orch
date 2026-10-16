@@ -283,15 +283,23 @@ def get_status():
             .join(StorageRoute, StorageRoute.node_id == Node.id)
             .distinct()
         ).all()
-        accounts = db.scalar(select(func.count(Account.id)).where(Account.enabled.is_(True))) or 0
+        accounts = db.scalars(
+            select(Account).where(Account.enabled.is_(True))
+        ).all()
+    manager_running = worker_pool._manager is not None and not worker_pool._manager.done()
+    registered_workers = sum(not task.done() for task in worker_pool._workers.values())
     ssh_connected = bool(routed_nodes) and all(
         node.last_connected_at
         and (utc_now() - node.last_connected_at.replace(tzinfo=timezone.utc)).total_seconds() < 300
         for node in routed_nodes
     )
     return {
-        "daemon_running": True, "ssh_connected": ssh_connected, "active_workers": worker_pool.active_count,
-        "available_accounts": accounts,
+        "daemon_running": True,
+        "worker_pool_running": manager_running,
+        "registered_account_workers": registered_workers,
+        "ssh_connected": ssh_connected,
+        "active_workers": worker_pool.active_count,
+        "available_accounts": len(accounts),
         "default_axel_connections": settings.default_axel_connections,
         "queue": {
             "pending": counts.get("PENDING", 0), "downloading": counts.get("DOWNLOADING", 0),
@@ -620,13 +628,72 @@ def requeue_pending_items():
             item.task_log = (item.task_log + message)[-262144:]
             item.task_log_offset += len(message)
             item.updated_at = utc_now()
+        enabled_accounts = db.scalars(
+            select(Account).where(Account.enabled.is_(True))
+        ).all()
+        routed_kinds = set(db.scalars(select(StorageRoute.kind)).all())
+        pending_by_kind: dict[str, int] = {}
+        dispatchable_by_kind: dict[str, int] = {}
+        blocked_by_kind: dict[str, str] = {}
+        for item in items:
+            pending_by_kind[item.kind] = pending_by_kind.get(item.kind, 0) + 1
+            if item.kind not in routed_kinds:
+                blocked_by_kind[item.kind] = "No storage route is configured."
+                continue
+            if item.provider_stream_id or (
+                item.source_provider_url or ""
+            ).startswith("m3u:"):
+                eligible = enabled_accounts
+            else:
+                source_url = item.source_provider_url
+                if source_url is None:
+                    try:
+                        stored_url = decrypt_secret(item.stream_url_encrypted)
+                    except Exception as exc:
+                        logger.error(
+                            "Could not inspect pending task %s provider URL (%s).",
+                            item.id,
+                            type(exc).__name__,
+                        )
+                        blocked_by_kind[item.kind] = (
+                            "Some legacy tasks have unreadable provider URLs."
+                        )
+                        continue
+                    eligible = [
+                        account
+                        for account in enabled_accounts
+                        if stored_url.startswith(account.provider_url.rstrip("/") + "/")
+                    ]
+                else:
+                    eligible = [
+                        account
+                        for account in enabled_accounts
+                        if account.provider_url.rstrip("/") == source_url.rstrip("/")
+                    ]
+            if not eligible:
+                blocked_by_kind.setdefault(
+                    item.kind,
+                    "No enabled provider account matches these tasks.",
+                )
+                continue
+            dispatchable_by_kind[item.kind] = (
+                dispatchable_by_kind.get(item.kind, 0) + 1
+            )
         db.commit()
         requeued_count = len(items)
     if requeued_count:
         worker_pool.wake()
+    manager_running = worker_pool._manager is not None and not worker_pool._manager.done()
+    registered_workers = sum(not task.done() for task in worker_pool._workers.values())
     return {
         "ok": True,
         "requeued_count": requeued_count,
+        "dispatchable_count": sum(dispatchable_by_kind.values()),
+        "pending_by_kind": pending_by_kind,
+        "dispatchable_by_kind": dispatchable_by_kind,
+        "blocked_by_kind": blocked_by_kind,
+        "worker_pool_running": manager_running,
+        "registered_account_workers": registered_workers,
         "message": (
             "Pending tasks were reset and workers were notified."
             if requeued_count

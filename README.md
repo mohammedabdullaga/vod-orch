@@ -273,7 +273,7 @@ If the dashboard and API are served from different browser origins, set `CORS_OR
 | `POST` | `/api/categories/toggle` | Enable/disable monitoring and set an optional destination override |
 | `GET` | `/api/queue` | List queue items |
 | `POST` | `/api/queue/retry` | Retry a failed item |
-| `POST` | `/api/queue/requeue-pending` | Reset assignments and retry history for visible pending items, then wake workers |
+| `POST` | `/api/queue/requeue-pending` | Reset pending assignments/retry history, wake workers, and report route/account eligibility |
 | `POST` | `/api/queue/{item_id}/cancel` | Cancel a pending or active download |
 | `POST` | `/api/queue/stop-all-and-clear` | Stop active jobs and hide all queue entries without deleting media files |
 | `POST` | `/api/tasks/purge-history` | Delete selected queue history and reconcile stale worker state |
@@ -306,7 +306,7 @@ The interactive OpenAPI documentation is at `/docs` on the API origin; keep it b
 - Manual browser queue requests wake the account worker immediately and use the same provider/type/stream identity and safe destination layout as polled items. Repeated queued/completed items are reported as skipped.
 - On daemon startup and every 15 seconds, the worker pool reconciles interrupted or orphaned active jobs. Recovered jobs return to `PENDING` with their attempted-account history cleared, so an account that previously claimed the task cannot strand it. Account busy state is in-memory; reconciliation releases stale worker flags rather than updating a persisted account lease.
 - Pending tasks older than 60 seconds are automatically requeued when an eligible idle worker exists; the scheduler releases their stale account assignment, logs the recovery in the task log, and wakes workers. Tasks remain pending when no enabled compatible account or storage route is available.
-- The **Force requeue pending** action on the queue resets the account assignment, retry history, and last error for all visible pending tasks, logs the manual reset, and immediately wakes workers.
+- The **Force requeue pending** action on the queue resets the account assignment, retry history, and last error for all visible pending tasks, logs the manual reset, and immediately wakes workers. The response reports how many items have a configured storage route and compatible enabled account, plus any blocked content kinds and worker-pool health; requeueing itself does not decrement the pending count until a worker claims a task.
 - Xtream catalog sync runs in a VPS backend worker and persists its cache, status, and progress in SQLite; the dashboard polls progress instead of holding a Cloudflare-proxied request open. Interrupted syncs are re-queued from the beginning after daemon restart. M3U imports remain supported by legacy API routes but are not exposed in the primary dashboard.
 - Queue stream IDs are unique. Existing queue items are not re-created when polled again.
 - Failed jobs are retried with exponential backoff up to `MAX_RETRIES`; manual retry is also available.
