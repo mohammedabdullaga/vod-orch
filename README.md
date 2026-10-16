@@ -105,7 +105,7 @@ Each storage root contains a folder per provider category. Movie files are place
 
 If a category-specific destination path is set, that path is used as the category folder itself. Otherwise the cleaned category name is created beneath the storage root. Movie titles never create their own directories. Queue deduplication keys include provider base URL, content type, and stream ID, and a no-clobber atomic move prevents an existing final file from being silently overwritten. The app does not infer identity from a title or merge series folders with similar names.
 
-Staging follows the same relative directory layout as the final destination. Each temporary filename has a `.part-<job id>` suffix so concurrent work cannot collide; after `ffprobe` succeeds, the file is atomically promoted to its final name.
+Each task stages in its own directory under `<staging root>/.vod-orch-jobs/<task id>/`, with a `.part-<job id>` filename. Isolating task directories prevents concurrent cleanup from removing another download's directory or PID file. Older task cleanup also checks the previous relative-layout staging location. After `ffprobe` succeeds, the file is atomically promoted to its final name.
 
 ## VPS setup
 

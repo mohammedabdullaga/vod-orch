@@ -298,21 +298,33 @@ class RemoteDispatcher:
                 raise ValueError("Series destination path is invalid for folder matching.")
             relative_path = PurePosixPath(*relative_path.parts[-2:])
 
-        staging_job_dir = str(PurePosixPath(node.staging_path) / relative_path.parent)
+        staging_job_dir = str(
+            PurePosixPath(node.staging_path) / ".vod-orch-jobs" / str(job_id)
+        )
         staging_file = str(
             PurePosixPath(staging_job_dir) / f"{relative_path.name}.part-{job_id}"
         )
+        legacy_staging_dir = str(
+            PurePosixPath(node.staging_path) / relative_path.parent
+        )
+        legacy_staging_file = str(
+            PurePosixPath(legacy_staging_dir)
+            / f"{relative_path.name}.part-{job_id}"
+        )
         pid_file = f"{staging_file}.pid"
+        legacy_pid_file = f"{legacy_staging_file}.pid"
         state_file = f"{staging_file}.st"
+        legacy_state_file = f"{legacy_staging_file}.st"
         root = PurePosixPath(destination_root or node.watch_path)
         final_directory = PurePosixPath(root) / relative_path.parent
         if final_directory.parts[:len(root.parts)] != root.parts:
             raise ValueError("Content destination is outside the configured storage root.")
 
-        self._terminate_remote_process(node, pid_file)
+        self._terminate_remote_process(node, (pid_file, legacy_pid_file))
         cleanup_parts = [
             f"rm -f -- {shlex.quote(staging_file)} {shlex.quote(state_file)} "
-            f"{shlex.quote(pid_file)}",
+            f"{shlex.quote(pid_file)} {shlex.quote(legacy_staging_file)} "
+            f"{shlex.quote(legacy_state_file)} {shlex.quote(legacy_pid_file)}",
             _rmdir_if_present(staging_job_dir),
         ]
         if prune_empty_final_directories:
@@ -407,7 +419,9 @@ class RemoteDispatcher:
                 )
                 final_root = str(PurePosixPath(final_root) / matched_folder)
                 relative_path = PurePosixPath(*relative_path.parts[-2:])
-            staging_job_dir = str(PurePosixPath(node.staging_path) / relative_path.parent)
+            staging_job_dir = str(
+                PurePosixPath(node.staging_path) / ".vod-orch-jobs" / str(job_id)
+            )
             staging_file = str(
                 PurePosixPath(staging_job_dir) / f"{relative_path.name}.part-{job_id}"
             )
@@ -560,18 +574,27 @@ class RemoteDispatcher:
         finally:
             client.close()
 
-    def _terminate_remote_process(self, node: Node, pid_file: str) -> None:
+    def _terminate_remote_process(
+        self, node: Node, pid_file: str | tuple[str, ...]
+    ) -> None:
         client = self._connect(node)
         try:
-            q_pid_file = shlex.quote(pid_file)
-            command = (
-                "for attempt in 1 2 3 4 5 6 7 8 9 10; do "
-                f"if [ -s {q_pid_file} ]; then break; fi; sleep 0.1; done; "
-                f"if [ -s {q_pid_file} ]; then pid=$(cat -- {q_pid_file}); "
-                "kill -TERM -- \"-$pid\" 2>/dev/null || true; sleep 1; "
-                "kill -KILL -- \"-$pid\" 2>/dev/null || true; "
-                "if kill -0 -- \"-$pid\" 2>/dev/null; then exit 1; fi; fi"
-            )
+            pid_files = (pid_file,) if isinstance(pid_file, str) else pid_file
+            command_parts = []
+            for index, path in enumerate(pid_files):
+                q_pid_file = shlex.quote(path)
+                if index == 0:
+                    command_parts.append(
+                        "for attempt in 1 2 3 4 5 6 7 8 9 10; do "
+                        f"if [ -s {q_pid_file} ]; then break; fi; sleep 0.1; done"
+                    )
+                command_parts.append(
+                    f"if [ -s {q_pid_file} ]; then pid=$(cat -- {q_pid_file}); "
+                    "kill -TERM -- \"-$pid\" 2>/dev/null || true; sleep 1; "
+                    "kill -KILL -- \"-$pid\" 2>/dev/null || true; "
+                    "if kill -0 -- \"-$pid\" 2>/dev/null; then exit 1; fi; fi"
+                )
+            command = "; ".join(command_parts)
             self._run(client, command)
         finally:
             client.close()

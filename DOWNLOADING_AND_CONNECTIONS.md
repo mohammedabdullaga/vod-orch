@@ -75,7 +75,7 @@ The Vite development server uses `localhost:5173` and forwards `/api` to the bac
    - The daemon sends safely quoted shell commands over SSH. Provider credentials in the stream URL are not placed in the dashboard URL; stream URLs are encrypted in SQLite and constructed for the assigned worker account when needed.
 
 4. **Prepare remote staging**
-   - A unique per-job partial file is created under the configured staging directory, mirroring the relative content path.
+   - A unique per-job partial file and PID/state files are created in `<staging root>/.vod-orch-jobs/<task id>/`. This isolates concurrent tasks so cleanup cannot remove another task's active staging directory.
    - The target parent directory is prepared on the storage server. For watched series with existing-folder matching enabled, only the single unambiguous matching folder under that category's custom path is selected.
    - Staging and target must be on the same filesystem so the final rename is atomic.
 
