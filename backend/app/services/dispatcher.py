@@ -60,6 +60,14 @@ def _parse_transfer_metrics(
     return progress, speed, file_size
 
 
+def _rmdir_if_present(path: str) -> str:
+    quoted_path = shlex.quote(path)
+    return (
+        f"rmdir --ignore-fail-on-non-empty {quoted_path} 2>/dev/null "
+        f"|| test ! -d {quoted_path}"
+    )
+
+
 class RemoteDispatcher:
     def __init__(self, known_hosts_path: str = "", command_timeout_seconds: int = 86400) -> None:
         self.known_hosts_path = known_hosts_path
@@ -305,14 +313,12 @@ class RemoteDispatcher:
         cleanup_parts = [
             f"rm -f -- {shlex.quote(staging_file)} {shlex.quote(state_file)} "
             f"{shlex.quote(pid_file)}",
-            f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}",
+            _rmdir_if_present(staging_job_dir),
         ]
         if prune_empty_final_directories:
             current = final_directory
             while current != root and current.parts[:len(root.parts)] == root.parts:
-                cleanup_parts.append(
-                    f"rmdir --ignore-fail-on-non-empty {shlex.quote(str(current))}"
-                )
+                cleanup_parts.append(_rmdir_if_present(str(current)))
                 current = current.parent
 
         client = self._connect(node)
@@ -525,15 +531,13 @@ class RemoteDispatcher:
                     f"&& rm -f -- {shlex.quote(pid_file)} && test ! -e {q_stage}"
                 )
                 run_remote(move)
-                run_remote(
-                    f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}"
-                )
+                run_remote(_rmdir_if_present(staging_job_dir))
                 return DispatchResult(final_path=final_path)
             except Exception as original_error:
                 try:
                     run_remote(
                         f"rm -f -- {q_stage} {q_state_file} {shlex.quote(pid_file)} && "
-                        f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}",
+                        f"{_rmdir_if_present(staging_job_dir)}",
                     )
                 except Exception as first_cleanup_error:
                     cleanup_client = None
@@ -542,7 +546,7 @@ class RemoteDispatcher:
                         self._run(
                             cleanup_client,
                             f"rm -f -- {q_stage} {q_state_file} {shlex.quote(pid_file)} && "
-                            f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}",
+                            f"{_rmdir_if_present(staging_job_dir)}",
                         )
                     except Exception as reconnect_cleanup_error:
                         raise RuntimeError(

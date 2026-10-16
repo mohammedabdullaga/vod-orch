@@ -322,7 +322,25 @@ class WorkerPool:
             candidate = None
             for item in candidates:
                 if item.account_id not in (None, account_id):
-                    continue
+                    assigned_account = db.get(Account, item.account_id)
+                    assigned_worker = self._workers.get(item.account_id)
+                    assigned_worker_available = (
+                        assigned_account is not None
+                        and assigned_account.enabled
+                        and assigned_worker is not None
+                        and not assigned_worker.done()
+                        and item.account_id not in self._busy_accounts
+                    )
+                    if assigned_worker_available:
+                        continue
+                    logger.warning(
+                        "Queue item %s was assigned to unavailable or busy account %s; "
+                        "releasing it for an eligible worker.",
+                        item.id,
+                        item.account_id,
+                    )
+                    item.account_id = None
+                    db.flush()
                 if item.source_provider_url is None:
                     if item.provider_stream_id:
                         item.source_provider_url = account.provider_url
@@ -349,6 +367,13 @@ class WorkerPool:
                             continue
                     item.source_provider_url = account.provider_url
                     db.flush()
+                elif (
+                    item.provider_stream_id is None
+                    and not item.source_provider_url.startswith("m3u:")
+                    and item.source_provider_url.rstrip("/")
+                    != account.provider_url.rstrip("/")
+                ):
+                    continue
                 try:
                     attempted_account_ids = {
                         int(value) for value in json.loads(item.attempted_account_ids or "[]")
@@ -387,6 +412,10 @@ class WorkerPool:
             if candidate is None:
                 db.commit()
                 return None
+            claim_message = (
+                f"Worker account {account_id} claimed the task; "
+                "preparing remote dispatch.\n"
+            )
             claimed = db.execute(
                 update(QueueItem)
                 .where(QueueItem.id == candidate.id, QueueItem.status == "PENDING")
@@ -396,8 +425,8 @@ class WorkerPool:
                     file_size_bytes=None,
                     speed_bytes_per_second=None,
                     dispatched_command=None,
-                    task_log="",
-                    task_log_offset=0,
+                    task_log=claim_message,
+                    task_log_offset=len(claim_message),
                     last_error=None,
                     account_id=account_id,
                     attempted_account_ids=json.dumps(
