@@ -56,6 +56,7 @@ function App() {
   const [authenticated, setAuthenticated] = useState(null);
   const [adminUsername, setAdminUsername] = useState("");
   const [tab, setTab] = useState(tabs[0]);
+  const [queueFilter, setQueueFilter] = useState("open");
   const [status, setStatus] = useState(null);
   const [queue, setQueue] = useState([]);
   const [categories, setCategories] = useState([]);
@@ -393,6 +394,26 @@ function App() {
     ["Completed", counts.completed || 0, Check, "text-emerald-300"],
     ["Failed", counts.failed || 0, CircleAlert, "text-rose-300"],
   ];
+  const activeStatuses = ["DOWNLOADING", "VERIFYING", "CLEANING", "CANCELLING"];
+  const activeCount = activeStatuses.reduce((total, key) => total + (counts[key.toLowerCase()] || 0), 0);
+  const queueFilters = [
+    { id: "open", label: "Open", count: activeCount + (counts.pending || 0) },
+    { id: "active", label: "Active", count: activeCount },
+    { id: "pending", label: "Pending", count: counts.pending || 0 },
+    { id: "completed", label: "Completed", count: counts.completed || 0 },
+    { id: "failed", label: "Failed", count: counts.failed || 0 },
+    { id: "cancelled", label: "Cancelled", count: counts.cancelled || 0 },
+    { id: "all", label: "All", count: Object.values(counts).reduce((total, value) => total + (value || 0), 0) },
+  ];
+  const visibleQueue = queue.filter((item) => {
+    if (queueFilter === "open") return item.status === "PENDING" || activeStatuses.includes(item.status);
+    if (queueFilter === "active") return activeStatuses.includes(item.status);
+    if (queueFilter === "pending") return item.status === "PENDING";
+    if (queueFilter === "completed") return item.status === "COMPLETED";
+    if (queueFilter === "failed") return item.status === "FAILED";
+    if (queueFilter === "cancelled") return item.status === "CANCELLED";
+    return true;
+  });
 
   return (
     <div className="min-h-screen bg-[#090d16]">
@@ -423,15 +444,31 @@ function App() {
           </div>
           <section className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0d1320]">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-5 py-4"><div><h2 className="font-semibold text-white">Ingestion queue</h2><p className="mt-1 text-xs text-slate-500">Latest 500 discovered streams</p></div><div className="flex flex-wrap items-center gap-2"><button onClick={clearDownloadedList} disabled={busy || !(counts.completed || 0)} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 size={14} />Clear downloaded list</button><button onClick={stopAllAndClearQueue} disabled={busy || ![counts.pending, counts.downloading, counts.verifying, counts.completed, counts.failed, counts.cancelled, counts.cancelling].some((value) => value > 0)} className="inline-flex items-center gap-1.5 rounded-lg border border-rose-900/70 px-3 py-2 text-xs text-rose-300 hover:bg-rose-950/40 disabled:cursor-not-allowed disabled:opacity-40"><XCircle size={14} />Stop all &amp; clear all</button><button onClick={refresh} disabled={busy} className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white disabled:opacity-40" aria-label="Refresh queue"><RefreshCw size={16} /></button></div></div>
+            <div className="flex flex-wrap gap-2 border-b border-slate-800 px-5 py-3">
+              {queueFilters.map((filter) => (
+                <button
+                  key={filter.id}
+                  onClick={() => setQueueFilter(filter.id)}
+                  aria-pressed={queueFilter === filter.id}
+                  className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+                    queueFilter === filter.id
+                      ? "border-indigo-400/50 bg-indigo-400/10 text-indigo-200"
+                      : "border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-200"
+                  }`}
+                >
+                  {filter.label}<span className="ml-2 text-slate-500">{filter.count}</span>
+                </button>
+              ))}
+            </div>
             <div className="overflow-x-auto"><table className="w-full min-w-[780px] text-left text-sm">
               <thead className="bg-slate-900/60 text-xs uppercase tracking-wide text-slate-500"><tr><th className="px-5 py-3">Title</th><th className="px-4 py-3">Type</th><th className="px-4 py-3">Status</th><th className="px-4 py-3">Progress</th><th className="px-4 py-3">Worker / Transfer</th><th className="px-4 py-3">Action</th></tr></thead>
-              <tbody className="divide-y divide-slate-800/80">{queue.length ? queue.map((item) => <tr key={item.id} className="hover:bg-slate-800/20">
+              <tbody className="divide-y divide-slate-800/80">{visibleQueue.length ? visibleQueue.map((item) => <tr key={item.id} className="hover:bg-slate-800/20">
                 <td className="px-5 py-4"><div className="font-medium text-slate-200">{item.title}</div>{item.series_title && <div className="mt-1 text-xs text-slate-500">{item.series_title} · S{item.season ?? "—"} E{item.episode ?? "—"}</div>}{item.final_path && <div className="mt-1 max-w-[30rem] truncate font-mono text-[10px] text-slate-500" title={item.final_path}>Saved to: {item.final_path}</div>}</td>
                 <td className="px-4 py-4 text-slate-400">{item.kind === "series" ? <Tv size={16} /> : <Film size={16} />}</td>
                 <td className="px-4 py-4"><Status status={item.status} /></td>
                 <td className="px-4 py-4"><div className="flex items-center gap-2"><div className="h-1.5 w-20 overflow-hidden rounded bg-slate-800"><div className="h-full bg-indigo-400" style={{ width: `${item.progress || 0}%` }} /></div><span className="text-xs text-slate-500">{Math.round(item.progress || 0)}%</span></div></td>
                 <td className="px-4 py-4">{item.status === "FAILED" && <div className="flex flex-col items-start gap-2"><button disabled={busy} onClick={() => cleanFailedItem(item.id)} className="flex items-center gap-1.5 text-xs text-amber-300 hover:text-amber-200"><Trash2 size={13} />Clean partial</button><button disabled={busy} onClick={() => retry(item.id)} className="flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200"><RefreshCw size={13} />Retry</button></div>}{["PENDING", "DOWNLOADING", "VERIFYING"].includes(item.status) && <button disabled={busy} onClick={() => cancelDownload(item.id)} className="flex items-center gap-1.5 text-xs text-rose-300 hover:text-rose-200"><XCircle size={13} />Cancel</button>}{item.status === "CLEANING" && <span className="text-xs text-amber-300">Cleaning storage…</span>}{item.status === "CANCELLING" && <span className="text-xs text-amber-300">Cancelling…</span>}</td>
-              </tr>) : <tr><td colSpan="6" className="px-5 py-14 text-center text-slate-500">No streams discovered yet. Enable a monitored category to begin.</td></tr>}</tbody>
+              </tr>) : <tr><td colSpan="6" className="px-5 py-14 text-center text-slate-500">{queue.length ? `No ${queueFilter === "all" ? "" : `${queueFilter} `}queue items in the latest list.` : "No streams discovered yet. Enable a monitored category to begin."}</td></tr>}</tbody>
             </table></div>
           </section>
         </>}
