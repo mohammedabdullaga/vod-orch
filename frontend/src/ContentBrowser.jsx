@@ -33,7 +33,6 @@ export default function ContentBrowser({
   setProviderProxyId,
   providerProxyBusy,
   providerProxyReady,
-  playlists,
 }) {
   const [type, setType] = useState("series");
   const [providerAccounts, setProviderAccounts] = useState([]);
@@ -60,14 +59,6 @@ export default function ContentBrowser({
   const [downloader, setDownloader] = useState("axel");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
-  const sourcePlaylist = playlists.find(
-    (playlist) =>
-      Boolean(sourceAccountId)
-      && playlist.provider_account_id != null
-      && Number(playlist.provider_account_id) === Number(sourceAccountId)
-      && playlist.entry_count > 0,
-  );
-  const sourcePlaylistId = sourcePlaylist?.id;
   const selectedProxy = availableProxies.find((proxy) => String(proxy.id) === selectedProxyId);
   const pendingCount = pendingSeries?.length ?? pendingQueue?.length ?? 0;
   const wgetProxyUnsupported = downloader === "wget"
@@ -88,7 +79,7 @@ export default function ContentBrowser({
         );
       })
       .catch((error) => {
-        if (current)         setNotice(error.response?.data?.detail || "Could not load provider accounts.");
+        if (current) setNotice(error.response?.data?.detail || "Could not load Xtream accounts.");
       });
     return () => { current = false; };
   }, [api]);
@@ -102,20 +93,17 @@ export default function ContentBrowser({
     setDetails(null);
     setNotice("");
     if (!providerProxyReady || !sourceAccountId) return () => { current = false; };
-    const categoryRequest = sourcePlaylistId
-      ? api.get(`/playlists/${sourcePlaylistId}/categories`, { params: { type } })
-      : api.get("/content/categories", {
-        params: {
-          type,
-          account_id: sourceAccountId,
-          proxy_id: providerProxyId ? Number(providerProxyId) : 0,
-        },
-      });
-    categoryRequest
+    api.get("/content/categories", {
+      params: {
+        type,
+        account_id: sourceAccountId,
+        proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+      },
+    })
       .then(({ data }) => { if (current) setCategories(data); })
       .catch((error) => { if (current) setNotice(error.response?.data?.detail || "Could not load provider categories."); });
     return () => { current = false; };
-  }, [api, type, sourceAccountId, sourcePlaylistId, providerProxyId, providerProxyReady]);
+  }, [api, type, sourceAccountId, providerProxyId, providerProxyReady]);
 
   const visibleCategories = useMemo(() => categories.filter((category) =>
     category.category_name.toLocaleLowerCase().includes(categorySearch.toLocaleLowerCase())
@@ -171,10 +159,6 @@ export default function ContentBrowser({
   };
 
   const setSelectedMonitoring = async (monitored) => {
-    if (sourcePlaylistId) {
-      setNotice("Local M3U categories refresh when you sync this provider account; category monitoring uses live Xtream categories.");
-      return;
-    }
     const selected = categories.filter((category) =>
       selectedCategories.has(category.category_id)
       && (monitored || category.monitored)
@@ -223,7 +207,7 @@ export default function ContentBrowser({
     setSelectedItems(new Set());
     setItemSearch("");
     try {
-      if (forceRefresh && !sourcePlaylistId) {
+      if (forceRefresh) {
         const { data: refreshedCategories } = await api.get("/content/categories", {
           params: {
             type,
@@ -234,19 +218,15 @@ export default function ContentBrowser({
         });
         setCategories(refreshedCategories);
       }
-      const { data } = sourcePlaylistId
-        ? await api.get(`/playlists/${sourcePlaylistId}/items`, {
-          params: { type, category_ids: [...selectedCategories].join(",") },
-        })
-        : await api.get("/content/items", {
-          params: {
-            type,
-            account_id: sourceAccountId,
-            category_ids: [...selectedCategories].join(","),
-            proxy_id: providerProxyId ? Number(providerProxyId) : 0,
-            refresh: forceRefresh,
-          },
-        });
+      const { data } = await api.get("/content/items", {
+        params: {
+          type,
+          account_id: sourceAccountId,
+          category_ids: [...selectedCategories].join(","),
+          proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+          refresh: forceRefresh,
+        },
+      });
       setItems(data);
       setInventoryFilter("all");
       const missing = data.filter((item) => item.download_status === "missing").length;
@@ -280,18 +260,14 @@ export default function ContentBrowser({
     setBusy(true);
     setNotice("");
     try {
-      const { data } = sourcePlaylistId
-        ? await api.get(
-          `/playlists/${sourcePlaylistId}/series/${encodeURIComponent(item.source_series_key)}/details`,
-        )
-        : await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
-          params: {
-            account_id: sourceAccountId,
-            category_id: item.category_id,
-            category_name: item.category_name,
-            proxy_id: providerProxyId ? Number(providerProxyId) : 0,
-          },
-        });
+      const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
+        params: {
+          account_id: sourceAccountId,
+          category_id: item.category_id,
+          category_name: item.category_name,
+          proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+        },
+      });
       setDetails({ item, data });
       setSelectedEpisodes(new Map());
     } catch (error) {
@@ -316,14 +292,12 @@ export default function ContentBrowser({
       const { data } = await api.get("/accounts/availability", {
         params: {
           content_type: type === "series" ? "SERIES" : "MOVIE",
-          ...(sourcePlaylistId
-            ? { source_playlist_id: sourcePlaylistId }
-            : { source_account_id: sourceAccountId }),
+          source_account_id: sourceAccountId,
         },
       });
       const free = data.accounts.filter((account) => account.free);
       if (!free.length) {
-        setNotice("No idle provider accounts are available as workers. Wait for current downloads or add an account.");
+        setNotice("No idle Xtream accounts are available for downloading. Wait for current downloads or add an account.");
         return;
       }
       setPendingQueue(entries);
@@ -360,14 +334,12 @@ export default function ContentBrowser({
       const { data } = await api.get("/accounts/availability", {
         params: {
           content_type: "SERIES",
-          ...(sourcePlaylistId
-            ? { source_playlist_id: sourcePlaylistId }
-            : { source_account_id: sourceAccountId }),
+          source_account_id: sourceAccountId,
         },
       });
       const free = data.accounts.filter((account) => account.free);
       if (!free.length) {
-        setNotice("No idle provider accounts are available as workers. Wait for current downloads or add an account.");
+        setNotice("No idle Xtream accounts are available for downloading. Wait for current downloads or add an account.");
         return;
       }
       setPendingQueue([]);
@@ -403,19 +375,15 @@ export default function ContentBrowser({
       const accountIds = [...selectedWorkerIds];
       if (pendingSeries?.length) {
         const { data } = await api.post("/queue/prepare-series-batch", {
-          ...(sourcePlaylistId
-            ? { source_playlist_id: sourcePlaylistId }
-            : {
-              source_account_id: Number(sourceAccountId),
-              provider_proxy_id: providerProxyId ? Number(providerProxyId) : 0,
-            }),
+          source_account_id: Number(sourceAccountId),
+          provider_proxy_id: providerProxyId ? Number(providerProxyId) : 0,
           account_ids: accountIds,
           proxy_mode: proxyMode === "node" ? "selected" : "direct",
           proxy_id: proxyMode === "node" ? Number(selectedProxyId) : null,
           downloader,
           missing_only: pendingMissingOnly,
           series: pendingSeries.map((item) => ({
-            series_id: item.source_series_key || item.id,
+            series_id: item.id,
             title: item.name,
             category_id: item.category_id,
             category_name: item.category_name,
@@ -441,9 +409,7 @@ export default function ContentBrowser({
       }
       const { data } = await api.post("/queue/manual-batch", {
         content_type: type === "series" ? "SERIES" : "MOVIE",
-        ...(sourcePlaylistId
-          ? { source_playlist_id: sourcePlaylistId }
-          : { source_account_id: Number(sourceAccountId) }),
+        source_account_id: Number(sourceAccountId),
         target_node_id: String(nodeId),
         account_ids: accountIds,
         proxy_mode: proxyMode === "node" ? "selected" : "direct",
@@ -516,18 +482,14 @@ export default function ContentBrowser({
     }
     const entries = [];
     for (const item of chosen) {
-      const { data } = sourcePlaylistId
-        ? await api.get(
-          `/playlists/${sourcePlaylistId}/series/${encodeURIComponent(item.source_series_key)}/details`,
-        )
-        : await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
-          params: {
-            account_id: sourceAccountId,
-            category_id: item.category_id,
-            category_name: item.category_name,
-            proxy_id: providerProxyId ? Number(providerProxyId) : 0,
-          },
-        });
+      const { data } = await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
+        params: {
+          account_id: sourceAccountId,
+          category_id: item.category_id,
+          category_name: item.category_name,
+          proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+        },
+      });
       entries.push(...detailsEntries(item, data));
     }
     return entries;
@@ -658,15 +620,15 @@ export default function ContentBrowser({
               </select>
             </label>
             <label className="text-xs text-slate-400">
-              Browse using provider account
+              Browse using Xtream account
               <select
-                aria-label="Browse using provider account"
+                aria-label="Browse using Xtream account"
                 value={sourceAccountId}
                 onChange={(event) => setSourceAccountId(event.target.value)}
                 disabled={!providerAccounts.length || busy || Boolean(pendingQueue)}
                 className="ml-2 max-w-64 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
               >
-                {!providerAccounts.length && <option value="">No enabled provider accounts</option>}
+                {!providerAccounts.length && <option value="">No enabled Xtream accounts</option>}
                 {providerAccounts.map((account) => (
                   <option key={account.id} value={account.id}>
                     #{account.id} · {account.username} · {account.provider_url}
@@ -683,7 +645,7 @@ export default function ContentBrowser({
             </div>
           </div>
         </div>
-        <p className="mt-3 text-xs text-slate-500">{sourcePlaylistId ? "This account has a locally indexed M3U catalog. Categories, titles, and episode details are read from SQLite; sync the account in Settings & Accounts to fetch a fresh playlist. Download proxy settings are selected separately when queueing." : "Choose the account used to browse categories and titles, and whether provider API requests should use a proxy. This proxy is for category, title, and series-detail API requests; download proxy settings are chosen separately at queue time. At download time, the selected idle worker account supplies its own Xtream username and password for the same stream ID."}</p>
+        <p className="mt-3 text-xs text-slate-500">Choose the account used to browse categories and titles, and whether provider API requests should use a proxy. This proxy is for category, title, and series-detail API requests; download proxy settings are chosen separately at queue time. At download time, the selected idle worker account supplies its own Xtream username and password for the same stream ID.</p>
 
         <div className="mt-5 grid gap-5 lg:grid-cols-[minmax(260px,0.8fr)_minmax(0,1.6fr)]">
           <div className="rounded-xl border border-slate-800 bg-slate-900/40">
@@ -711,13 +673,13 @@ export default function ContentBrowser({
                   {category.monitored && <span className="rounded-full bg-emerald-400/10 px-2 py-0.5 text-[10px] text-emerald-300">Watching</span>}
                 </label>
               ))}
-              {!visibleCategories.length && <p className="px-3 py-8 text-center text-sm text-slate-500">{!providerAccounts.length ? "Add an enabled provider account to browse." : categories.length ? "No matching categories." : "No categories available for this source and type."}</p>}
+              {!visibleCategories.length && <p className="px-3 py-8 text-center text-sm text-slate-500">{!providerAccounts.length ? "Add an enabled Xtream account to browse." : categories.length ? "No matching categories." : "No categories available for this source and type."}</p>}
             </div>
             <div className="grid gap-2 border-t border-slate-800 p-3 sm:grid-cols-2">
-              {!sourcePlaylistId && <button disabled={busy || !selectedCategories.size} onClick={() => setSelectedMonitoring(true)} className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-40">Monitor selected</button>}
-              {!sourcePlaylistId && selectedMonitoredCategories.length > 0 && <button disabled={busy} onClick={() => setSelectedMonitoring(false)} className="rounded-lg border border-amber-800/70 px-3 py-2 text-xs font-medium text-amber-300 hover:bg-amber-950/40 disabled:opacity-40">Stop monitoring selected ({selectedMonitoredCategories.length})</button>}
+              <button disabled={busy || !selectedCategories.size} onClick={() => setSelectedMonitoring(true)} className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-40">Monitor selected</button>
+              {selectedMonitoredCategories.length > 0 && <button disabled={busy} onClick={() => setSelectedMonitoring(false)} className="rounded-lg border border-amber-800/70 px-3 py-2 text-xs font-medium text-amber-300 hover:bg-amber-950/40 disabled:opacity-40">Stop monitoring selected ({selectedMonitoredCategories.length})</button>}
               <button disabled={busy || !selectedCategories.size} onClick={() => browseSelected()} className="rounded-lg bg-indigo-500 px-3 py-2 text-xs font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">Browse selected</button>
-              <button disabled={busy || !selectedCategories.size} onClick={() => browseSelected(!sourcePlaylistId)} title={sourcePlaylistId ? "Reload titles from the locally indexed catalog." : "Fetch fresh categories and titles from the provider instead of using cached data."} className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-300 hover:border-slate-500 hover:text-white disabled:opacity-40">{sourcePlaylistId ? "Reload local catalog" : "Refresh from provider"}</button>
+              <button disabled={busy || !selectedCategories.size} onClick={() => browseSelected(true)} title="Fetch fresh categories and titles from the provider instead of using cached data." className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-300 hover:border-slate-500 hover:text-white disabled:opacity-40">Refresh from provider</button>
             </div>
           </div>
 
@@ -763,7 +725,7 @@ export default function ContentBrowser({
               </div>
               <div className="flex flex-wrap gap-2">
                 <button type="button" disabled={busy || !selectedTitles.length} onClick={queueSelectedTitles} className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/25 disabled:opacity-40"><Download size={14} />{type === "series" ? "Queue Missing Episodes" : "Ingest Selected via Workers"}</button>
-                {!sourcePlaylistId && <button type="button" disabled={busy || !selectedTitles.length} onClick={exportSelectedScript} className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-400/40 bg-indigo-500/10 px-3 py-2 text-xs font-medium text-indigo-200 hover:bg-indigo-500/20 disabled:opacity-40"><Download size={14} />Export / Run as Direct Bash Script</button>}
+                <button type="button" disabled={busy || !selectedTitles.length} onClick={exportSelectedScript} className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-400/40 bg-indigo-500/10 px-3 py-2 text-xs font-medium text-indigo-200 hover:bg-indigo-500/20 disabled:opacity-40"><Download size={14} />Export / Run as Direct Bash Script</button>
               </div>
             </div>}
             {!items.length ? <div className="grid min-h-64 place-items-center px-4 text-center text-sm text-slate-500">Choose categories and select <span className="text-indigo-300">Browse selected</span> to see provider content.</div> :
@@ -890,11 +852,11 @@ export default function ContentBrowser({
             <button type="button" onClick={cancelQueueConfirmation} disabled={busy} aria-label="Cancel queue confirmation" className="rounded-lg p-2 text-slate-400 hover:bg-slate-800"><X size={16} /></button>
           </header>
           <div className="min-h-0 space-y-5 overflow-y-auto p-5">
-            {pendingSeries && <p className="rounded-lg border border-indigo-900/70 bg-indigo-950/30 px-3 py-2 text-xs text-indigo-200">{sourcePlaylistId ? "Series episodes are read from the local indexed playlist. Each series is queued as its details are prepared." : "Series details are requested at least 3 seconds apart. Each series is added to the download queue as soon as its details are ready."}</p>}
+            {pendingSeries && <p className="rounded-lg border border-indigo-900/70 bg-indigo-950/30 px-3 py-2 text-xs text-indigo-200">Series details are requested at least 3 seconds apart. Each series is added to the download queue as soon as its details are ready.</p>}
             <div>
-              <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-medium text-slate-200">Idle provider accounts</h3><span className="text-xs text-slate-500">{selectedWorkerIds.size} selected</span></div>
+              <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-medium text-slate-200">Idle Xtream accounts</h3><span className="text-xs text-slate-500">{selectedWorkerIds.size} selected</span></div>
               <p className="mb-3 text-xs text-slate-500">Jobs are distributed round-robin. Each account runs at most one download at a time; selecting more free accounts increases parallel downloads.</p>
-              <p className="mb-3 text-[11px] text-indigo-300">{sourcePlaylistId ? "Idle accounts are used as worker slots; the stored M3U entry supplies each stream URL." : "Only accounts for the selected provider endpoint are shown; each worker uses its own credentials."}</p>
+              <p className="mb-3 text-[11px] text-indigo-300">Only accounts for the selected provider endpoint are shown; each worker uses its own credentials.</p>
               <div className="max-h-48 space-y-2 overflow-y-auto">
                 {availableAccounts.map((account) => {
                   const sortedWorkers = [...selectedWorkerIds].sort((left, right) => left - right);
