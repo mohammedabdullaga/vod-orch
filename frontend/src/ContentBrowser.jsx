@@ -932,13 +932,14 @@ export default function ContentBrowser({
           </footer>
         </div>
       </div>}
-      {(pendingQueue !== null || pendingSeries !== null) && <div role="dialog" aria-modal="true" aria-labelledby="queue-confirm-title" className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4">
-        <section className="w-full max-w-xl rounded-2xl border border-slate-700 bg-[#0d1320] shadow-2xl">
+      {(pendingQueue !== null || pendingSeries !== null) && <div role="dialog" aria-modal="true" aria-labelledby="queue-confirm-title" className="fixed inset-0 z-[60] overflow-y-auto bg-black/80 p-3 sm:p-4">
+        <div className="flex min-h-full items-center justify-center">
+        <section className="flex max-h-[calc(100vh-1.5rem)] w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-slate-700 bg-[#0d1320] shadow-2xl sm:max-h-[calc(100vh-2rem)]">
           <header className="flex items-start justify-between gap-4 border-b border-slate-800 px-5 py-4">
             <div><h2 id="queue-confirm-title" className="font-semibold text-white">Confirm download assignment</h2><p className="mt-1 text-xs text-slate-400">{pendingSeries ? `${pendingCount} series will be prepared and queued as each finishes.` : `${pendingCount} item${pendingCount === 1 ? "" : "s"} will be queued across the free accounts you select.`}</p><p className="mt-1 text-[11px] text-indigo-300">{sourceType === "m3u" ? `Using stream URLs saved from ${playlists.find((playlist) => String(playlist.id) === sourcePlaylistId)?.name || "the M3U playlist"}.` : `Browsing with ${providerAccounts.find((account) => String(account.id) === sourceAccountId)?.username || "the selected account"}; each download uses the credentials of its assigned account.`}</p></div>
             <button type="button" onClick={cancelQueueConfirmation} disabled={busy} aria-label="Cancel queue confirmation" className="rounded-lg p-2 text-slate-400 hover:bg-slate-800"><X size={16} /></button>
           </header>
-          <div className="space-y-5 p-5">
+          <div className="min-h-0 space-y-5 overflow-y-auto p-5">
             {pendingSeries && <p className="rounded-lg border border-indigo-900/70 bg-indigo-950/30 px-3 py-2 text-xs text-indigo-200">Series details are requested at least 3 seconds apart. Each series is added to the download queue as soon as its details are ready.</p>}
             <div>
               <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-medium text-slate-200">Idle Xtream accounts</h3><span className="text-xs text-slate-500">{selectedWorkerIds.size} selected</span></div>
@@ -996,7 +997,7 @@ export default function ContentBrowser({
               {!proxyAvailable && <p className="mt-2 text-xs text-slate-500">There are no enabled proxies in the proxy pool.</p>}
             </fieldset>
           </div>
-          <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 px-5 py-4">
+          <footer className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-slate-800 px-5 py-4">
             <button type="button" onClick={cancelQueueConfirmation} disabled={busy} className="rounded-lg border border-slate-700 px-4 py-2.5 text-sm text-slate-300 hover:bg-slate-800">Cancel</button>
             <button type="button" onClick={confirmQueueEntries} disabled={busy || !selectedWorkerIds.size || (proxyMode === "node" && !selectedProxyId) || wgetProxyUnsupported} className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">
               {busy ? <LoaderCircle size={15} className="animate-spin" /> : <Download size={15} />}
@@ -1004,6 +1005,7 @@ export default function ContentBrowser({
             </button>
           </footer>
         </section>
+        </div>
       </div>}
       {busy && <span className="sr-only" role="status">Loading content</span>}
     </section>
