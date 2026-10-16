@@ -39,6 +39,7 @@ from app.services.m3u import fetch_playlist, replace_playlist_entries
 from app.services.content_paths import (
     category_directory_name,
     clean_content_name,
+    identity_segment,
     library_name_matches,
     normalized_episode_path,
     safe_extension,
@@ -209,6 +210,96 @@ def _playlist_entry_json(entry: M3UEntry, category_id: str) -> dict[str, Any]:
         "episode_num": entry.episode,
         "series_name": entry.series_name,
     }
+
+
+def _find_series_folder(
+    files: list[str],
+    series_name: str,
+    series_id: str,
+    provider_url: str,
+    prefixes: str | None,
+) -> tuple[str | None, bool]:
+    directories = {entry.split("/", 1)[0] for entry in files if "/" in entry}
+    expected = identity_segment(
+        clean_content_name(series_name, prefixes), series_id, provider_url
+    )
+    if expected in directories:
+        return expected, False
+    matches = [
+        directory
+        for directory in directories
+        if library_name_matches(series_name, directory, prefixes)
+    ]
+    if len(matches) == 1:
+        return matches[0], False
+    return None, len(matches) > 1
+
+
+def _stored_episode_numbers(filename: str) -> set[tuple[int, int]]:
+    result = set()
+    pattern = re.compile(
+        r"(?:^|[^A-Za-z0-9])(?:S(\d{1,3})E(\d{1,3})|(\d{1,3})x(\d{1,3}))"
+        r"(?=[^A-Za-z0-9]|$)",
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(filename):
+        season, episode = match.group(1, 2)
+        if season is None:
+            season, episode = match.group(3, 4)
+        result.add((int(season), int(episode)))
+    return result
+
+
+def _mark_series_storage(
+    details: dict[str, Any],
+    files: list[str],
+    provider_url: str,
+    prefixes: str | None = None,
+) -> None:
+    series_folder, ambiguous = _find_series_folder(
+        files,
+        details["name"],
+        str(details["series_id"]),
+        provider_url,
+        prefixes,
+    )
+    details["storage_inventory_available"] = True
+    details["storage_match"] = series_folder
+    details["storage_inventory_ambiguous"] = ambiguous
+    stored_episodes: set[tuple[int, int]] = set()
+    has_unclassified_video = False
+    if series_folder:
+        for entry in files:
+            if not entry.startswith(f"{series_folder}/"):
+                continue
+            filename = entry.rsplit("/", 1)[-1]
+            episode_numbers = _stored_episode_numbers(filename)
+            if episode_numbers:
+                stored_episodes.update(episode_numbers)
+            else:
+                has_unclassified_video = True
+    details["storage_inventory_unclassified"] = has_unclassified_video
+    missing_count = 0
+    for season_key, episodes in details["seasons"].items():
+        for episode in episodes:
+            season = episode.get("season")
+            if season is None:
+                season = parse_season_number(season_key) or 0
+            present = (
+                None
+                if ambiguous or (
+                    has_unclassified_video
+                    and (int(season), int(episode["episode_num"]))
+                    not in stored_episodes
+                )
+                else (int(season), int(episode["episode_num"])) in stored_episodes
+            )
+            episode["on_storage"] = present
+            if present is False:
+                missing_count += 1
+    details["missing_episode_count"] = (
+        missing_count if not ambiguous and not has_unclassified_video else None
+    )
 
 
 @playlist_router.get("")
@@ -418,9 +509,11 @@ def get_m3u_items(
 
 
 @playlist_router.get("/{playlist_id}/series/{series_key}/details")
-def get_m3u_series_details(
+async def get_m3u_series_details(
+    request: Request,
     playlist_id: int,
     series_key: str,
+    check_storage: bool = Query(default=True),
 ) -> dict[str, Any]:
     with SessionLocal() as db:
         playlist = db.get(M3UPlaylist, playlist_id)
@@ -465,13 +558,36 @@ def get_m3u_series_details(
             "title": row.title,
             "season": season,
         })
-    return {
+    details = {
         "series_id": series_key,
         "name": matching[0].series_name or matching[0].title,
         "category_id": _playlist_category_id(playlist_id, matching[0].group_title),
         "category_name": matching[0].group_title,
         "seasons": dict(seasons),
     }
+    with SessionLocal() as db:
+        route = db.get(StorageRoute, "series")
+        node = db.get(Node, route.node_id) if route else None
+    if node and check_storage:
+        root, prefixes = _series_storage_location(
+            node,
+            details["category_id"],
+            details["category_name"],
+        )
+        if root is None:
+            _set_unknown_series_inventory(details)
+            return details
+        await _populate_series_inventory(
+            request,
+            details,
+            f"m3u:{playlist_id}",
+            node,
+            root,
+            prefixes,
+        )
+    else:
+        _set_unknown_series_inventory(details)
+    return details
 
 
 @router.get("/categories")
@@ -664,19 +780,17 @@ async def get_content_items(
             continue
 
         if kind == "series":
-            series_directory = next(
-                (
-                    entry.split("/", 1)[0]
-                    for entry in files
-                    if "/" in entry
-                    and library_name_matches(
-                        item["name"],
-                        entry.split("/", 1)[0],
-                        category_prefixes.get(category_id, ""),
-                    )
-                ),
-                None,
+            series_directory, ambiguous = _find_series_folder(
+                files,
+                item["name"],
+                item["id"],
+                account.provider_url,
+                category_prefixes.get(category_id, ""),
             )
+            if ambiguous:
+                item["download_status"] = "unknown"
+                item["inventory_warning"] = "Multiple matching series folders were found."
+                continue
             if not series_directory:
                 item["download_status"] = "missing"
                 continue
@@ -686,14 +800,7 @@ async def get_content_items(
                 if not entry.startswith(f"{series_directory}/"):
                     continue
                 filename = entry.rsplit("/", 1)[-1]
-                episode_ids.update(
-                    (int(season), int(episode))
-                    for season, episode in re.findall(
-                        r"(?:^|[^A-Za-z0-9])S(\d{1,3})E(\d{1,3})(?=[^A-Za-z0-9]|$)",
-                        filename,
-                        flags=re.IGNORECASE,
-                    )
-                )
+                episode_ids.update(_stored_episode_numbers(filename))
             total_episodes = item["total_episodes"]
             is_complete = (
                 total_episodes is not None
@@ -710,30 +817,36 @@ async def get_content_items(
             if "." not in filename:
                 continue
             movie_candidates.append((filename.rsplit(".", 1)[0], entry))
-        match = next(
-            (
-                stored_path
-                for candidate, stored_path in movie_candidates
-                if library_name_matches(
-                    item["name"],
-                    candidate,
-                    category_prefixes.get(category_id, ""),
-                )
-            ),
-            None,
+        matches = [
+            stored_path
+            for candidate, stored_path in movie_candidates
+            if library_name_matches(
+                item["name"],
+                candidate,
+                category_prefixes.get(category_id, ""),
+            )
+        ]
+        match = matches[0] if len(matches) == 1 else None
+        item["download_status"] = (
+            "downloaded" if match else "unknown" if len(matches) > 1 else "missing"
         )
-        item["download_status"] = "downloaded" if match else "missing"
+        if len(matches) > 1:
+            item["inventory_warning"] = "Multiple matching movie files were found."
         item["storage_match"] = match
     return result
 
 
 @router.get("/series/{series_id}/details")
 async def get_series_details(
+    request: Request,
     response: Response,
     series_id: str,
     account_id: int | None = Query(default=None, ge=1),
+    category_id: str | None = Query(default=None, max_length=255),
+    category_name: str | None = Query(default=None, max_length=512),
     proxy_id: int | None = Query(default=None, ge=0),
     refresh: bool = Query(default=False),
+    check_storage: bool = Query(default=True),
 ) -> dict[str, Any]:
     if not series_id or len(series_id) > 512:
         raise HTTPException(status_code=422, detail="Invalid series ID.")
@@ -747,7 +860,93 @@ async def get_series_details(
         response=response,
         series_id=series_id,
     )
-    return _normalize_series_details(info, series_id)
+    details = _normalize_series_details(info, series_id)
+    with SessionLocal() as db:
+        route = db.get(StorageRoute, "series")
+        node = db.get(Node, route.node_id) if route else None
+    root, prefixes = (
+        _series_storage_location(node, category_id, category_name)
+        if node
+        else (None, "")
+    )
+    if node and root and check_storage:
+        await _populate_series_inventory(
+            request,
+            details,
+            account.provider_url,
+            node,
+            root,
+            prefixes,
+        )
+    else:
+        _set_unknown_series_inventory(details)
+    return details
+
+
+def _set_unknown_series_inventory(details: dict[str, Any]) -> None:
+    details["storage_inventory_available"] = False
+    details["storage_inventory_ambiguous"] = False
+    details["storage_inventory_unclassified"] = False
+    details["storage_match"] = None
+    details["missing_episode_count"] = None
+    for episodes in details["seasons"].values():
+        for episode in episodes:
+            episode["on_storage"] = None
+
+
+async def _populate_series_inventory(
+    request: Request,
+    details: dict[str, Any],
+    provider_url: str,
+    node: Node,
+    root: str,
+    prefixes: str | None = None,
+) -> None:
+    try:
+        inventory = await asyncio.to_thread(
+            request.app.state.dispatcher.scan_library_files,
+            node,
+            {"series": root},
+        )
+        _mark_series_storage(
+            details,
+            inventory["series"],
+            provider_url,
+            prefixes,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not match stored episodes for series %s (%s)",
+            details.get("series_id"),
+            type(exc).__name__,
+        )
+        _set_unknown_series_inventory(details)
+
+
+def _series_storage_location(
+    node: Node,
+    category_id: str | None,
+    category_name: str | None,
+) -> tuple[str | None, str]:
+    category = None
+    if category_id:
+        with SessionLocal() as db:
+            category = db.scalar(
+                select(MonitoredCategory).where(
+                    MonitoredCategory.kind == "series",
+                    MonitoredCategory.category_id == category_id,
+                )
+            )
+    prefixes = category.strip_prefixes if category else ""
+    if category and category.destination_path:
+        return category.destination_path, prefixes
+    name = category.name if category else category_name
+    if not name:
+        return None, prefixes
+    return (
+        str(PurePosixPath(node.watch_path) / category_directory_name(name, prefixes)),
+        prefixes,
+    )
 
 
 def _normalize_series_details(info: Any, series_id: str) -> dict[str, Any]:
@@ -828,6 +1027,7 @@ class SeriesQueueBatchRequest(BaseModel):
     proxy_mode: Literal["selected", "direct"] = "direct"
     proxy_id: int | None = Field(default=None, ge=1)
     downloader: Literal["axel", "wget"] = "axel"
+    missing_only: bool = False
     series: list[SeriesQueueSelection] = Field(min_length=1, max_length=500)
 
 
@@ -841,6 +1041,7 @@ def _queue_manual_batch(
     request: Request,
     *,
     allow_existing_account_queue: bool = False,
+    series_storage_matches: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     kind = "series" if payload.content_type == "SERIES" else "vod"
     with SessionLocal() as db:
@@ -907,6 +1108,14 @@ def _queue_manual_batch(
                 raise HTTPException(
                     status_code=409,
                     detail="Selected download accounts must be enabled.",
+                )
+            if account and any(
+                selected.provider_url.rstrip("/") != account.provider_url.rstrip("/")
+                for selected in selected_accounts
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Xtream download accounts must use the same provider endpoint as the source account.",
                 )
             if not allow_existing_account_queue:
                 busy_ids = set(db.scalars(
@@ -1077,6 +1286,47 @@ def _queue_manual_batch(
                 filename=filename_input,
                 strip_prefixes=category.strip_prefixes if category else None,
             )
+            matched_series_folder = (
+                series_storage_matches.get(str(series_id))
+                if kind == "series" and series_storage_matches
+                else None
+            )
+            if matched_series_folder:
+                folder_parts = PurePosixPath(matched_series_folder).parts
+                if (
+                    len(folder_parts) != 1
+                    or folder_parts[0] in ("", ".", "..")
+                    or "\\" in matched_series_folder
+                    or "\x00" in matched_series_folder
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="The matched series folder has an unsafe path and cannot be used for queueing.",
+                    )
+                expected_identity = identity_segment(
+                    clean_content_name(
+                        series_name or title,
+                        category.strip_prefixes if category else None,
+                    ),
+                    series_id or provider_stream_id,
+                    source_provider_url,
+                )
+                path_parts = list(PurePosixPath(file_name).parts)
+                identity_index = next(
+                    (
+                        index
+                        for index, part in enumerate(path_parts[:-2])
+                        if part == expected_identity
+                    ),
+                    None,
+                )
+                if identity_index is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Could not map the matched series folder to its queue destination.",
+                    )
+                path_parts[identity_index] = folder_parts[0]
+                file_name = str(PurePosixPath(*path_parts))
             if kind == "series":
                 series_name = clean_content_name(
                     series_name or title,
@@ -1115,6 +1365,7 @@ def _queue_manual_batch(
                 "progress": 0,
                 "error": None,
                 "retry_after": None,
+                "attempted_account_ids": "[]",
                 "updated_at": utc_now(),
             }
             if existing:
@@ -1171,6 +1422,23 @@ async def prepare_series_batch(
         ).all()
         if len(selected_accounts) != len(payload.account_ids):
             raise HTTPException(status_code=409, detail="Selected download accounts must be enabled.")
+        source_account = (
+            db.get(Account, payload.source_account_id)
+            if payload.source_account_id is not None
+            else None
+        )
+        if payload.source_account_id is not None and (
+            not source_account or not source_account.enabled
+        ):
+            raise HTTPException(status_code=409, detail="The source Xtream account is unavailable.")
+        if source_account and any(
+            selected.provider_url.rstrip("/") != source_account.provider_url.rstrip("/")
+            for selected in selected_accounts
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Xtream download accounts must use the same provider endpoint as the source account.",
+            )
         busy_ids = set(db.scalars(
             select(QueueItem.account_id).where(
                 QueueItem.account_id.in_(payload.account_ids),
@@ -1183,7 +1451,8 @@ async def prepare_series_batch(
                 detail="One or more selected accounts already have queued or active work. Refresh account availability.",
             )
         route = db.get(StorageRoute, "series")
-        if not route or not db.get(Node, route.node_id):
+        series_node = db.get(Node, route.node_id) if route else None
+        if not series_node:
             raise HTTPException(
                 status_code=409,
                 detail="Assign a storage node for series content before queueing.",
@@ -1207,7 +1476,6 @@ async def prepare_series_batch(
 
     account = None
     playlist = None
-    provider_proxy_url = None
     if payload.source_playlist_id is not None:
         with SessionLocal() as db:
             playlist = db.get(M3UPlaylist, payload.source_playlist_id)
@@ -1215,19 +1483,21 @@ async def prepare_series_batch(
                 raise HTTPException(status_code=409, detail="The selected M3U playlist is unavailable.")
     else:
         account = _provider_account(payload.source_account_id)
-        provider_proxy_url = _resolve_api_proxy(payload.provider_proxy_id)
 
     queued: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     failed: list[dict[str, str]] = []
     enqueued_first_series = False
+    inventory_by_root: dict[str, list[str] | None] = {}
 
     for selection in payload.series:
         try:
             if playlist is not None:
-                details = get_m3u_series_details(
+                details = await get_m3u_series_details(
+                    request,
                     playlist.id,
                     selection.series_id,
+                    check_storage=False,
                 )
             else:
                 if account is None:
@@ -1235,17 +1505,87 @@ async def prepare_series_batch(
                         status_code=409,
                         detail="The selected Xtream account is unavailable.",
                     )
-                provider_info = await _request_provider(
-                    account,
-                    "get_series_info",
-                    proxy_url=provider_proxy_url,
-                    series_id=selection.series_id,
+                details = await get_series_details(
+                    request,
+                    Response(),
+                    selection.series_id,
+                    account_id=account.id,
+                    category_id=selection.category_id,
+                    category_name=selection.category_name,
+                    proxy_id=payload.provider_proxy_id,
+                    check_storage=False,
                 )
-                details = _normalize_series_details(provider_info, selection.series_id)
+            if payload.missing_only:
+                if series_node is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="A series storage node is not configured.",
+                    )
+                root, prefixes = _series_storage_location(
+                    series_node,
+                    selection.category_id,
+                    selection.category_name,
+                )
+                if root is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="The series category has no known storage destination.",
+                    )
+                if root not in inventory_by_root:
+                    try:
+                        inventory = await asyncio.to_thread(
+                            request.app.state.dispatcher.scan_library_files,
+                            series_node,
+                            {"series": root},
+                        )
+                        inventory_by_root[root] = inventory["series"]
+                    except Exception as exc:
+                        inventory_by_root[root] = None
+                        logger.warning(
+                            "Could not inspect storage for category %s (%s)",
+                            selection.category_id,
+                            type(exc).__name__,
+                        )
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Storage inventory is unavailable; check the storage connection and try again.",
+                        ) from exc
+                files = inventory_by_root[root]
+                if files is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Storage inventory is unavailable; check the storage connection and try again.",
+                    )
+                provider_url = (
+                    f"m3u:{playlist.id}"
+                    if playlist is not None
+                    else account.provider_url
+                    if account is not None
+                    else ""
+                )
+                _mark_series_storage(details, files, provider_url, prefixes)
+                if not details.get("storage_inventory_available"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Storage inventory is unavailable; check the storage connection and try again.",
+                    )
+                if details.get("storage_inventory_ambiguous"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Multiple series folders match this title. Resolve the folder ambiguity before queueing missing episodes.",
+                    )
+                if details.get("storage_inventory_unclassified"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Some files in the series folder have no recognizable episode number. Review the folder before queueing missing episodes.",
+                    )
 
             entries: list[ManualQueueItem] = []
+            series_storage_matches: dict[str, str] = {}
             for season_key, episodes in details["seasons"].items():
                 for episode in episodes:
+                    if payload.missing_only and episode.get("on_storage") is not False:
+                        continue
                     season = episode.get("season")
                     if season is None:
                         season = parse_season_number(season_key) or 0
@@ -1266,6 +1606,17 @@ async def prepare_series_batch(
                         category_id=selection.category_id,
                         category_name=selection.category_name,
                     ))
+            if details.get("storage_match"):
+                series_storage_matches[str(details["series_id"])] = details[
+                    "storage_match"
+                ]
+            if payload.missing_only and not entries:
+                skipped.append({
+                    "series_id": selection.series_id,
+                    "title": selection.title,
+                    "reason": "no_missing_episodes",
+                })
+                continue
             if not entries:
                 failed.append({
                     "series_id": selection.series_id,
@@ -1287,6 +1638,7 @@ async def prepare_series_batch(
                 ),
                 request,
                 allow_existing_account_queue=enqueued_first_series,
+                series_storage_matches=series_storage_matches,
             )
             enqueued_first_series = True
             queued.extend(result["queued"])

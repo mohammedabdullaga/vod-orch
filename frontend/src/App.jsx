@@ -225,6 +225,13 @@ function App() {
     "Category destination saved. Pending watched content will use the updated path.",
   );
   const retry = (id) => act(() => api.post("/queue/retry", { item_id: id }), "Task queued for retry.");
+  const cleanFailedItem = (id) => {
+    if (!window.confirm("Remove this failed job's known staging partials and only empty directories? Existing media files will not be deleted.")) return;
+    act(
+      () => api.post(`/queue/${id}/cleanup`),
+      "Removed this failed download's remote partial file and empty folders, when present.",
+    );
+  };
   const cancelDownload = (id) => act(
     () => api.post(`/queue/${id}/cancel`),
     "Download cancellation requested; the remote partial file will be removed.",
@@ -243,7 +250,7 @@ function App() {
   const stopAllAndClearQueue = () => {
     const counts = status?.queue || {};
     const total = [
-      counts.pending, counts.downloading, counts.verifying, counts.completed,
+      counts.pending, counts.downloading, counts.verifying, counts.cleaning, counts.completed,
       counts.failed, counts.cancelled, counts.cancelling,
     ].reduce((sum, value) => sum + (value || 0), 0);
     if (!total) return;
@@ -423,7 +430,7 @@ function App() {
                 <td className="px-4 py-4 text-slate-400">{item.kind === "series" ? <Tv size={16} /> : <Film size={16} />}</td>
                 <td className="px-4 py-4"><Status status={item.status} /></td>
                 <td className="px-4 py-4"><div className="flex items-center gap-2"><div className="h-1.5 w-20 overflow-hidden rounded bg-slate-800"><div className="h-full bg-indigo-400" style={{ width: `${item.progress || 0}%` }} /></div><span className="text-xs text-slate-500">{Math.round(item.progress || 0)}%</span></div></td>
-                <td className="px-4 py-4"><div className="text-xs text-slate-300">{item.account || "Unassigned"}</div><div className="mt-1 whitespace-nowrap text-[10px] text-slate-500"><span title="Reported stream file size">{formatBytes(item.file_size_bytes)}</span><span className="mx-1.5 text-slate-700">·</span><span title="Latest reported transfer speed">{formatSpeed(item.speed_bytes_per_second)}</span></div></td><td className="px-4 py-4">{item.status === "FAILED" && <button disabled={busy} onClick={() => retry(item.id)} className="flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200"><RefreshCw size={13} />Retry</button>}{["PENDING", "DOWNLOADING", "VERIFYING"].includes(item.status) && <button disabled={busy} onClick={() => cancelDownload(item.id)} className="flex items-center gap-1.5 text-xs text-rose-300 hover:text-rose-200"><XCircle size={13} />Cancel</button>}{item.status === "CANCELLING" && <span className="text-xs text-amber-300">Cancelling…</span>}</td>
+                <td className="px-4 py-4">{item.status === "FAILED" && <div className="flex flex-col items-start gap-2"><button disabled={busy} onClick={() => cleanFailedItem(item.id)} className="flex items-center gap-1.5 text-xs text-amber-300 hover:text-amber-200"><Trash2 size={13} />Clean partial</button><button disabled={busy} onClick={() => retry(item.id)} className="flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200"><RefreshCw size={13} />Retry</button></div>}{["PENDING", "DOWNLOADING", "VERIFYING"].includes(item.status) && <button disabled={busy} onClick={() => cancelDownload(item.id)} className="flex items-center gap-1.5 text-xs text-rose-300 hover:text-rose-200"><XCircle size={13} />Cancel</button>}{item.status === "CLEANING" && <span className="text-xs text-amber-300">Cleaning storage…</span>}{item.status === "CANCELLING" && <span className="text-xs text-amber-300">Cancelling…</span>}</td>
               </tr>) : <tr><td colSpan="6" className="px-5 py-14 text-center text-slate-500">No streams discovered yet. Enable a monitored category to begin.</td></tr>}</tbody>
             </table></div>
           </section>
@@ -622,7 +629,7 @@ function LoginScreen({ busy, notice, onLogin }) {
 }
 
 function Status({ status }) {
-  const tones = { PENDING: "slate", DOWNLOADING: "blue", VERIFYING: "yellow", CANCELLING: "yellow", COMPLETED: "green", FAILED: "red", CANCELLED: "slate" };
+  const tones = { PENDING: "slate", DOWNLOADING: "blue", VERIFYING: "yellow", CLEANING: "yellow", CANCELLING: "yellow", COMPLETED: "green", FAILED: "red", CANCELLED: "slate" };
   return <Pill tone={tones[status] || "slate"}>{status}</Pill>;
 }
 

@@ -1,4 +1,5 @@
 import logging
+import json
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -285,6 +286,7 @@ def get_status():
             "pending": counts.get("PENDING", 0), "downloading": counts.get("DOWNLOADING", 0),
             "verifying": counts.get("VERIFYING", 0), "completed": counts.get("COMPLETED", 0),
             "failed": counts.get("FAILED", 0),
+            "cleaning": counts.get("CLEANING", 0),
             "cancelled": counts.get("CANCELLED", 0),
             "cancelling": counts.get("CANCELLING", 0),
         },
@@ -448,17 +450,127 @@ def retry_item(payload: RetryRequest):
             raise HTTPException(status_code=404, detail="Queue item not found.")
         if item.status != "FAILED":
             raise HTTPException(status_code=409, detail="Only failed queue items can be retried.")
+        accounts = db.scalars(
+            select(Account)
+            .where(Account.enabled.is_(True))
+            .order_by(Account.id)
+        ).all()
+        provider_url = item.source_provider_url
+        if provider_url is None:
+            previous_account = db.get(Account, item.account_id) if item.account_id else None
+            if not previous_account:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This legacy item cannot be matched to its provider account. Requeue it from the content browser.",
+                )
+            provider_url = previous_account.provider_url
+        if not provider_url.startswith("m3u:"):
+            accounts = [
+                account
+                for account in accounts
+                if account.provider_url.rstrip("/") == provider_url.rstrip("/")
+            ]
+        if not accounts:
+            raise HTTPException(
+                status_code=409,
+                detail="No enabled download account is available for this item's provider.",
+            )
+        next_account = next(
+            (account for account in accounts if account.id != item.account_id),
+            accounts[0],
+        )
         item.status = "PENDING"
-        item.account_id = None
+        item.account_id = next_account.id
         item.file_size_bytes = None
         item.speed_bytes_per_second = None
         item.progress = 0
         item.retry_after = None
         item.error = None
         item.retries = 0
+        item.attempted_account_ids = json.dumps(
+            sorted(account.id for account in accounts if account.id != next_account.id)
+        )
+        item.updated_at = utc_now()
         db.commit()
     worker_pool.wake()
     return {"ok": True}
+
+
+@app.post("/api/queue/{item_id}/cleanup")
+def cleanup_failed_queue_item(item_id: int):
+    with SessionLocal() as db:
+        item = db.get(QueueItem, item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Queue item not found.")
+        if item.status != "FAILED":
+            raise HTTPException(
+                status_code=409,
+                detail="Storage cleanup is available only for failed queue items.",
+            )
+        route = db.get(StorageRoute, item.kind)
+        node = db.get(Node, route.node_id) if route else None
+        if not node:
+            raise HTTPException(
+                status_code=409,
+                detail="Configure a storage route before cleaning this queue item.",
+            )
+        category = (
+            db.scalar(
+                select(MonitoredCategory).where(
+                    MonitoredCategory.kind == item.kind,
+                    MonitoredCategory.category_id == item.category_id,
+                )
+            )
+            if item.category_id and not (item.source_provider_url or "").startswith("m3u:")
+            else None
+        )
+        destination_root = (
+            category.destination_path
+            if category and category.destination_path
+            else node.watch_path
+        )
+        prune_empty_final_directories = not bool(
+            category and category.match_existing_series
+        )
+        match_existing_series = bool(category and category.match_existing_series)
+        file_name = item.file_name
+        item.status = "CLEANING"
+        item.retry_after = None
+        item.updated_at = utc_now()
+        db.commit()
+
+    try:
+        dispatcher.cleanup_failed_job(
+            node,
+            item_id,
+            file_name,
+            destination_root,
+            prune_empty_final_directories,
+            match_existing_series,
+        )
+    except Exception as exc:
+        logger.exception("Failed to clean remote artifacts for queue item %s", item_id)
+        with SessionLocal() as db:
+            item = db.get(QueueItem, item_id)
+            if item and item.status == "CLEANING":
+                item.status = "FAILED"
+                item.error = (
+                    f"{item.error or 'Download failed.'} "
+                    f"Storage cleanup failed ({type(exc).__name__})."
+                )[-4000:]
+                item.updated_at = utc_now()
+                db.commit()
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not clean this item's remote partial files: {type(exc).__name__}.",
+        ) from exc
+    with SessionLocal() as db:
+        item = db.get(QueueItem, item_id)
+        if item and item.status == "CLEANING":
+            item.status = "FAILED"
+            item.updated_at = utc_now()
+            db.commit()
+    return {"ok": True, "item_id": item_id}
 
 
 @app.post("/api/queue/{item_id}/cancel")
@@ -482,26 +594,31 @@ def list_accounts():
 def get_account_availability(
     content_type: Literal["SERIES", "MOVIE"],
     source_account_id: int | None = None,
+    source_playlist_id: int | None = None,
 ):
     kind = "series" if content_type == "SERIES" else "vod"
-    with SessionLocal() as db:
-        source_account = (
-            db.get(Account, source_account_id)
-            if source_account_id is not None
-            else db.scalar(
-                select(Account)
-                .where(Account.enabled.is_(True))
-                .order_by(Account.id)
-                .limit(1)
-            )
+    if (source_account_id is None) == (source_playlist_id is None):
+        raise HTTPException(
+            status_code=422,
+            detail="Select exactly one Xtream account or M3U playlist as the source.",
         )
-        if not source_account or not source_account.enabled:
-            raise HTTPException(status_code=409, detail="Add an enabled provider account first.")
+    with SessionLocal() as db:
+        source_account = db.get(Account, source_account_id) if source_account_id else None
+        playlist = db.get(M3UPlaylist, source_playlist_id) if source_playlist_id else None
+        if source_account_id is not None and (
+            not source_account or not source_account.enabled
+        ):
+            raise HTTPException(status_code=409, detail="The selected Xtream account is unavailable.")
+        if source_playlist_id is not None and (not playlist or not playlist.enabled):
+            raise HTTPException(status_code=409, detail="The selected M3U playlist is unavailable.")
         accounts = db.scalars(
-            select(Account)
-            .where(Account.enabled.is_(True))
-            .order_by(Account.id)
+            select(Account).where(Account.enabled.is_(True)).order_by(Account.id)
         ).all()
+        if source_account:
+            accounts = [
+                account for account in accounts
+                if account.provider_url.rstrip("/") == source_account.provider_url.rstrip("/")
+            ]
         account_ids = [account.id for account in accounts]
         busy_ids = set()
         if account_ids:
@@ -520,7 +637,7 @@ def get_account_availability(
             select(Proxy).where(Proxy.enabled.is_(True)).order_by(Proxy.id)
         ).all()
     return {
-        "provider_url": source_account.provider_url,
+        "provider_url": source_account.provider_url if source_account else None,
         "proxy_available": bool(enabled_proxies),
         "assigned_proxy_id": (
             assigned_proxy.id if assigned_proxy and assigned_proxy.enabled else None

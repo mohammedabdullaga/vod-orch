@@ -52,6 +52,7 @@ export default function ContentBrowser({
   const [selectedEpisodes, setSelectedEpisodes] = useState(new Map());
   const [pendingQueue, setPendingQueue] = useState(null);
   const [pendingSeries, setPendingSeries] = useState(null);
+  const [pendingMissingOnly, setPendingMissingOnly] = useState(false);
   const [availableAccounts, setAvailableAccounts] = useState([]);
   const [selectedWorkerIds, setSelectedWorkerIds] = useState(new Set());
   const [availableProxies, setAvailableProxies] = useState([]);
@@ -286,6 +287,8 @@ export default function ContentBrowser({
         : await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
           params: {
             account_id: sourceAccountId,
+            category_id: item.category_id,
+            category_name: item.category_name,
             proxy_id: providerProxyId ? Number(providerProxyId) : 0,
           },
         });
@@ -313,7 +316,9 @@ export default function ContentBrowser({
       const { data } = await api.get("/accounts/availability", {
         params: {
           content_type: type === "series" ? "SERIES" : "MOVIE",
-          ...(sourceType === "xtream" ? { source_account_id: sourceAccountId } : {}),
+          ...(sourceType === "xtream"
+            ? { source_account_id: sourceAccountId }
+            : { source_playlist_id: sourcePlaylistId }),
         },
       });
       const free = data.accounts.filter((account) => account.free);
@@ -340,7 +345,7 @@ export default function ContentBrowser({
     }
   };
 
-  const prepareSeriesQueue = async (series) => {
+  const prepareSeriesQueue = async (series, missingOnly = false) => {
     if (!nodeId) {
       setNotice(`Assign a storage server for ${nodeLabel} in Settings & Accounts before adding downloads.`);
       return;
@@ -355,7 +360,9 @@ export default function ContentBrowser({
       const { data } = await api.get("/accounts/availability", {
         params: {
           content_type: "SERIES",
-          ...(sourceType === "xtream" ? { source_account_id: sourceAccountId } : {}),
+          ...(sourceType === "xtream"
+            ? { source_account_id: sourceAccountId }
+            : { source_playlist_id: sourcePlaylistId }),
         },
       });
       const free = data.accounts.filter((account) => account.free);
@@ -365,6 +372,7 @@ export default function ContentBrowser({
       }
       setPendingQueue([]);
       setPendingSeries(series);
+      setPendingMissingOnly(missingOnly);
       setAvailableAccounts(free);
       setSelectedWorkerIds(new Set(free.map((account) => account.id)));
       const proxies = data.proxies || [];
@@ -405,6 +413,7 @@ export default function ContentBrowser({
           proxy_mode: proxyMode === "node" ? "selected" : "direct",
           proxy_id: proxyMode === "node" ? Number(selectedProxyId) : null,
           downloader,
+          missing_only: pendingMissingOnly,
           series: pendingSeries.map((item) => ({
             series_id: sourceType === "m3u" ? item.source_series_key : item.id,
             title: item.name,
@@ -420,12 +429,13 @@ export default function ContentBrowser({
           : "";
         setNotice(
           `Prepared ${data.processed_series}/${pendingSeries.length} series; `
-          + `queued ${queued} episode${queued === 1 ? "" : "s"}; `
-          + `skipped ${skipped} duplicate${skipped === 1 ? "" : "s"}; `
+          + `queued ${pendingMissingOnly ? "missing " : ""}${queued} episode${queued === 1 ? "" : "s"}; `
+          + `skipped ${skipped} existing/duplicate item${skipped === 1 ? "" : "s"}; `
           + `failed ${failed.length}.${firstFailure}`
         );
         setPendingQueue(null);
         setPendingSeries(null);
+        setPendingMissingOnly(false);
         if (queued) onQueued?.();
         return;
       }
@@ -446,6 +456,7 @@ export default function ContentBrowser({
       setNotice(`Queued ${queued} item${queued === 1 ? "" : "s"}; skipped ${skipped} duplicate${skipped === 1 ? "" : "s"}.`);
       setPendingQueue(null);
       setPendingSeries(null);
+      setPendingMissingOnly(false);
       onQueued?.();
     } catch (error) {
       setNotice(error.response?.data?.detail || "Could not queue downloads. Refresh free account availability and retry.");
@@ -457,6 +468,7 @@ export default function ContentBrowser({
   const cancelQueueConfirmation = () => {
     setPendingQueue(null);
     setPendingSeries(null);
+    setPendingMissingOnly(false);
   };
 
   const toggleWorker = (accountId) => {
@@ -483,6 +495,7 @@ export default function ContentBrowser({
         episode_num: number,
         filename: episodeFilename(season, number, ext),
         container_ext: ext,
+        on_storage: episode.on_storage ?? null,
         category_id: item.category_id,
         category_name: item.category_name,
       };
@@ -508,7 +521,12 @@ export default function ContentBrowser({
           `/playlists/${sourcePlaylistId}/series/${encodeURIComponent(item.source_series_key)}/details`,
         )
         : await api.get(`/content/series/${encodeURIComponent(item.id)}/details`, {
-          params: { account_id: sourceAccountId, proxy_id: providerProxyId ? Number(providerProxyId) : 0 },
+          params: {
+            account_id: sourceAccountId,
+            category_id: item.category_id,
+            category_name: item.category_name,
+            proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+          },
         });
       entries.push(...detailsEntries(item, data));
     }
@@ -519,9 +537,13 @@ export default function ContentBrowser({
     await prepareSeriesQueue([item]);
   };
 
+  const queueMissingSeries = async (item) => {
+    await prepareSeriesQueue([item], true);
+  };
+
   const queueSelectedTitles = async () => {
     if (!selectedTitles.length) return setNotice("Select at least one title to queue.");
-    if (type === "series") return prepareSeriesQueue(selectedTitles);
+    if (type === "series") return prepareSeriesQueue(selectedTitles, true);
     setBusy(true);
     setNotice("");
     try {
@@ -591,6 +613,18 @@ export default function ContentBrowser({
       });
       return next;
     });
+  };
+
+  const selectMissingEpisodes = () => {
+    if (!details) return;
+    const missing = detailsEntries(details.item, details.data)
+      .filter((entry) => entry.on_storage === false);
+    setSelectedEpisodes(new Map(
+      missing.map((entry) => [
+        `${details.item.id}:${entry.stream_id}`,
+        entry,
+      ]),
+    ));
   };
 
   const queueSelectedEpisodes = () => queueEntries([...selectedEpisodes.values()]);
@@ -753,7 +787,7 @@ export default function ContentBrowser({
                 <span className="text-xs text-slate-400">Selected: {selectedTitles.length} {type === "series" ? `shows · ${knownEpisodeCount} known episodes${unknownEpisodeCount ? ` · ${unknownEpisodeCount} count${unknownEpisodeCount === 1 ? "" : "s"} unavailable` : ""}` : "movies"}</span>
               </div>
               <div className="flex flex-wrap gap-2">
-                <button type="button" disabled={busy || !selectedTitles.length} onClick={queueSelectedTitles} className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/25 disabled:opacity-40"><Download size={14} />Ingest Selected via Workers</button>
+                <button type="button" disabled={busy || !selectedTitles.length} onClick={queueSelectedTitles} className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/15 px-3 py-2 text-xs font-medium text-emerald-300 hover:bg-emerald-500/25 disabled:opacity-40"><Download size={14} />{type === "series" ? "Queue Missing Episodes" : "Ingest Selected via Workers"}</button>
                 {sourceType === "xtream" && <button type="button" disabled={busy || !selectedTitles.length} onClick={exportSelectedScript} className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-400/40 bg-indigo-500/10 px-3 py-2 text-xs font-medium text-indigo-200 hover:bg-indigo-500/20 disabled:opacity-40"><Download size={14} />Export / Run as Direct Bash Script</button>}
               </div>
             </div>}
@@ -774,6 +808,7 @@ export default function ContentBrowser({
                           <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>{type === "series" ? <div className="flex gap-2">
                             <button type="button" disabled={busy} onClick={() => fetchDetails(item)} className="whitespace-nowrap rounded-lg border border-slate-700 px-2.5 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40">Inspect / Episodes</button>
                             <button type="button" disabled={busy} onClick={() => queueFullSeries(item)} title="Queue full series" className="rounded-lg bg-indigo-500/15 px-2.5 text-indigo-300 hover:bg-indigo-500/25 disabled:opacity-40"><Download size={15} /></button>
+                            <button type="button" disabled={busy} onClick={() => queueMissingSeries(item)} title="Queue only missing episodes" className="rounded-lg border border-amber-500/30 px-2.5 text-amber-300 hover:bg-amber-500/10 disabled:opacity-40"><Download size={15} /></button>
                           </div> : <button type="button" disabled={busy} onClick={() => queueEntries([{
                             stream_id: item.id, title: item.name, filename: `${item.name}.${item.container_ext || "mkv"}`,
                             container_ext: item.container_ext || "mkv", category_id: item.category_id, category_name: item.category_name,
@@ -802,6 +837,7 @@ export default function ContentBrowser({
                           {type === "series" ? <>
                             <button type="button" disabled={busy} onClick={() => fetchDetails(item)} className="flex-1 rounded-lg border border-slate-700 px-2 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40">Inspect / Episodes</button>
                             <button type="button" disabled={busy} onClick={() => queueFullSeries(item)} title="Queue full series" className="rounded-lg bg-indigo-500/15 px-3 text-indigo-300 hover:bg-indigo-500/25 disabled:opacity-40"><Download size={15} /></button>
+                            <button type="button" disabled={busy} onClick={() => queueMissingSeries(item)} title="Queue only missing episodes" className="rounded-lg border border-amber-500/30 px-3 text-amber-300 hover:bg-amber-500/10 disabled:opacity-40"><Download size={15} /></button>
                           </> : <button type="button" disabled={busy} onClick={() => queueEntries([{
                             stream_id: item.id, title: item.name, filename: `${item.name}.${item.container_ext || "mkv"}`,
                             container_ext: item.container_ext || "mkv", category_id: item.category_id, category_name: item.category_name,
@@ -846,6 +882,8 @@ export default function ContentBrowser({
                       <span className="w-14 shrink-0 font-mono text-xs text-indigo-300">E{String(episode.episode_num).padStart(2, "0")}</span>
                       <span className="min-w-0 flex-1 truncate text-sm text-slate-300">{episode.title}</span>
                       <span className="hidden text-xs text-slate-500 sm:inline">.{episode.ext}</span>
+                      {episode.on_storage === false && <span className="text-[10px] text-amber-300">Missing</span>}
+                      {episode.on_storage === true && <span className="text-[10px] text-emerald-300">On storage</span>}
                       <span className="hidden font-mono text-[10px] text-slate-600 md:inline">{episode.id}</span>
                       <button onClick={() => queueOneEpisode(details.item, details.data, episode)} title="Queue episode" disabled={busy} className="rounded-md p-2 text-indigo-300 hover:bg-indigo-500/10 disabled:opacity-40"><Download size={14} /></button>
                     </div>;
@@ -857,9 +895,12 @@ export default function ContentBrowser({
           </div>
           <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 px-5 py-4">
             <div className="min-w-0 flex-1">
-              <span className="text-xs text-slate-500">{selectedEpisodes.size} episodes selected</span>
+              <span className="text-xs text-slate-500">{selectedEpisodes.size} episodes selected · {!details.data.storage_inventory_available ? "storage inventory unavailable" : details.data.storage_inventory_ambiguous || details.data.storage_inventory_unclassified ? "missing count unknown" : `${details.data.missing_episode_count ?? 0} missing`}</span>
+              {details.data.storage_inventory_ambiguous && <p className="mt-1 text-xs text-amber-300">Multiple matching series folders were found; missing episodes cannot be safely determined.</p>}
+              {details.data.storage_inventory_unclassified && <p className="mt-1 text-xs text-amber-300">Some stored files have no recognizable season and episode number; missing episodes cannot be safely determined.</p>}
               {notice && <p role="status" className="mt-1 text-xs text-slate-300">{notice}</p>}
             </div>
+            <button type="button" onClick={selectMissingEpisodes} disabled={!details.data.storage_inventory_available || details.data.storage_inventory_ambiguous || details.data.storage_inventory_unclassified || !details.data.missing_episode_count} className="rounded-lg border border-amber-500/30 px-3 py-2.5 text-xs font-medium text-amber-300 hover:bg-amber-500/10 disabled:opacity-40">Select missing</button>
             <button onClick={queueSelectedEpisodes} disabled={busy || !selectedEpisodes.size} className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">
               {busy ? <LoaderCircle size={15} className="animate-spin" /> : <Download size={15} />}Download selected episodes
             </button>
@@ -877,7 +918,7 @@ export default function ContentBrowser({
             <div>
               <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-medium text-slate-200">Idle Xtream accounts</h3><span className="text-xs text-slate-500">{selectedWorkerIds.size} selected</span></div>
               <p className="mb-3 text-xs text-slate-500">Jobs are distributed round-robin. Each account runs at most one download at a time; selecting more free accounts increases parallel downloads.</p>
-              <p className="mb-3 text-[11px] text-indigo-300">Worker credentials are used for the stream request even when they differ from the browsing account.</p>
+              <p className="mb-3 text-[11px] text-indigo-300">{sourceType === "xtream" ? "Only accounts for the selected provider endpoint are shown; each worker uses its own credentials." : "M3U stream URLs are downloaded exactly as stored; Xtream accounts provide worker concurrency only."}</p>
               <div className="max-h-48 space-y-2 overflow-y-auto">
                 {availableAccounts.map((account) => {
                   const sortedWorkers = [...selectedWorkerIds].sort((left, right) => left - right);
@@ -934,7 +975,7 @@ export default function ContentBrowser({
             <button type="button" onClick={cancelQueueConfirmation} disabled={busy} className="rounded-lg border border-slate-700 px-4 py-2.5 text-sm text-slate-300 hover:bg-slate-800">Cancel</button>
             <button type="button" onClick={confirmQueueEntries} disabled={busy || !selectedWorkerIds.size || (proxyMode === "node" && !selectedProxyId) || wgetProxyUnsupported} className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">
               {busy ? <LoaderCircle size={15} className="animate-spin" /> : <Download size={15} />}
-              {pendingSeries ? `Prepare & queue ${pendingCount} series` : `Confirm & queue ${pendingCount} downloads`}
+              {pendingSeries ? `${pendingMissingOnly ? "Queue missing episodes from" : "Prepare & queue"} ${pendingCount} series` : `Confirm & queue ${pendingCount} downloads`}
             </button>
           </footer>
         </section>

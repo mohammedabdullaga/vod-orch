@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import threading
 from datetime import timedelta
@@ -195,20 +196,13 @@ class WorkerPool:
                 .where(
                     QueueItem.status == "PENDING",
                     QueueItem.kind.in_(select(StorageRoute.kind)),
-                    or_(
-                        QueueItem.account_id.is_(None),
-                        QueueItem.account_id == account_id,
-                    ),
-                    or_(
-                        QueueItem.account_id == account_id,
-                        QueueItem.source_provider_url == account.provider_url,
-                        QueueItem.source_provider_url.is_(None),
-                    ),
                 )
                 .order_by(QueueItem.created_at, QueueItem.id)
             ).all()
             candidate = None
             for item in candidates:
+                if item.account_id not in (None, account_id):
+                    continue
                 if item.source_provider_url is None:
                     try:
                         stored_url = decrypt_secret(item.stream_url_encrypted)
@@ -231,6 +225,26 @@ class WorkerPool:
                         continue
                     item.source_provider_url = account.provider_url
                     db.flush()
+                elif not item.source_provider_url.startswith("m3u:"):
+                    if item.source_provider_url.rstrip("/") != account.provider_url.rstrip("/"):
+                        continue
+                try:
+                    attempted_account_ids = {
+                        int(value) for value in json.loads(item.attempted_account_ids or "[]")
+                    }
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    logger.error(
+                        "Queue item %s has invalid attempted-account history; refusing to claim it.",
+                        item.id,
+                    )
+                    item.status = "FAILED"
+                    item.error = "Invalid account retry history; inspect the queue record before retrying."
+                    item.retry_after = None
+                    item.updated_at = utc_now()
+                    db.flush()
+                    continue
+                if account_id in attempted_account_ids:
+                    continue
                 candidate = item
                 break
             if candidate is None:
@@ -245,7 +259,11 @@ class WorkerPool:
                     file_size_bytes=None,
                     speed_bytes_per_second=None,
                     account_id=account_id,
+                    attempted_account_ids=json.dumps(
+                        sorted(attempted_account_ids | {account_id})
+                    ),
                     error=None,
+                    updated_at=utc_now(),
                 )
             )
             if claimed.rowcount != 1:
@@ -263,6 +281,10 @@ class WorkerPool:
         try:
             with SessionLocal() as db:
                 statuses = db.scalars(select(QueueItem.status)).all()
+                if any(status == "CLEANING" for status in statuses):
+                    raise RuntimeError(
+                        "A failed-item storage cleanup is in progress; wait for it to finish."
+                    )
                 pending_count = sum(status == "PENDING" for status in statuses)
                 active_count = sum(
                     status in ("DOWNLOADING", "VERIFYING", "CANCELLING")
@@ -331,18 +353,68 @@ class WorkerPool:
 
     @staticmethod
     def _release_due_retries(db, now) -> None:
-        due = db.scalars(
-            select(QueueItem).where(
+        due = db.execute(
+            select(
+                QueueItem.id,
+                QueueItem.attempted_account_ids,
+                QueueItem.source_provider_url,
+            ).where(
                 QueueItem.status == "FAILED",
                 QueueItem.retry_after.is_not(None),
                 QueueItem.retry_after <= now,
                 QueueItem.retries < settings.max_retries,
             )
         ).all()
-        for item in due:
-            item.status = "PENDING"
-            item.account_id = None
-            item.retry_after = None
+        for item_id, history, source_provider_url in due:
+            try:
+                attempted_account_ids = {
+                    int(value) for value in json.loads(history or "[]")
+                }
+            except (json.JSONDecodeError, TypeError, ValueError):
+                db.execute(
+                    update(QueueItem)
+                    .where(
+                        QueueItem.id == item_id,
+                        QueueItem.status == "FAILED",
+                        QueueItem.retry_after <= now,
+                    )
+                    .values(
+                        retry_after=None,
+                        error="Invalid account retry history; inspect the queue record before retrying.",
+                        updated_at=utc_now(),
+                    )
+                )
+                continue
+            accounts_query = select(Account.id, Account.provider_url).where(
+                Account.enabled.is_(True)
+            )
+            if source_provider_url and not source_provider_url.startswith("m3u:"):
+                eligible_accounts = [
+                    account_id
+                    for account_id, provider_url in db.execute(accounts_query).all()
+                    if provider_url.rstrip("/") == source_provider_url.rstrip("/")
+                ]
+            else:
+                eligible_accounts = list(db.scalars(accounts_query.with_only_columns(Account.id)).all())
+            available_account_ids = set(eligible_accounts)
+            if not available_account_ids - attempted_account_ids:
+                attempted_account_ids = set()
+            db.execute(
+                update(QueueItem)
+                .where(
+                    QueueItem.id == item_id,
+                    QueueItem.status == "FAILED",
+                    QueueItem.retry_after <= now,
+                )
+                .values(
+                    status="PENDING",
+                    account_id=None,
+                    attempted_account_ids=json.dumps(sorted(attempted_account_ids)),
+                    retry_after=None,
+                    error=None,
+                    updated_at=utc_now(),
+                )
+            )
         if due:
             db.commit()
 
@@ -386,7 +458,9 @@ class WorkerPool:
                     )
                     return
                 file_name = item.file_name
-                if item.provider_stream_id:
+                if item.provider_stream_id and not (
+                    item.source_provider_url or ""
+                ).startswith("m3u:"):
                     extension = safe_extension(file_name.rsplit(".", 1)[-1])
                     stream_url_value = stream_url(
                         account, item.kind, item.provider_stream_id, extension
@@ -539,6 +613,15 @@ class WorkerPool:
                 item.status = "FAILED"
                 item.progress = 0
                 item.retries += 1
+                if item.retries >= settings.max_retries:
+                    message = (
+                        f"{message} Automatic retry limit reached; use Retry to start a new cycle."
+                    )
                 item.error = message[-4000:]
-                item.retry_after = utc_now() + timedelta(seconds=min(3600, 30 * (2 ** max(0, item.retries - 1))))
+                item.retry_after = (
+                    None
+                    if item.retries >= settings.max_retries
+                    else utc_now()
+                    + timedelta(seconds=min(3600, 30 * (2 ** max(0, item.retries - 1))))
+                )
                 db.commit()

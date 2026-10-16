@@ -24,6 +24,9 @@ class Settings:
     max_retries: int = int(os.getenv("MAX_RETRIES", "5"))
     request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
     remote_job_timeout_seconds: int = int(os.getenv("REMOTE_JOB_TIMEOUT_SECONDS", "86400"))
+    remote_download_idle_timeout_seconds: int = int(
+        os.getenv("REMOTE_DOWNLOAD_IDLE_TIMEOUT_SECONDS", "300")
+    )
     default_axel_connections: int = int(os.getenv("DEFAULT_AXEL_CONNECTIONS", "12"))
     known_hosts_path: str = os.getenv("SSH_KNOWN_HOSTS", "")
     admin_username: str = os.getenv("ADMIN_USERNAME", "")
@@ -42,6 +45,8 @@ class Settings:
             raise ValueError("DEFAULT_AXEL_CONNECTIONS must be between 1 and 12.")
         if self.provider_series_details_interval_seconds < 0:
             raise ValueError("PROVIDER_SERIES_DETAILS_INTERVAL_SECONDS cannot be negative.")
+        if self.remote_download_idle_timeout_seconds < 1:
+            raise ValueError("REMOTE_DOWNLOAD_IDLE_TIMEOUT_SECONDS must be positive.")
 
 
 settings = Settings()

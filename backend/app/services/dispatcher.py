@@ -97,6 +97,7 @@ class RemoteDispatcher:
         cancel_remote: Callable[[], None] | None = None,
         on_transfer_metrics: Callable[[float | None, float | None, int | None], None] | None = None,
         max_output_bytes: int = 65536,
+        idle_timeout_seconds: int | None = None,
     ) -> str:
         if max_output_bytes < 1:
             raise ValueError("Remote command output limit must be positive.")
@@ -105,6 +106,7 @@ class RemoteDispatcher:
         output = bytearray()
         error_output = bytearray()
         started = time.monotonic()
+        last_transfer_at = started
         last_metrics: tuple[float | None, float | None, int | None] = (None, None, None)
         last_metrics_at = 0.0
         while not channel.exit_status_ready():
@@ -120,6 +122,14 @@ class RemoteDispatcher:
                 raise TimeoutError(
                     f"Remote command exceeded {self.command_timeout_seconds} seconds."
                 )
+            if (
+                idle_timeout_seconds is not None
+                and time.monotonic() - last_transfer_at > idle_timeout_seconds
+            ):
+                channel.close()
+                raise TimeoutError(
+                    f"Remote download had no transfer progress for {idle_timeout_seconds} seconds."
+                )
             if channel.recv_ready():
                 output.extend(channel.recv(65536))
                 del output[:-max_output_bytes]
@@ -129,6 +139,8 @@ class RemoteDispatcher:
             parsed_progress, speed, file_size = _parse_transfer_metrics(output + error_output)
             metrics = (parsed_progress, speed, file_size)
             now = time.monotonic()
+            if speed is not None and speed > 0:
+                last_transfer_at = now
             if parsed_progress is not None and progress:
                 progress(parsed_progress)
             if (
@@ -226,6 +238,59 @@ class RemoteDispatcher:
         if any(record for record in records[offset:]):
             raise RuntimeError("Remote library inventory contained unexpected data.")
         return entries
+
+    def cleanup_failed_job(
+        self,
+        node: Node,
+        job_id: int,
+        file_name: str,
+        destination_root: str | None = None,
+        prune_empty_final_directories: bool = True,
+        match_existing_series: bool = False,
+    ) -> None:
+        relative_path = PurePosixPath(file_name)
+        if (
+            relative_path.is_absolute()
+            or not relative_path.parts
+            or any(part in ("", ".", "..") for part in relative_path.parts)
+            or "\\" in file_name
+        ):
+            raise ValueError("Content destination must be a safe relative POSIX path.")
+        if match_existing_series:
+            if len(relative_path.parts) < 3:
+                raise ValueError("Series destination path is invalid for folder matching.")
+            relative_path = PurePosixPath(*relative_path.parts[-2:])
+
+        staging_job_dir = str(PurePosixPath(node.staging_path) / relative_path.parent)
+        staging_file = str(
+            PurePosixPath(staging_job_dir) / f"{relative_path.name}.part-{job_id}"
+        )
+        pid_file = f"{staging_file}.pid"
+        state_file = f"{staging_file}.st"
+        root = PurePosixPath(destination_root or node.watch_path)
+        final_directory = PurePosixPath(root) / relative_path.parent
+        if final_directory.parts[:len(root.parts)] != root.parts:
+            raise ValueError("Content destination is outside the configured storage root.")
+
+        self._terminate_remote_process(node, pid_file)
+        cleanup_parts = [
+            f"rm -f -- {shlex.quote(staging_file)} {shlex.quote(state_file)} "
+            f"{shlex.quote(pid_file)}",
+            f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}",
+        ]
+        if prune_empty_final_directories:
+            current = final_directory
+            while current != root and current.parts[:len(root.parts)] == root.parts:
+                cleanup_parts.append(
+                    f"rmdir --ignore-fail-on-non-empty {shlex.quote(str(current))}"
+                )
+                current = current.parent
+
+        client = self._connect(node)
+        try:
+            self._run(client, " && ".join(cleanup_parts))
+        finally:
+            client.close()
 
     def dispatch(
         self,
@@ -396,6 +461,7 @@ class RemoteDispatcher:
                     cancel_event,
                     lambda: self._terminate_remote_process(node, pid_file),
                     on_transfer_metrics,
+                    idle_timeout_seconds=settings.remote_download_idle_timeout_seconds,
                 )
                 if cancel_event and cancel_event.is_set():
                     raise DispatchCancelled("Download cancelled by request.")

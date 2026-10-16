@@ -180,6 +180,7 @@ class QueueItem(Base):
     )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     retries: Mapped[int] = mapped_column(Integer, default=0)
+    attempted_account_ids: Mapped[str] = mapped_column(Text, default="[]")
     retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
@@ -240,6 +241,7 @@ def init_db() -> None:
                 "final_path": "TEXT",
                 "file_size_bytes": "INTEGER",
                 "speed_bytes_per_second": "FLOAT",
+                "attempted_account_ids": "TEXT NOT NULL DEFAULT '[]'",
             },
             "nodes": {
                 "name": "VARCHAR(255) NOT NULL DEFAULT 'Storage server'",
