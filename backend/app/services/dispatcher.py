@@ -77,9 +77,9 @@ class RemoteDispatcher:
                 port=node.port,
                 username=node.username,
                 key_filename=node.private_key_path,
-                timeout=15,
-                banner_timeout=15,
-                auth_timeout=15,
+                timeout=10,
+                banner_timeout=10,
+                auth_timeout=10,
                 look_for_keys=False,
                 allow_agent=False,
             )
@@ -106,7 +106,7 @@ class RemoteDispatcher:
         if max_output_bytes < 1:
             raise ValueError("Remote command output limit must be positive.")
         _, stdout, _ = client.exec_command(
-            command, get_pty=False, timeout=15
+            command, get_pty=False, timeout=10
         )
         channel = stdout.channel
         output = bytearray()
@@ -423,7 +423,7 @@ class RemoteDispatcher:
             q_state_file = shlex.quote(state_file)
             prepare = (
                 f"mkdir -p {shlex.quote(staging_job_dir)} {shlex.quote(final_dir)} "
-                f"&& chmod 0755 {shlex.quote(final_dir)} "
+                f"&& chmod 0755 {shlex.quote(staging_job_dir)} {shlex.quote(final_dir)} "
                 f"&& rm -f -- {q_stage} {q_state_file} {shlex.quote(pid_file)}"
             )
             run_remote(
@@ -458,14 +458,14 @@ class RemoteDispatcher:
                 download = (
                     f"http_proxy={safe_proxy} https_proxy={safe_proxy} "
                     f"HTTP_PROXY={safe_proxy} HTTPS_PROXY={safe_proxy} "
-                    f"axel -n {axel_connections} -o {q_stage} "
+                    f"axel -q -n {axel_connections} -o {q_stage} "
                     f"--user-agent={q_ua} {q_url}"
                 )
             elif proxy_url:
                 raise RuntimeError("Proxy URL scheme must be http, https, or socks5.")
             else:
                 download = (
-                    f"axel -n {axel_connections} -o {q_stage} "
+                    f"axel -q -n {axel_connections} -o {q_stage} "
                     f"--user-agent={q_ua} {q_url}"
                 )
             remote_download = (

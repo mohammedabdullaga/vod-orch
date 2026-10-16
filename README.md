@@ -275,6 +275,7 @@ If the dashboard and API are served from different browser origins, set `CORS_OR
 | `POST` | `/api/queue/retry` | Retry a failed item |
 | `POST` | `/api/queue/{item_id}/cancel` | Cancel a pending or active download |
 | `POST` | `/api/queue/stop-all-and-clear` | Stop active jobs and hide all queue entries without deleting media files |
+| `POST` | `/api/tasks/purge-history` | Delete selected queue history and reconcile stale worker state |
 | `GET` | `/api/content/categories?type=series\|movie` | Provider categories and watch state |
 | `GET` | `/api/content/items?type=series\|movie&category_ids=1,2` | Titles in selected categories |
 | `GET` | `/api/content/series/{series_id}/details` | Seasons and normalized episode metadata |
@@ -302,11 +303,12 @@ The interactive OpenAPI documentation is at `/docs` on the API origin; keep it b
 
 - A worker is created for each enabled provider account and reconciled on every worker-pool poll; adding an account wakes the pool immediately. Each queue item is claimed by one idle worker for the same provider endpoint, and its stream URL is rebuilt with that worker's credentials.
 - Manual browser queue requests wake the account worker immediately and use the same provider/type/stream identity and safe destination layout as polled items. Repeated queued/completed items are reported as skipped.
-- On daemon startup, interrupted `DOWNLOADING` and `VERIFYING` jobs are reset to `PENDING` for recovery.
+- On daemon startup and every 15 seconds, the worker pool reconciles interrupted or orphaned active jobs. Recovered jobs return to `PENDING` with their attempted-account history cleared, so an account that previously claimed the task cannot strand it. Account busy state is in-memory; reconciliation releases stale worker flags rather than updating a persisted account lease.
 - Xtream catalog sync runs in a VPS backend worker and persists its cache, status, and progress in SQLite; the dashboard polls progress instead of holding a Cloudflare-proxied request open. Interrupted syncs are re-queued from the beginning after daemon restart. M3U imports remain supported by legacy API routes but are not exposed in the primary dashboard.
 - Queue stream IDs are unique. Existing queue items are not re-created when polled again.
 - Failed jobs are retried with exponential backoff up to `MAX_RETRIES`; manual retry is also available.
 - **Stop all & clear all** cancels active work, cancels pending work and hides every queue entry. Records remain internally as deduplication tombstones; completed media files are never deleted by this action. Monitored categories remain enabled and can enqueue future new streams.
+- **Clean Task History & Reset Queue** in Settings can delete all history, only failed/completed items, only pending items, or reconcile stale worker state without deleting task records. Active jobs selected by the cleanup are cancelled first, and their staging artifacts are cleaned before their records are deleted. Completed media is preserved.
 - SSH host-key checking is strict. The daemon must trust the storage server key before a test or download can succeed.
 - The remote node needs `axel`, `aria2c` for SOCKS5, and `ffprobe`. Remote SSH egress and provider/proxy network policy must allow the requested stream.
 - Back up both `backend/ingestion.db` and the encryption key securely.

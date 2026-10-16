@@ -528,6 +528,16 @@ class RetryRequest(BaseModel):
     item_id: int
 
 
+class PurgeTaskHistoryRequest(BaseModel):
+    scope: Literal[
+        "all",
+        "failed_and_completed",
+        "stuck_pending",
+        "none",
+    ]
+    force_reset_account_busy_states: bool = False
+
+
 @app.post("/api/queue/retry")
 def retry_item(payload: RetryRequest):
     with SessionLocal() as db:
@@ -584,6 +594,21 @@ def retry_item(payload: RetryRequest):
         db.commit()
     worker_pool.wake()
     return {"ok": True}
+
+
+@app.post("/api/tasks/purge-history")
+async def purge_task_history(payload: PurgeTaskHistoryRequest):
+    try:
+        return await worker_pool.purge_history(
+            payload.scope,
+            payload.force_reset_account_busy_states,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
 
 
 @app.post("/api/queue/{item_id}/cleanup")

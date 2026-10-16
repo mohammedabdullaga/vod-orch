@@ -223,6 +223,8 @@ class QueueItem(Base):
     account_id: Mapped[int | None] = mapped_column(
         ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True
     )
+    remote_node_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    remote_match_existing_series: Mapped[bool] = mapped_column(Boolean, default=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     dispatched_command: Mapped[str | None] = mapped_column(Text, nullable=True)
     task_log: Mapped[str] = mapped_column(Text, default="")
@@ -291,6 +293,8 @@ def init_db() -> None:
                 "file_size_bytes": "INTEGER",
                 "speed_bytes_per_second": "FLOAT",
                 "attempted_account_ids": "TEXT NOT NULL DEFAULT '[]'",
+                "remote_node_id": "INTEGER",
+                "remote_match_existing_series": "BOOLEAN NOT NULL DEFAULT 0",
                 "dispatched_command": "TEXT",
                 "task_log": "TEXT NOT NULL DEFAULT ''",
                 "task_log_offset": "INTEGER NOT NULL DEFAULT 0",

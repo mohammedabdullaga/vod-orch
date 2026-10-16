@@ -60,6 +60,12 @@ function App() {
   const [status, setStatus] = useState(null);
   const [queue, setQueue] = useState([]);
   const [logTask, setLogTask] = useState(null);
+  const [purgeDialogOpen, setPurgeDialogOpen] = useState(false);
+  const [purgeOptions, setPurgeOptions] = useState({
+    clearFailedCompleted: true,
+    clearPending: false,
+    resetAccountBusyStates: false,
+  });
   const [categories, setCategories] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [catalogSyncJobs, setCatalogSyncJobs] = useState({});
@@ -260,6 +266,32 @@ function App() {
       () => api.post("/queue/stop-all-and-clear"),
       ({ data }) => `Stopped ${data.active_cancelled_count} active and cancelled ${data.pending_cancelled_count} pending download${data.pending_cancelled_count === 1 ? "" : "s"}; cleared ${data.cleared_count} queue entr${data.cleared_count === 1 ? "y" : "ies"}. Downloaded media files were kept.`,
     );
+  };
+  const purgeTaskHistory = async () => {
+    const scope = purgeOptions.clearFailedCompleted && purgeOptions.clearPending
+      ? "all"
+      : purgeOptions.clearFailedCompleted
+        ? "failed_and_completed"
+        : purgeOptions.clearPending
+          ? "stuck_pending"
+          : "none";
+    setBusy(true);
+    setNotice("");
+    try {
+      const { data } = await api.post("/tasks/purge-history", {
+        scope,
+        force_reset_account_busy_states: purgeOptions.resetAccountBusyStates,
+      });
+      await refresh();
+      setNotice(
+        `${data.message} Deleted ${data.deleted_tasks_count} task${data.deleted_tasks_count === 1 ? "" : "s"}.`
+      );
+      setPurgeDialogOpen(false);
+    } catch (error) {
+      setNotice(error.response?.data?.detail || error.message || "Could not clean task history.");
+    } finally {
+      setBusy(false);
+    }
   };
   const addAccount = (event) => {
     event.preventDefault();
@@ -620,8 +652,43 @@ function App() {
               </form>
             </div>
           </section>
+          <section className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-rose-900/60 bg-rose-950/15 p-5 lg:col-span-2">
+            <div>
+              <h2 className="font-semibold text-rose-200">Queue &amp; Task History Management</h2>
+              <p className="mt-1 max-w-3xl text-xs leading-relaxed text-slate-400">Remove selected queue records and reconcile stale worker state. Active work is stopped before its records are removed; completed media files are never deleted.</p>
+            </div>
+            <button type="button" onClick={() => setPurgeDialogOpen(true)} disabled={busy} className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-rose-700/70 bg-rose-950/40 px-4 py-2.5 text-xs font-semibold text-rose-200 hover:bg-rose-900/50 disabled:opacity-40">
+              <Trash2 size={14} />Clean Task History &amp; Reset Queue
+            </button>
+          </section>
         </div>}
       </main>
+      {purgeDialogOpen && <div className="fixed inset-0 z-40 grid place-items-center bg-black/75 p-5" role="dialog" aria-modal="true" aria-labelledby="purge-history-title">
+        <section className="w-full max-w-lg rounded-2xl border border-rose-900/70 bg-[#0d1320] p-6 shadow-2xl">
+          <h2 id="purge-history-title" className="text-lg font-semibold text-rose-200">Clean task history and reset queue</h2>
+          <p className="mt-2 text-sm leading-relaxed text-slate-400">Choose what to remove. Active downloads selected for removal will be cancelled and their remote staging files cleaned first. Final media files are preserved.</p>
+          <div className="mt-5 space-y-3">
+            <label className="flex items-start gap-3 rounded-lg border border-slate-800 p-3 text-sm text-slate-200">
+              <input type="checkbox" checked={purgeOptions.clearFailedCompleted} onChange={(event) => setPurgeOptions((current) => ({ ...current, clearFailedCompleted: event.target.checked }))} className="mt-1 accent-rose-500" />
+              <span><span className="block font-medium">Clear completed &amp; failed tasks</span><span className="mt-1 block text-xs text-slate-500">Removes their queue records and their deduplication history.</span></span>
+            </label>
+            <label className="flex items-start gap-3 rounded-lg border border-slate-800 p-3 text-sm text-slate-200">
+              <input type="checkbox" checked={purgeOptions.clearPending} onChange={(event) => setPurgeOptions((current) => ({ ...current, clearPending: event.target.checked }))} className="mt-1 accent-rose-500" />
+              <span><span className="block font-medium">Clear stuck / pending tasks</span><span className="mt-1 block text-xs text-slate-500">Deletes pending items instead of leaving them queued.</span></span>
+            </label>
+            <label className="flex items-start gap-3 rounded-lg border border-slate-800 p-3 text-sm text-slate-200">
+              <input type="checkbox" checked={purgeOptions.resetAccountBusyStates} onChange={(event) => setPurgeOptions((current) => ({ ...current, resetAccountBusyStates: event.target.checked }))} className="mt-1 accent-rose-500" />
+              <span><span className="block font-medium">Force reset account busy states</span><span className="mt-1 block text-xs text-slate-500">Reconciles orphaned active task leases and stale in-memory worker flags; live tasks remain assigned until cancelled or finished.</span></span>
+            </label>
+          </div>
+          {purgeOptions.clearFailedCompleted && purgeOptions.clearPending && <p className="mt-4 rounded-lg border border-amber-800/60 bg-amber-950/20 p-3 text-xs text-amber-200">Both cleanup scopes are selected: this removes all queue history and cancels active downloads before deleting their records.</p>}
+          {!purgeOptions.clearFailedCompleted && !purgeOptions.clearPending && !purgeOptions.resetAccountBusyStates && <p className="mt-4 text-xs text-rose-300">Select at least one maintenance action.</p>}
+          <div className="mt-6 flex justify-end gap-2">
+            <button type="button" disabled={busy} onClick={() => setPurgeDialogOpen(false)} className="secondary">Cancel</button>
+            <button type="button" disabled={busy || (!purgeOptions.clearFailedCompleted && !purgeOptions.clearPending && !purgeOptions.resetAccountBusyStates)} onClick={purgeTaskHistory} className="inline-flex items-center gap-2 rounded-lg bg-rose-700 px-4 py-2.5 text-xs font-semibold text-white hover:bg-rose-600 disabled:opacity-40">{busy ? "Cleaning…" : "Confirm cleanup"}</button>
+          </div>
+        </section>
+      </div>}
       {logTask && <TaskLogViewer
         key={logTask.id}
         task={logTask}

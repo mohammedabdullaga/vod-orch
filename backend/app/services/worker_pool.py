@@ -6,7 +6,7 @@ import threading
 import time
 from datetime import timedelta
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import delete, select, update
 
 from app.config import settings
 from app.models import (
@@ -66,34 +66,44 @@ class WorkerPool:
     async def _manage(self) -> None:
         next_reconciliation = time.monotonic() + 15
         while not self._stopping.is_set():
-            self._manager_wakeup.clear()
-            with SessionLocal() as db:
-                account_ids = set(db.scalars(
-                    select(Account.id).where(Account.enabled.is_(True))
-                ).all())
-            for account_id, task in list(self._workers.items()):
-                if task.done():
-                    self._workers.pop(account_id)
+            try:
+                self._manager_wakeup.clear()
+                with SessionLocal() as db:
+                    account_ids = set(db.scalars(
+                        select(Account.id).where(Account.enabled.is_(True))
+                    ).all())
+                for account_id, task in list(self._workers.items()):
+                    if task.done():
+                        self._workers.pop(account_id)
+                        self._wakeups.pop(account_id, None)
+                        if not task.cancelled():
+                            error = task.exception()
+                            if error:
+                                logger.error(
+                                    "Account worker %s stopped unexpectedly: %s",
+                                    account_id,
+                                    error,
+                                )
+                for account_id in account_ids - self._workers.keys():
+                    wakeup = asyncio.Event()
+                    self._wakeups[account_id] = wakeup
+                    self._workers[account_id] = asyncio.create_task(
+                        self._account_worker(account_id, wakeup),
+                        name=f"account-worker-{account_id}",
+                    )
+                    wakeup.set()
+                for account_id in self._workers.keys() - account_ids:
+                    if account_id in self._busy_accounts:
+                        continue
+                    self._workers.pop(account_id).cancel()
                     self._wakeups.pop(account_id, None)
-                    if not task.cancelled():
-                        error = task.exception()
-                        if error:
-                            logger.error("Account worker %s stopped unexpectedly: %s", account_id, error)
-            for account_id in account_ids - self._workers.keys():
-                wakeup = asyncio.Event()
-                self._wakeups[account_id] = wakeup
-                self._workers[account_id] = asyncio.create_task(
-                    self._account_worker(account_id, wakeup), name=f"account-worker-{account_id}"
-                )
-                wakeup.set()
-            for account_id in self._workers.keys() - account_ids:
-                if account_id in self._busy_accounts:
-                    continue
-                self._workers.pop(account_id).cancel()
-                self._wakeups.pop(account_id, None)
-            if time.monotonic() >= next_reconciliation:
-                self._reconcile_orphaned_jobs()
-                next_reconciliation = time.monotonic() + 15
+                if time.monotonic() >= next_reconciliation:
+                    self._reconcile_worker_state()
+                    next_reconciliation = time.monotonic() + 15
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Worker pool loop crashed: %s", str(exc))
             try:
                 await asyncio.wait_for(
                     self._manager_wakeup.wait(),
@@ -104,42 +114,56 @@ class WorkerPool:
 
     async def _account_worker(self, account_id: int, wakeup: asyncio.Event) -> None:
         while not self._stopping.is_set():
-            wakeup.clear()
-            if account_id in self._busy_accounts:
-                logger.error("Account %s worker attempted to claim concurrent work.", account_id)
-                try:
-                    await asyncio.wait_for(wakeup.wait(), timeout=settings.worker_poll_seconds)
-                except asyncio.TimeoutError:
-                    pass
-                continue
-            item_id = self._claim_next(account_id)
-            if item_id is None:
-                try:
-                    await asyncio.wait_for(
-                        wakeup.wait(), timeout=settings.worker_poll_seconds
-                    )
-                except asyncio.TimeoutError:
-                    pass
-                continue
-            self.active_count += 1
-            self._busy_accounts.add(account_id)
-            self._active_jobs[account_id] = item_id
             try:
-                await self._process(account_id, item_id)
-            except Exception as exc:
-                logger.exception("Account worker %s could not process queue item %s", account_id, item_id)
+                wakeup.clear()
+                if account_id in self._busy_accounts:
+                    logger.error(
+                        "Account %s worker attempted to claim concurrent work.",
+                        account_id,
+                    )
+                    await self._wait_for_wakeup(wakeup)
+                    continue
+                item_id = self._claim_next(account_id)
+                if item_id is None:
+                    await self._wait_for_wakeup(wakeup)
+                    continue
+                self.active_count += 1
+                self._busy_accounts.add(account_id)
+                self._active_jobs[account_id] = item_id
                 try:
-                    self._fail(item_id, str(exc))
-                except Exception:
+                    await self._process(account_id, item_id)
+                except Exception as exc:
                     logger.exception(
-                        "Could not record failure for queue item %s; releasing it for another worker",
+                        "Account worker %s could not process queue item %s",
+                        account_id,
                         item_id,
                     )
-                    self._release_claim(item_id, account_id)
-            finally:
-                self._busy_accounts.discard(account_id)
-                self._active_jobs.pop(account_id, None)
-                self.active_count -= 1
+                    try:
+                        self._fail(item_id, str(exc))
+                    except Exception:
+                        logger.exception(
+                            "Could not record failure for queue item %s; "
+                            "releasing it for another worker",
+                            item_id,
+                        )
+                        self._release_claim(item_id, account_id)
+                finally:
+                    self._busy_accounts.discard(account_id)
+                    self._active_jobs.pop(account_id, None)
+                    self.active_count = len(self._busy_accounts)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Worker pool loop crashed: %s", str(exc))
+                await asyncio.sleep(max(1, settings.worker_poll_seconds))
+
+    async def _wait_for_wakeup(self, wakeup: asyncio.Event) -> None:
+        try:
+            await asyncio.wait_for(
+                wakeup.wait(), timeout=max(1, settings.worker_poll_seconds)
+            )
+        except asyncio.TimeoutError:
+            pass
 
     def wake(self) -> None:
         if self._loop and self._loop.is_running():
@@ -180,55 +204,102 @@ class WorkerPool:
 
     @staticmethod
     def _recover_interrupted_jobs() -> None:
+        recovered_statuses = ("DOWNLOADING", "VERIFYING")
         with SessionLocal() as db:
-            result = db.execute(
-                update(QueueItem)
-                .where(QueueItem.status.in_(("DOWNLOADING", "VERIFYING")))
-                .values(
-                    status="PENDING",
-                    account_id=None,
-                    progress=0,
-                    speed_bytes_per_second=None,
-                    error=None,
-                    retry_after=None,
-                    updated_at=utc_now(),
-                )
-            )
-            db.commit()
-        if result.rowcount:
-            logger.warning("Reset %s interrupted queue jobs to PENDING.", result.rowcount)
-
-    def _reconcile_orphaned_jobs(self) -> None:
-        with SessionLocal() as db:
-            active_items = db.scalars(
-                select(QueueItem).where(
-                    QueueItem.status.in_(("DOWNLOADING", "VERIFYING"))
-                )
+            interrupted = db.scalars(
+                select(QueueItem).where(QueueItem.status.in_(recovered_statuses))
             ).all()
-            recovered = 0
-            for item in active_items:
-                if self._active_jobs.get(item.account_id) == item.id:
-                    continue
-                message = (
-                    "Worker state was lost while the task was active; "
-                    "the task was returned to the queue by the 15-second watchdog."
-                )
+            message = (
+                "The service restarted while this task was active; "
+                "it was returned to the pending queue."
+            )
+            for item in interrupted:
                 item.status = "PENDING"
                 item.account_id = None
                 item.progress = 0
                 item.speed_bytes_per_second = None
                 item.attempted_account_ids = "[]"
-                item.last_error = message
                 item.error = message
+                item.last_error = message
+                item.task_log = (item.task_log + f"\n{message}\n")[-_TASK_LOG_LIMIT:]
+                item.task_log_offset += len(f"\n{message}\n")
+                item.retry_after = None
+                item.updated_at = utc_now()
+            db.commit()
+        if interrupted:
+            logger.warning(
+                "Reset %s interrupted queue jobs to PENDING.",
+                len(interrupted),
+            )
+
+    def _reconcile_orphaned_jobs(self) -> None:
+        self._reconcile_worker_state()
+
+    def _reconcile_worker_state(self) -> int:
+        with self._cancel_lock:
+            cancel_event_ids = set(self._cancel_events)
+        with SessionLocal() as db:
+            active_items = db.scalars(
+                select(QueueItem).where(
+                    QueueItem.status.in_(("DOWNLOADING", "VERIFYING", "CANCELLING"))
+                )
+            ).all()
+            live_active_by_id = {
+                item.id: item.account_id for item in active_items
+            }
+            recovered = 0
+            for item in active_items:
+                if (
+                    self._active_jobs.get(item.account_id) == item.id
+                    and item.account_id in self._busy_accounts
+                    and item.id in cancel_event_ids
+                ):
+                    continue
+                message = (
+                    "Worker lease was not associated with a live task; "
+                    "the task was reconciled by the scheduler."
+                )
+                if item.status == "CANCELLING":
+                    item.status = "CANCELLED"
+                    item.error = "Cancelled after the worker lease was lost."
+                else:
+                    item.status = "PENDING"
+                    item.error = message
+                    item.attempted_account_ids = "[]"
+                item.account_id = None
+                item.progress = 0
+                item.speed_bytes_per_second = None
+                item.last_error = message
                 item.task_log = (item.task_log + f"\n{message}\n")[-_TASK_LOG_LIMIT:]
                 item.task_log_offset += len(f"\n{message}\n")
                 item.updated_at = utc_now()
                 recovered += 1
             if recovered:
                 db.commit()
-        if recovered:
-            logger.warning("Watchdog reset %s orphaned queue tasks to PENDING.", recovered)
+        stale_accounts = [
+            account_id
+            for account_id in self._busy_accounts
+            if account_id not in self._active_jobs
+            or live_active_by_id.get(self._active_jobs[account_id]) != account_id
+            or self._active_jobs[account_id] not in cancel_event_ids
+        ]
+        for account_id in stale_accounts:
+            item_id = self._active_jobs.pop(account_id, None)
+            self._busy_accounts.discard(account_id)
+            if item_id is not None:
+                with self._cancel_lock:
+                    cancel_event = self._cancel_events.get(item_id)
+                if cancel_event:
+                    cancel_event.set()
+        self.active_count = len(self._busy_accounts)
+        if recovered or stale_accounts:
+            logger.warning(
+                "Reconciled %s orphaned tasks and %s stale account worker flags.",
+                recovered,
+                len(stale_accounts),
+            )
             self.wake()
+        return recovered + len(stale_accounts)
 
     def _claim_next(self, account_id: int) -> int | None:
         if self._clearing_queue:
@@ -294,7 +365,23 @@ class WorkerPool:
                     db.flush()
                     continue
                 if account_id in attempted_account_ids:
-                    continue
+                    eligible_account_ids = set(db.scalars(
+                        select(Account.id).where(Account.enabled.is_(True))
+                    ).all())
+                    if (
+                        item.source_provider_url
+                        and not item.source_provider_url.startswith("m3u:")
+                        and item.provider_stream_id is None
+                    ):
+                        eligible_account_ids = set(db.scalars(
+                            select(Account.id).where(
+                                Account.enabled.is_(True),
+                                Account.provider_url == item.source_provider_url,
+                            )
+                        ).all())
+                    if eligible_account_ids - attempted_account_ids:
+                        continue
+                    attempted_account_ids.clear()
                 candidate = item
                 break
             if candidate is None:
@@ -405,6 +492,156 @@ class WorkerPool:
             self._clearing_queue = False
             self.wake()
 
+    async def purge_history(
+        self,
+        scope: str,
+        force_reset_account_busy_states: bool = False,
+        timeout_seconds: float = 120,
+    ) -> dict[str, int | str | bool]:
+        if scope not in (
+            "all",
+            "failed_and_completed",
+            "stuck_pending",
+            "none",
+        ):
+            raise ValueError("Unsupported task history purge scope.")
+        if self._clearing_queue:
+            raise RuntimeError("Another queue maintenance operation is already in progress.")
+        self._clearing_queue = True
+        try:
+            reset_count = (
+                self._reconcile_worker_state()
+                if force_reset_account_busy_states
+                else 0
+            )
+            with SessionLocal() as db:
+                if scope == "all":
+                    items = db.scalars(select(QueueItem)).all()
+                elif scope == "failed_and_completed":
+                    items = db.scalars(
+                        select(QueueItem).where(
+                            QueueItem.status.in_(("FAILED", "COMPLETED"))
+                        )
+                    ).all()
+                elif scope == "stuck_pending":
+                    items = db.scalars(
+                        select(QueueItem).where(QueueItem.status == "PENDING")
+                    ).all()
+                else:
+                    items = []
+
+                if any(item.status == "CLEANING" for item in items):
+                    raise RuntimeError(
+                        "A failed-item storage cleanup is in progress; wait for it to finish."
+                    )
+                selected_ids = {item.id for item in items}
+                original_statuses = {item.id: item.status for item in items}
+                active_ids = {
+                    item.id
+                    for item in items
+                    if item.status in ("DOWNLOADING", "VERIFYING", "CANCELLING")
+                }
+                for item in items:
+                    if item.status in ("DOWNLOADING", "VERIFYING"):
+                        item.status = "CANCELLING"
+                        item.error = "Cancellation requested by queue history maintenance."
+                        item.updated_at = utc_now()
+                    elif item.status == "PENDING":
+                        item.status = "CANCELLED"
+                        item.account_id = None
+                        item.error = "Cancelled by queue history maintenance."
+                        item.updated_at = utc_now()
+                db.commit()
+
+            with self._cancel_lock:
+                cancel_events = [
+                    self._cancel_events[item_id]
+                    for item_id in active_ids
+                    if item_id in self._cancel_events
+                ]
+            for cancel_event in cancel_events:
+                cancel_event.set()
+            self.wake()
+
+            deadline = asyncio.get_running_loop().time() + timeout_seconds
+            while True:
+                with self._cancel_lock:
+                    active_selected = active_ids.intersection(self._cancel_events)
+                if not active_selected:
+                    break
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Timed out waiting for selected downloads to stop; "
+                        "their task history was not deleted."
+                    )
+                await asyncio.sleep(min(0.1, remaining))
+
+            cleanup_targets: list[tuple[int, str, int, bool]] = []
+            with SessionLocal() as db:
+                for item in db.scalars(
+                    select(QueueItem).where(QueueItem.id.in_(selected_ids))
+                ).all() if selected_ids else []:
+                    if original_statuses[item.id] == "COMPLETED":
+                        continue
+                    if not item.remote_node_id and not item.dispatched_command:
+                        continue
+                    node = (
+                        db.get(Node, item.remote_node_id)
+                        if item.remote_node_id is not None
+                        else None
+                    )
+                    if node is None:
+                        route = db.get(StorageRoute, item.kind)
+                        node = db.get(Node, route.node_id) if route else None
+                    if node is None:
+                        raise RuntimeError(
+                            f"Cannot clean remote artifacts for task {item.id}: "
+                            "its storage server is not configured."
+                        )
+                    cleanup_targets.append(
+                        (
+                            item.id,
+                            item.file_name,
+                            node.id,
+                            bool(item.remote_match_existing_series),
+                        )
+                    )
+                nodes_by_id = {
+                    node_id: db.get(Node, node_id)
+                    for _, _, node_id, _ in cleanup_targets
+                }
+
+            for item_id, file_name, node_id, match_existing in cleanup_targets:
+                node = nodes_by_id[node_id]
+                await asyncio.to_thread(
+                    self.dispatcher.cleanup_failed_job,
+                    node,
+                    item_id,
+                    file_name,
+                    node.watch_path,
+                    False,
+                    match_existing,
+                )
+
+            with SessionLocal() as db:
+                deleted = 0
+                if selected_ids:
+                    result = db.execute(
+                        delete(QueueItem).where(QueueItem.id.in_(selected_ids))
+                    )
+                    deleted = result.rowcount or 0
+                db.commit()
+            return {
+                "success": True,
+                "deleted_tasks_count": deleted,
+                "reset_account_states_count": reset_count,
+                "message": "Queue and task history successfully cleaned.",
+            }
+        finally:
+            self._clearing_queue = False
+            self.wake()
+
     @staticmethod
     def _release_due_retries(db, now) -> None:
         due = db.execute(
@@ -509,6 +746,14 @@ class WorkerPool:
                         f"Account or {content_type} storage node is not configured.",
                     )
                     return
+                match_existing_series = bool(
+                    category
+                    and item.kind == "series"
+                    and category.match_existing_series
+                )
+                item.remote_node_id = node.id
+                item.remote_match_existing_series = match_existing_series
+                db.commit()
                 file_name = item.file_name
                 if item.provider_stream_id and not (
                     item.source_provider_url or ""
@@ -524,11 +769,6 @@ class WorkerPool:
                     category.destination_path
                     if category and category.destination_path
                     else node.watch_path
-                )
-                match_existing_series = bool(
-                    category
-                    and item.kind == "series"
-                    and category.match_existing_series
                 )
                 series_match_name = item.series_title if match_existing_series else None
                 series_match_prefixes = (
