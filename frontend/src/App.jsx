@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import axios from "axios";
 import ContentBrowser from "./ContentBrowser";
-import { waitForM3uJob } from "./m3uJobs";
 import {
   Activity, Check, CircleAlert, Clapperboard, Film, Gauge, LogOut, LockKeyhole,
   Play, Plus, Radio, RefreshCw, Server, Settings2, Trash2, Tv, Wifi, XCircle,
@@ -62,7 +61,7 @@ function App() {
   const [queue, setQueue] = useState([]);
   const [categories, setCategories] = useState([]);
   const [accounts, setAccounts] = useState([]);
-  const [m3uPlaylists, setM3uPlaylists] = useState([]);
+  const [catalogSyncJobs, setCatalogSyncJobs] = useState({});
   const [proxies, setProxies] = useState([]);
   const [providerProxyId, setProviderProxyId] = useState("");
   const [providerProxyReady, setProviderProxyReady] = useState(false);
@@ -76,8 +75,6 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [accountForm, setAccountForm] = useState({ provider_url: "", username: "", password: "", user_agent: "Mozilla" });
-  const [playlistForm, setPlaylistForm] = useState({ name: "", url: "", proxy_id: "" });
-  const playlistProxyInitialized = useRef(false);
   const [proxyUrl, setProxyUrl] = useState("");
 
   useEffect(() => {
@@ -98,8 +95,14 @@ function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [s, q] = await Promise.all([api.get("/status"), api.get("/queue")]);
-      setStatus(s.data); setQueue(q.data);
+      const [s, q, syncJobs] = await Promise.all([
+        api.get("/status"),
+        api.get("/queue"),
+        api.get("/content/catalog-sync"),
+      ]);
+      setStatus(s.data);
+      setQueue(q.data);
+      setCatalogSyncJobs(Object.fromEntries(syncJobs.data.map((job) => [job.account_id, job])));
     } catch (error) { setNotice(error.response?.data?.detail || "Could not reach the backend API."); }
   }, []);
   useEffect(() => {
@@ -111,29 +114,22 @@ function App() {
 
   const loadSettings = async () => {
     try {
-      const [a, p, n, r, providerProxy, playlists] = await Promise.all([
+      const [a, p, n, r, providerProxy, syncJobs] = await Promise.all([
         api.get("/accounts"),
         api.get("/proxies"),
         api.get("/nodes"),
         api.get("/settings/storage-routing"),
         api.get("/settings/provider-proxy"),
-        api.get("/playlists"),
+        api.get("/content/catalog-sync"),
       ]);
       setAccounts(a.data);
-      setM3uPlaylists(playlists.data);
+      setCatalogSyncJobs(Object.fromEntries(syncJobs.data.map((job) => [job.account_id, job])));
       setProxies(p.data);
       setProviderProxyId((selected) =>
         p.data.some((proxy) => proxy.enabled && String(proxy.id) === String(providerProxy.data.proxy_id))
           ? String(providerProxy.data.proxy_id)
           : ""
       );
-      if (!playlistProxyInitialized.current) {
-        const defaultProxy = p.data.find(
-          (proxy) => proxy.enabled && String(proxy.id) === String(providerProxy.data.proxy_id)
-        ) ?? p.data.find((proxy) => proxy.enabled);
-        setPlaylistForm((form) => ({ ...form, proxy_id: defaultProxy ? String(defaultProxy.id) : "" }));
-        playlistProxyInitialized.current = true;
-      }
       setNodes(n.data); setRouting(r.data);
       setProviderProxyReady(true);
       return p.data.some((proxy) =>
@@ -268,43 +264,13 @@ function App() {
     event.preventDefault();
     act(async () => { await api.post("/accounts", accountForm); setAccountForm({ provider_url: "", username: "", password: "", user_agent: "Mozilla" }); await loadSettings(); }, "Provider account added.");
   };
-  const importPlaylist = (event) => {
-    event.preventDefault();
-    act(async () => {
-      const { data: job } = await api.post("/playlists/import", {
-        ...playlistForm,
-        proxy_id: playlistForm.proxy_id ? Number(playlistForm.proxy_id) : null,
-      });
-      setNotice("Fetching the M3U playlist on the VPS and saving it to SQLite…");
-      const result = await waitForM3uJob(api, job.job_id, (state) => {
-        if (state.status === "RUNNING") {
-          setNotice("The VPS is downloading and indexing the M3U playlist…");
-        }
-      });
-      setPlaylistForm((form) => ({ name: "", url: "", proxy_id: form.proxy_id }));
-      await loadSettings();
-      return result;
-    }, (result) => `M3U playlist fetched on the VPS: ${result.entry_count} entries saved to SQLite.`);
-  };
-  const refreshPlaylist = (playlist) => act(
-    async () => {
-      const { data: job } = await api.post(`/playlists/${playlist.id}/refresh`);
-      setNotice(`Refreshing ${playlist.name} on the VPS…`);
-      const data = await waitForM3uJob(api, job.job_id, (state) => {
-        if (state.status === "RUNNING") setNotice(`Refreshing and indexing ${playlist.name} on the VPS…`);
-      });
-      await loadSettings();
-      return { ...data, name: playlist.name };
-    },
-    (data) => `Refreshed ${playlist.name}: ${data.entry_count} entries stored.`,
+  const syncCatalog = (accountId) => act(
+    () => api.post("/content/catalog-sync", {
+      account_id: accountId,
+      proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+    }),
+    "Xtream catalog sync queued. Progress will update here while the VPS caches categories, titles, and series episodes.",
   );
-  const savePlaylistProxy = (playlist) => act(async () => {
-    const { data } = await api.put(`/playlists/${playlist.id}/proxy`, {
-      proxy_id: playlist.proxy_id ? Number(playlist.proxy_id) : null,
-    });
-    await loadSettings();
-    return data;
-  }, `Saved proxy assignment for ${playlist.name}.`);
   const addProxy = (event) => {
     event.preventDefault();
     act(async () => { await api.post("/proxies", { url: proxyUrl }); setProxyUrl(""); await loadSettings(); }, "Proxy added.");
@@ -487,7 +453,6 @@ function App() {
 
         {tab === tabs[1] && <ContentBrowser
           api={api}
-          playlists={m3uPlaylists}
           routing={routing}
           onQueued={refresh}
           proxies={proxies.filter((proxy) => proxy.enabled)}
@@ -544,7 +509,31 @@ function App() {
         {tab === tabs[3] && <div className="grid gap-6 lg:grid-cols-2">
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
             <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Radio size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Provider accounts</h2><p className="text-xs text-slate-500">One active download per enabled account</p></div></div>
-            <div className="space-y-2 p-5">{accounts.map((account) => <div key={account.id} className="flex items-center justify-between rounded-lg bg-slate-900/70 px-3 py-2.5"><div><div className="text-sm text-slate-200">{account.username}</div><div className="text-xs text-slate-500">{account.provider_url}</div></div><button onClick={() => remove("/accounts", account.id)} className="p-2 text-slate-500 hover:text-rose-300" aria-label={`Remove ${account.username}`}><Trash2 size={15} /></button></div>)}
+            <div className="space-y-2 p-5">{accounts.map((account) => {
+              const job = catalogSyncJobs[account.id];
+              const syncing = job && ["PENDING", "RUNNING"].includes(job.status);
+              return <div key={account.id} className="rounded-lg bg-slate-900/70 px-3 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0"><div className="text-sm text-slate-200">{account.username}</div><div className="truncate text-xs text-slate-500">{account.provider_url}</div></div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <button type="button" disabled={busy || syncing} onClick={() => syncCatalog(account.id)} className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-400/30 px-2.5 py-1.5 text-xs text-indigo-200 hover:bg-indigo-500/10 disabled:opacity-40">
+                      <RefreshCw size={13} className={syncing ? "animate-spin" : ""} />{syncing ? "Syncing…" : "Sync catalog"}
+                    </button>
+                    <button type="button" onClick={() => remove("/accounts", account.id)} className="p-2 text-slate-500 hover:text-rose-300" aria-label={`Remove ${account.username}`}><Trash2 size={15} /></button>
+                  </div>
+                </div>
+                {job && <div className="mt-2 border-t border-slate-800 pt-2 text-[11px]">
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-400">
+                    <span className={job.status === "COMPLETED" ? "text-emerald-300" : job.status === "FAILED" ? "text-rose-300" : "text-indigo-300"}>{job.status} · {job.phase}</span>
+                    <span>{job.categories_processed} categories</span>
+                    <span>{job.lists_processed} lists · {job.cached_items} titles</span>
+                    <span>{job.series_details_processed}/{job.total_series_details} series details</span>
+                  </div>
+                  {job.stale_responses > 0 && <p className="mt-1 text-amber-300">{job.stale_responses} refresh requests used stale cached data after provider/proxy errors.</p>}
+                  {job.error && <p className="mt-1 text-rose-300">{job.error}</p>}
+                </div>}
+              </div>;
+            })}
               <form onSubmit={addAccount} className="mt-4 space-y-2 border-t border-slate-800 pt-4">
                 <input required type="url" placeholder="Provider base URL" value={accountForm.provider_url} onChange={(e) => setAccountForm({ ...accountForm, provider_url: e.target.value })} className="field" />
                 <div className="grid grid-cols-2 gap-2"><input required placeholder="Username" value={accountForm.username} onChange={(e) => setAccountForm({ ...accountForm, username: e.target.value })} className="field" /><input required type="password" placeholder="Password" value={accountForm.password} onChange={(e) => setAccountForm({ ...accountForm, password: e.target.value })} className="field" /></div>
@@ -554,36 +543,8 @@ function App() {
             </div>
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320] lg:col-span-2">
-            <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Clapperboard size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">M3U playlist catalogs</h2><p className="text-xs text-slate-500">Fetch playlists into SQLite; source and stream URLs are encrypted at rest.</p></div></div>
-            <div className="space-y-3 p-5">
-              {m3uPlaylists.map((playlist) => <div key={playlist.id} className="flex flex-wrap items-center gap-3 rounded-lg bg-slate-900/70 px-3 py-2.5">
-                <div className="min-w-0 flex-1"><div className="text-sm text-slate-200">{playlist.name}</div><div className="text-xs text-slate-500">{playlist.entry_count} entries · fetched {new Date(playlist.fetched_at).toLocaleString()}</div></div>
-                <label className="min-w-48 text-xs text-slate-400">Playlist fetch proxy
-                  <select value={playlist.proxy_id ?? ""} onChange={(event) => setM3uPlaylists((items) => items.map((item) =>
-                    item.id === playlist.id ? { ...item, proxy_id: event.target.value ? Number(event.target.value) : null } : item
-                  ))} className="field mt-1">
-                    <option value="">Direct connection</option>
-                    {playlist.proxy_id && !proxies.some((proxy) => proxy.id === playlist.proxy_id) && <option value={playlist.proxy_id}>Proxy #{playlist.proxy_id} (unavailable)</option>}
-                    {proxies.map((proxy) => <option key={proxy.id} value={proxy.id}>Proxy #{proxy.id} · {proxy.url}{proxy.enabled ? "" : " (disabled)"}</option>)}
-                  </select>
-                </label>
-                <button type="button" disabled={busy} onClick={() => savePlaylistProxy(playlist)} className="text-xs text-indigo-300 hover:text-indigo-200 disabled:opacity-40">Save proxy</button>
-                <button type="button" disabled={busy} onClick={() => refreshPlaylist(playlist)} className="inline-flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200 disabled:opacity-40"><RefreshCw size={13} />Refresh</button>
-                <button type="button" onClick={() => remove("/playlists", playlist.id)} disabled={busy} className="p-2 text-slate-500 hover:text-rose-300" aria-label={`Remove ${playlist.name}`}><Trash2 size={15} /></button>
-              </div>)}
-              <form onSubmit={importPlaylist} className="grid gap-2 border-t border-slate-800 pt-4 md:grid-cols-[minmax(150px,0.6fr)_minmax(220px,1.4fr)_minmax(170px,0.8fr)_auto]">
-                <input required maxLength={255} placeholder="Playlist name" value={playlistForm.name} onChange={(event) => setPlaylistForm({ ...playlistForm, name: event.target.value })} className="field" />
-                <input required type="url" maxLength={4096} placeholder="https://provider.example/playlist.m3u" value={playlistForm.url} onChange={(event) => setPlaylistForm({ ...playlistForm, url: event.target.value })} className="field" />
-                <label className="text-xs text-slate-400">Fetch proxy
-                  <select value={playlistForm.proxy_id} onChange={(event) => setPlaylistForm({ ...playlistForm, proxy_id: event.target.value })} className="field mt-1">
-                    <option value="">Direct connection</option>
-                    {proxies.filter((proxy) => proxy.enabled).map((proxy) => <option key={proxy.id} value={proxy.id}>Proxy #{proxy.id} · {proxy.url}</option>)}
-                  </select>
-                </label>
-                <button disabled={busy} className="primary"><Plus size={15} />Fetch M3U</button>
-              </form>
-              <p className="text-[11px] text-slate-500">Choose a proxy for the initial fetch and save a separate proxy per playlist for refreshes. Replace an assigned proxy here at any time. A disabled or deleted proxy will not silently fall back to direct. Playlist entries retain group/category, stream URL, tvg metadata, EXTINF attributes, and per-entry directives. M3U downloads use the exact stored stream URL; enabled Xtream accounts provide worker concurrency only.</p>
-            </div>
+            <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Clapperboard size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Xtream catalog cache</h2><p className="text-xs text-slate-500">Catalog syncs run on the VPS and persist provider categories, titles, and episode mappings in SQLite.</p></div></div>
+            <p className="p-5 text-xs leading-5 text-slate-400">Start a sync from an account above. Category and title lists are fetched first, then series episode details are fetched one series at a time and rate-limited to protect the provider. The selected provider API proxy is used for the entire sync. If a refresh fails but cached data exists, the job records and displays the stale response count instead of claiming every response was fresh. Existing saved M3U records are preserved but are no longer part of the primary browsing and import workflow.</p>
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
             <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Gauge size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Proxy pool</h2><p className="text-xs text-slate-500">Proxy URLs are encrypted at rest</p></div></div>

@@ -72,6 +72,29 @@ class ProviderCatalogCache(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class ProviderCatalogSyncJob(Base):
+    __tablename__ = "provider_catalog_sync_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+    proxy_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
+    phase: Mapped[str] = mapped_column(String(32), default="queued")
+    categories_processed: Mapped[int] = mapped_column(Integer, default=0)
+    lists_processed: Mapped[int] = mapped_column(Integer, default=0)
+    cached_items: Mapped[int] = mapped_column(Integer, default=0)
+    series_details_processed: Mapped[int] = mapped_column(Integer, default=0)
+    total_series_details: Mapped[int] = mapped_column(Integer, default=0)
+    stale_responses: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
 class M3UPlaylist(Base):
     __tablename__ = "m3u_playlists"
 
@@ -271,6 +294,9 @@ def init_db() -> None:
             },
             "m3u_playlists": {
                 "proxy_id": "INTEGER",
+            },
+            "provider_catalog_sync_jobs": {
+                "stale_responses": "INTEGER NOT NULL DEFAULT 0",
             },
         }
         inspector = inspect(connection)

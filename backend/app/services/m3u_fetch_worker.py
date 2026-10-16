@@ -182,13 +182,14 @@ class M3UFetchWorker:
             try:
                 return await fetch_playlist(source_url, proxy_url)
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code != 429 and exc.response.status_code < 500:
+                status_code = exc.response.status_code
+                if 400 <= status_code < 500 and status_code != 429:
                     raise
                 if attempt == 2:
                     raise
                 logger.warning(
-                    "M3U source returned HTTP %s for fetch job %s; retrying",
-                    exc.response.status_code,
+                    "M3U source or proxy returned HTTP %s for fetch job %s; retrying",
+                    status_code,
                     job_id,
                 )
             except httpx.RequestError as exc:
@@ -207,8 +208,14 @@ class M3UFetchWorker:
         if isinstance(exc, ValueError):
             return str(exc)
         if isinstance(exc, httpx.HTTPStatusError):
+            status_code = exc.response.status_code
+            if status_code < 100 or status_code > 599:
+                return (
+                    f"M3U source or proxy returned non-standard HTTP status {status_code} "
+                    "after retries. Check provider and proxy availability."
+                )
             return (
-                f"M3U source returned HTTP {exc.response.status_code}. "
+                f"M3U source returned HTTP {status_code}. "
                 "Check the playlist URL and assigned proxy."
             )
         if isinstance(exc, httpx.TimeoutException):

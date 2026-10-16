@@ -17,12 +17,14 @@ from sqlalchemy.exc import IntegrityError
 from app.config import settings
 from app.models import (
     Account,
+    AppSettings,
     M3UEntry,
     M3UFetchJob,
     M3UPlaylist,
     MonitoredCategory,
     Node,
     Proxy,
+    ProviderCatalogSyncJob,
     QueueItem,
     SessionLocal,
     StorageRoute,
@@ -161,9 +163,101 @@ class M3UPlaylistProxyUpdate(BaseModel):
     proxy_id: int | None = Field(default=None, ge=0)
 
 
+class CatalogSyncRequest(BaseModel):
+    account_id: int = Field(ge=1)
+    proxy_id: int | None = Field(default=None, ge=0)
+
+
 def _playlist_category_id(playlist_id: int, group_title: str) -> str:
     group_hash = hashlib.sha256(group_title.encode("utf-8")).hexdigest()[:16]
     return f"m3u:{playlist_id}:{group_hash}"
+
+
+@router.post("/catalog-sync")
+def start_catalog_sync(payload: CatalogSyncRequest, request: Request) -> dict[str, Any]:
+    with SessionLocal() as db:
+        account = db.get(Account, payload.account_id)
+        if not account or not account.enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="Select an enabled Xtream account to sync.",
+            )
+        proxy_id = payload.proxy_id
+        if proxy_id is None:
+            settings_row = db.get(AppSettings, 1)
+            proxy_id = settings_row.provider_proxy_id if settings_row else None
+        if proxy_id == 0:
+            proxy_id = None
+        active_job = db.scalar(
+            select(ProviderCatalogSyncJob.id).where(
+                ProviderCatalogSyncJob.account_id == account.id,
+                ProviderCatalogSyncJob.status.in_(("PENDING", "RUNNING")),
+            )
+        )
+        if active_job is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="A catalog sync is already queued or running for this account.",
+            )
+    try:
+        resolve_provider_proxy(proxy_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    with SessionLocal() as db:
+        job = ProviderCatalogSyncJob(
+            account_id=payload.account_id,
+            proxy_id=proxy_id,
+            status="PENDING",
+            phase="queued",
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+    request.app.state.catalog_sync_worker.wake()
+    return {"job_id": job_id, "status": "PENDING"}
+
+
+def _catalog_sync_job_json(job: ProviderCatalogSyncJob) -> dict[str, Any]:
+    return {
+        "job_id": job.id,
+        "account_id": job.account_id,
+        "status": job.status,
+        "phase": job.phase,
+        "categories_processed": job.categories_processed,
+        "lists_processed": job.lists_processed,
+        "cached_items": job.cached_items,
+        "series_details_processed": job.series_details_processed,
+        "total_series_details": job.total_series_details,
+        "stale_responses": job.stale_responses,
+        "error": job.error,
+        "created_at": job.created_at.isoformat(),
+        "updated_at": job.updated_at.isoformat(),
+    }
+
+
+@router.get("/catalog-sync")
+def get_latest_catalog_sync_status() -> list[dict[str, Any]]:
+    with SessionLocal() as db:
+        latest_job_ids = (
+            select(func.max(ProviderCatalogSyncJob.id).label("job_id"))
+            .group_by(ProviderCatalogSyncJob.account_id)
+            .subquery()
+        )
+        jobs = db.scalars(
+            select(ProviderCatalogSyncJob)
+            .where(ProviderCatalogSyncJob.id.in_(select(latest_job_ids.c.job_id)))
+            .order_by(ProviderCatalogSyncJob.account_id)
+        ).all()
+        return [_catalog_sync_job_json(job) for job in jobs]
+
+
+@router.get("/catalog-sync/{job_id}")
+def get_catalog_sync_status(job_id: int) -> dict[str, Any]:
+    with SessionLocal() as db:
+        job = db.get(ProviderCatalogSyncJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Catalog sync job not found.")
+        return _catalog_sync_job_json(job)
 
 
 def _playlist_entry_json(entry: M3UEntry, category_id: str) -> dict[str, Any]:
