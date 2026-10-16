@@ -1,7 +1,9 @@
 import asyncio
 import json
 import logging
+import re
 import threading
+import time
 from datetime import timedelta
 
 from sqlalchemy import or_, select, update
@@ -18,11 +20,17 @@ from app.models import (
     utc_now,
 )
 from app.services.provider_client import stream_url
-from app.security import decrypt_secret
+from app.security import decrypt_secret, encrypt_secret
 from app.services.content_paths import safe_extension
 from app.services.dispatcher import DispatchCancelled, RemoteDispatcher
 
 logger = logging.getLogger(__name__)
+_TASK_LOG_LIMIT = 262144
+_ERROR_LINE = re.compile(
+    r"(?:\b(?:401|403)\b|unauthori[sz]ed|forbidden|connection refused|"
+    r"no space left|disk quota|quota exceeded)",
+    re.IGNORECASE,
+)
 
 
 class WorkerPool:
@@ -31,6 +39,7 @@ class WorkerPool:
         self._manager: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._workers: dict[int, asyncio.Task] = {}
+        self._active_jobs: dict[int, int] = {}
         self._wakeups: dict[int, asyncio.Event] = {}
         self._busy_accounts: set[int] = set()
         self._cancel_events: dict[int, threading.Event] = {}
@@ -55,6 +64,7 @@ class WorkerPool:
         await asyncio.gather(*self._workers.values(), return_exceptions=True)
 
     async def _manage(self) -> None:
+        next_reconciliation = time.monotonic() + 15
         while not self._stopping.is_set():
             self._manager_wakeup.clear()
             with SessionLocal() as db:
@@ -77,8 +87,13 @@ class WorkerPool:
                 )
                 wakeup.set()
             for account_id in self._workers.keys() - account_ids:
+                if account_id in self._busy_accounts:
+                    continue
                 self._workers.pop(account_id).cancel()
                 self._wakeups.pop(account_id, None)
+            if time.monotonic() >= next_reconciliation:
+                self._reconcile_orphaned_jobs()
+                next_reconciliation = time.monotonic() + 15
             try:
                 await asyncio.wait_for(
                     self._manager_wakeup.wait(),
@@ -108,6 +123,7 @@ class WorkerPool:
                 continue
             self.active_count += 1
             self._busy_accounts.add(account_id)
+            self._active_jobs[account_id] = item_id
             try:
                 await self._process(account_id, item_id)
             except Exception as exc:
@@ -122,6 +138,7 @@ class WorkerPool:
                     self._release_claim(item_id, account_id)
             finally:
                 self._busy_accounts.discard(account_id)
+                self._active_jobs.pop(account_id, None)
                 self.active_count -= 1
 
     def wake(self) -> None:
@@ -180,6 +197,38 @@ class WorkerPool:
             db.commit()
         if result.rowcount:
             logger.warning("Reset %s interrupted queue jobs to PENDING.", result.rowcount)
+
+    def _reconcile_orphaned_jobs(self) -> None:
+        with SessionLocal() as db:
+            active_items = db.scalars(
+                select(QueueItem).where(
+                    QueueItem.status.in_(("DOWNLOADING", "VERIFYING"))
+                )
+            ).all()
+            recovered = 0
+            for item in active_items:
+                if self._active_jobs.get(item.account_id) == item.id:
+                    continue
+                message = (
+                    "Worker state was lost while the task was active; "
+                    "the task was returned to the queue by the 15-second watchdog."
+                )
+                item.status = "PENDING"
+                item.account_id = None
+                item.progress = 0
+                item.speed_bytes_per_second = None
+                item.attempted_account_ids = "[]"
+                item.last_error = message
+                item.error = message
+                item.task_log = (item.task_log + f"\n{message}\n")[-_TASK_LOG_LIMIT:]
+                item.task_log_offset += len(f"\n{message}\n")
+                item.updated_at = utc_now()
+                recovered += 1
+            if recovered:
+                db.commit()
+        if recovered:
+            logger.warning("Watchdog reset %s orphaned queue tasks to PENDING.", recovered)
+            self.wake()
 
     def _claim_next(self, account_id: int) -> int | None:
         if self._clearing_queue:
@@ -259,6 +308,10 @@ class WorkerPool:
                     progress=0,
                     file_size_bytes=None,
                     speed_bytes_per_second=None,
+                    dispatched_command=None,
+                    task_log="",
+                    task_log_offset=0,
+                    last_error=None,
                     account_id=account_id,
                     attempted_account_ids=json.dumps(
                         sorted(attempted_account_ids | {account_id})
@@ -532,6 +585,12 @@ class WorkerPool:
                 match_existing_series=match_existing_series,
                 series_name=series_match_name,
                 series_match_prefixes=series_match_prefixes,
+                on_log=lambda text: self._append_task_log(
+                    item_id, self._redact_task_text(text, stream_url_value, proxy_url)
+                ),
+                on_command=lambda command: self._set_dispatched_command(
+                    item_id, command
+                ),
             )
             with SessionLocal() as db:
                 item = db.get(QueueItem, item_id)
@@ -540,6 +599,7 @@ class WorkerPool:
                     item.progress = 100
                     item.final_path = result.final_path
                     item.error = None
+                    item.last_error = None
                     item.retry_after = None
                     db.commit()
         except DispatchCancelled:
@@ -565,6 +625,40 @@ class WorkerPool:
             if item and item.status == "DOWNLOADING":
                 item.progress = progress
                 db.commit()
+
+    @staticmethod
+    def _redact_task_text(
+        text: str, stream_url_value: str, proxy_url: str | None
+    ) -> str:
+        if stream_url_value:
+            text = text.replace(stream_url_value, "[redacted stream URL]")
+        if proxy_url:
+            text = text.replace(proxy_url, "[redacted proxy URL]")
+        return text
+
+    @staticmethod
+    def _set_dispatched_command(item_id: int, command: str) -> None:
+        with SessionLocal() as db:
+            item = db.get(QueueItem, item_id)
+            if item and item.status in ("DOWNLOADING", "VERIFYING"):
+                item.dispatched_command = encrypt_secret(command)
+                db.commit()
+
+    @staticmethod
+    def _append_task_log(item_id: int, text: str) -> None:
+        if not text:
+            return
+        with SessionLocal() as db:
+            item = db.get(QueueItem, item_id)
+            if not item:
+                return
+            item.task_log = (item.task_log + text)[-_TASK_LOG_LIMIT:]
+            item.task_log_offset += len(text)
+            for line in re.split(r"[\r\n]+", item.task_log[-8192:]):
+                if _ERROR_LINE.search(line):
+                    item.last_error = line[-4000:]
+            item.updated_at = utc_now()
+            db.commit()
 
     @staticmethod
     async def _set_status(item_id: int, status: str) -> None:
@@ -617,6 +711,7 @@ class WorkerPool:
                         f"{message} Automatic retry limit reached; use Retry to start a new cycle."
                     )
                 item.error = message[-4000:]
+                item.last_error = message[-4000:]
                 item.retry_after = (
                     None
                     if item.retries >= settings.max_retries

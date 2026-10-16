@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import axios from "axios";
 import ContentBrowser from "./ContentBrowser";
 import {
-  Activity, Check, CircleAlert, Clapperboard, Film, Gauge, LogOut, LockKeyhole,
-  Play, Plus, Radio, RefreshCw, Server, Settings2, Trash2, Tv, Wifi, XCircle,
+  Activity, Check, CircleAlert, Clapperboard, ClipboardCopy, Film, Gauge, LogOut, LockKeyhole,
+  Play, Plus, Radio, RefreshCw, Server, Settings2, Terminal, Trash2, Tv, Wifi, X, XCircle,
 } from "lucide-react";
 
 const api = axios.create({ baseURL: "/api", withCredentials: true });
@@ -59,6 +59,7 @@ function App() {
   const [queueFilter, setQueueFilter] = useState("open");
   const [status, setStatus] = useState(null);
   const [queue, setQueue] = useState([]);
+  const [logTask, setLogTask] = useState(null);
   const [categories, setCategories] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [catalogSyncJobs, setCatalogSyncJobs] = useState({});
@@ -445,7 +446,7 @@ function App() {
                 <td className="px-4 py-4 text-slate-400">{item.kind === "series" ? <Tv size={16} /> : <Film size={16} />}</td>
                 <td className="px-4 py-4"><Status status={item.status} /></td>
                 <td className="px-4 py-4"><div className="flex items-center gap-2"><div className="h-1.5 w-20 overflow-hidden rounded bg-slate-800"><div className="h-full bg-indigo-400" style={{ width: `${item.progress || 0}%` }} /></div><span className="text-xs text-slate-500">{Math.round(item.progress || 0)}%</span></div></td>
-                <td className="px-4 py-4">{item.status === "FAILED" && <div className="flex flex-col items-start gap-2"><button disabled={busy} onClick={() => cleanFailedItem(item.id)} className="flex items-center gap-1.5 text-xs text-amber-300 hover:text-amber-200"><Trash2 size={13} />Clean partial</button><button disabled={busy} onClick={() => retry(item.id)} className="flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200"><RefreshCw size={13} />Retry</button></div>}{["PENDING", "DOWNLOADING", "VERIFYING"].includes(item.status) && <button disabled={busy} onClick={() => cancelDownload(item.id)} className="flex items-center gap-1.5 text-xs text-rose-300 hover:text-rose-200"><XCircle size={13} />Cancel</button>}{item.status === "CLEANING" && <span className="text-xs text-amber-300">Cleaning storage…</span>}{item.status === "CANCELLING" && <span className="text-xs text-amber-300">Cancelling…</span>}</td>
+                <td className="px-4 py-4"><div className="flex flex-col items-start gap-2"><button onClick={() => setLogTask(item)} className="flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200"><Terminal size={13} />View log</button>{item.status === "FAILED" && <><button disabled={busy} onClick={() => cleanFailedItem(item.id)} className="flex items-center gap-1.5 text-xs text-amber-300 hover:text-amber-200"><Trash2 size={13} />Clean partial</button><button disabled={busy} onClick={() => retry(item.id)} className="flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200"><RefreshCw size={13} />Retry</button></>}{["PENDING", "DOWNLOADING", "VERIFYING"].includes(item.status) && <button disabled={busy} onClick={() => cancelDownload(item.id)} className="flex items-center gap-1.5 text-xs text-rose-300 hover:text-rose-200"><XCircle size={13} />Cancel</button>}{item.status === "CLEANING" && <span className="text-xs text-amber-300">Cleaning storage…</span>}{item.status === "CANCELLING" && <span className="text-xs text-amber-300">Cancelling…</span>}</div></td>
               </tr>) : <tr><td colSpan="6" className="px-5 py-14 text-center text-slate-500">{queue.length ? `No ${queueFilter === "all" ? "" : `${queueFilter} `}queue items in the latest list.` : "No streams discovered yet. Enable a monitored category to begin."}</td></tr>}</tbody>
             </table></div>
           </section>
@@ -604,7 +605,112 @@ function App() {
           </section>
         </div>}
       </main>
+      {logTask && <TaskLogViewer
+        key={logTask.id}
+        task={logTask}
+        onClose={() => setLogTask(null)}
+        onAbort={async (id) => {
+          const { data } = await api.post(`/tasks/${id}/abort`);
+          await refresh();
+          return data;
+        }}
+      />}
       <style>{`.field{width:100%;border:1px solid #263244;background:#090d16;color:#e2e8f0;border-radius:.6rem;padding:.65rem .8rem;font-size:.8rem;outline:none}.field:focus{border-color:#818cf8}.primary,.secondary{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;border-radius:.6rem;padding:.65rem 1rem;font-size:.8rem;font-weight:600}.primary{background:#4f46e5;color:white}.primary:hover{background:#6366f1}.secondary{border:1px solid #334155;color:#cbd5e1}.secondary:hover{background:#1e293b}`}</style>
+    </div>
+  );
+}
+
+function TaskLogViewer({ task, onClose, onAbort }) {
+  const [log, setLog] = useState("");
+  const [command, setCommand] = useState("");
+  const [status, setStatus] = useState(task.status);
+  const [account, setAccount] = useState(task.account);
+  const [host, setHost] = useState(task.host);
+  const [lastError, setLastError] = useState(task.last_error || task.error || "");
+  const [streamError, setStreamError] = useState("");
+  const [aborting, setAborting] = useState(false);
+  const [copyMessage, setCopyMessage] = useState("");
+  const terminalBody = useRef(null);
+  const terminal = ["COMPLETED", "FAILED", "CANCELLED"].includes(status);
+
+  useEffect(() => {
+    const source = new EventSource(`/api/tasks/${task.id}/logs/stream`, {
+      withCredentials: true,
+    });
+    source.onmessage = (event) => {
+      const update = JSON.parse(event.data);
+      setLog((current) => update.reset ? update.log : current + update.log);
+      setCommand(update.command || "");
+      setStatus(update.status);
+      setAccount(update.account || task.account);
+      setHost(update.host || task.host);
+      setLastError(update.last_error || "");
+      setStreamError("");
+      if (["COMPLETED", "FAILED", "CANCELLED"].includes(update.status)) {
+        source.close();
+      }
+    };
+    source.onerror = () => setStreamError("Log stream disconnected; reconnecting…");
+    return () => source.close();
+  }, [task.id, task.account, task.host]);
+
+  useEffect(() => {
+    if (terminalBody.current) {
+      terminalBody.current.scrollTop = terminalBody.current.scrollHeight;
+    }
+  }, [log]);
+
+  const copyCommand = async () => {
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopyMessage("Command copied.");
+    } catch {
+      setCopyMessage("Clipboard access is unavailable in this browser.");
+    }
+  };
+
+  const abort = async () => {
+    setAborting(true);
+    setCopyMessage("");
+    try {
+      const result = await onAbort(task.id);
+      setStatus(result.status);
+    } catch (error) {
+      setCopyMessage(error.response?.data?.detail || "Could not abort this task.");
+    } finally {
+      setAborting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end bg-black/70" role="dialog" aria-modal="true" aria-label={`Task log: ${task.title}`}>
+      <section className="flex h-full w-full max-w-4xl flex-col border-l border-slate-700 bg-[#090d16] shadow-2xl">
+        <header className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-800 bg-[#0d1320] px-5 py-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-indigo-300"><Terminal size={17} /><h2 className="font-semibold text-white">{task.title}</h2></div>
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+              <Pill tone={status === "FAILED" ? "red" : status === "COMPLETED" ? "green" : "blue"}>{status}</Pill>
+              <span>Account: {account || "Unassigned"}</span><span>Storage host: {host || "Unknown"}</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {["PENDING", "DOWNLOADING", "VERIFYING", "CANCELLING"].includes(status) && <button disabled={aborting || status === "CANCELLING"} onClick={abort} className="rounded-lg border border-rose-800 px-3 py-2 text-xs text-rose-300 hover:bg-rose-950/50 disabled:opacity-50">{aborting ? "Aborting…" : status === "CANCELLING" ? "Cancelling…" : "Abort job"}</button>}
+            <button onClick={onClose} aria-label="Close log viewer" className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white"><X size={17} /></button>
+          </div>
+        </header>
+        <div className="border-b border-slate-800 p-4">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">Dispatched command</h3>
+            <button disabled={!command} onClick={copyCommand} className="inline-flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200 disabled:opacity-40"><ClipboardCopy size={13} />Copy</button>
+          </div>
+          <p className="mb-2 text-[11px] text-amber-300">The exact command contains provider credentials. Do not copy or share it outside trusted systems.</p>
+          <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-slate-800 bg-black/40 p-3 font-mono text-[11px] leading-relaxed text-slate-300">{command || "Waiting for the worker to dispatch the remote command…"}</pre>
+          {copyMessage && <p className="mt-1 text-xs text-amber-300">{copyMessage}</p>}
+        </div>
+        {lastError && <div className="border-b border-rose-900/60 bg-rose-950/30 px-4 py-2 text-xs text-rose-300"><span className="font-semibold">Latest error: </span>{lastError}</div>}
+        <div className="flex items-center justify-between border-b border-slate-800 px-4 py-2 text-[11px] text-slate-500"><span>Live task output</span><span>{streamError || (terminal ? "Task finished" : "Streaming")}</span></div>
+        <pre ref={terminalBody} className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-xs leading-relaxed text-emerald-100/90">{log ? log.split(/(?<=\n)/).map((line, index) => <span key={index} className={/(?:\b(?:401|403)\b|unauthori[sz]ed|forbidden|connection refused|no space left|disk quota|quota exceeded)/i.test(line) ? "text-rose-300" : undefined}>{line}</span>) : <span className="text-slate-600">Waiting for task output…</span>}</pre>
+      </section>
     </div>
   );
 }

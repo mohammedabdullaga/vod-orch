@@ -224,6 +224,10 @@ class QueueItem(Base):
         ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True
     )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dispatched_command: Mapped[str | None] = mapped_column(Text, nullable=True)
+    task_log: Mapped[str] = mapped_column(Text, default="")
+    task_log_offset: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     retries: Mapped[int] = mapped_column(Integer, default=0)
     attempted_account_ids: Mapped[str] = mapped_column(Text, default="[]")
     retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -287,6 +291,10 @@ def init_db() -> None:
                 "file_size_bytes": "INTEGER",
                 "speed_bytes_per_second": "FLOAT",
                 "attempted_account_ids": "TEXT NOT NULL DEFAULT '[]'",
+                "dispatched_command": "TEXT",
+                "task_log": "TEXT NOT NULL DEFAULT ''",
+                "task_log_offset": "INTEGER NOT NULL DEFAULT 0",
+                "last_error": "TEXT",
             },
             "nodes": {
                 "name": "VARCHAR(255) NOT NULL DEFAULT 'Storage server'",

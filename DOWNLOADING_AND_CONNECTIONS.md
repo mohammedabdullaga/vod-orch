@@ -66,7 +66,7 @@ The Vite development server uses `localhost:5173` and forwards `/api` to the bac
 
 2. **Claim an account-bound job**
    - The worker pool reconciles enabled accounts dynamically.
-   - An idle worker claims one compatible `PENDING` item for its provider endpoint and storage route. One account cannot run two active downloads at once; multiple accounts allow different files to download concurrently.
+   - An idle worker claims one eligible `PENDING` item for its storage route. Provider-ID Xtream jobs are rebuilt using the assigned worker account's host and credentials; legacy URL-only jobs retain their provider-host restriction. One account cannot run two active downloads at once; multiple accounts allow different files to download concurrently.
    - Manual batches can select free accounts, downloader, and direct/proxy mode before enqueueing.
 
 3. **Open the SSH control connection**
@@ -80,7 +80,7 @@ The Vite development server uses `localhost:5173` and forwards `/api` to the bac
    - Staging and target must be on the same filesystem so the final rename is atomic.
 
 5. **Download the bytes on the storage server**
-   - Default **Axel** jobs use the storage node's configured connection count (1-12; new nodes default to `DEFAULT_AXEL_CONNECTIONS=12`). Daemon Axel runs quietly without ANSI progress output; transfer speed and size are sampled from staging-file growth. Standalone exported scripts use the same configured count and show normal terminal output.
+   - Default **Axel** jobs use the storage node's configured connection count (1-12; new nodes default to `DEFAULT_AXEL_CONNECTIONS=12`). Remote stdout/stderr is collected continuously for the dashboard task log; transfer speed and size are also sampled from staging-file growth. Existing stage files and Axel `.st` state files are removed before a fresh attempt.
    - Manually queued **Wget** jobs use resume/output, retry, User-Agent, and explicit direct or HTTP(S)-proxy settings. Wget uses one connection per file and cannot use SOCKS5.
    - New accounts use the `Mozilla` User-Agent unless another value is explicitly entered. Commands use the provider's configured stream host directly, adding explicit default HTTP/HTTPS ports when missing. The VPS does not follow redirects or resolve the edge URL; the storage server's downloader receives the primary provider URL and follows any redirect from its own network.
    - Only the explicitly selected/configured proxy is supplied to the remote downloader. Direct jobs clear inherited proxy environment variables before starting the downloader.
@@ -90,9 +90,12 @@ The Vite development server uses `localhost:5173` and forwards `/api` to the bac
    - After the downloader exits successfully, the VPS asks the storage server to run `ffprobe` against the staged file.
    - If a video stream is found, the remote file is renamed into the final destination. The rename is performed on the storage server and is atomic when staging and target are on the same filesystem.
    - Failed verification or transfer marks the queue item failed and cleans up the staging partial and any adjacent Axel `.st` resume state where the remote server remains reachable. Completed rows record the final remote path.
+   - SSH exec requests have a bounded channel-open timeout; the worker also detects dropped SSH transports and enforces the configured remote-job and transfer-idle timeouts. A 15-second worker-pool reconciliation returns persisted active records with no live worker to `PENDING`.
+   - **View log** streams output through `GET /api/tasks/{task_id}/logs/stream`; the authenticated `POST /api/tasks/{task_id}/abort` endpoint requests remote process-group termination and staging cleanup. Logs are retained as a bounded 256 KiB tail in SQLite.
+   - The exact dispatched command is encrypted at rest with the configured application key and returned to authenticated administrators by the log viewer. It contains provider credentials; protect the SQLite database, backups, encryption key, and administrator sessions as secrets.
 
 7. **Cancel or clear**
-   - Cancelling one active job signals its worker. The SSH command handler terminates the remote downloader process group and removes the partial staging file.
+   - Cancelling one active job signals its worker. The SSH command handler terminates the remote downloader process group and removes the partial staging file. The task log viewer provides the same action as **Abort job**.
    - **Stop all & clear all** prevents workers from claiming new pending jobs, cancels pending jobs, signals active jobs, waits for worker cancellation to finish, and hides all queue entries. It does not delete completed media files. Queue records remain internally as hidden deduplication tombstones; selected cancelled items can be queued again manually through the browser. Monitored categories remain enabled and may enqueue future new streams.
    - If SSH is unavailable, the VPS cannot guarantee that it killed an already-running remote process immediately. The bulk operation reports a timeout rather than clearing the list while tracked jobs are still running.
 

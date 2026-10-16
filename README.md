@@ -9,8 +9,8 @@ Use this software only with media you own or are authorized to access, and with 
 ```text
 backend/
   app/
-    main.py                 FastAPI routes and service lifecycle
-    models.py               SQLite / SQLAlchemy models, provider cache and storage routing
+    main.py                 FastAPI routes, authenticated task-log stream and lifecycle
+    models.py               SQLite / SQLAlchemy models, queue logs, provider cache and routing
     config.py               Environment configuration
     security.py             Fernet encryption and secret masking
     provider.py             Compatibility exports for the provider client
@@ -23,7 +23,7 @@ backend/
       content_paths.py      Shared identity-safe relative destinations
       poller.py             Category polling and queue ingestion
       worker_pool.py        One worker per enabled account
-      dispatcher.py         SSH, remote download, probe and promotion
+      dispatcher.py         Bounded SSH, live output capture, remote download, probe and promotion
   .env.example              Backend configuration template
   media-ingestion.service   systemd unit
   requirements.txt          Python dependencies
@@ -40,6 +40,8 @@ DOWNLOADING_AND_CONNECTIONS.md
 ```
 
 For a detailed description of the download lifecycle, network connections, and transfer direction, see [Downloading and server connections](./DOWNLOADING_AND_CONNECTIONS.md).
+
+The queue's **View log** action streams each task's latest output and dispatched command from the authenticated API. The command contains provider credentials and is encrypted at rest in the local SQLite database; it is decrypted only for authenticated administrators. Protect the database, encryption key, and admin session accordingly.
 
 ## Ports and network paths
 

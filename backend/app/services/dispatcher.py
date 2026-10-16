@@ -83,6 +83,9 @@ class RemoteDispatcher:
                 look_for_keys=False,
                 allow_agent=False,
             )
+            transport = client.get_transport()
+            if transport:
+                transport.set_keepalive(30)
         except Exception:
             client.close()
             raise
@@ -96,12 +99,15 @@ class RemoteDispatcher:
         cancel_event: threading.Event | None = None,
         cancel_remote: Callable[[], None] | None = None,
         on_transfer_metrics: Callable[[float | None, float | None, int | None], None] | None = None,
+        on_output: Callable[[str], None] | None = None,
         max_output_bytes: int = 65536,
         idle_timeout_seconds: int | None = None,
     ) -> str:
         if max_output_bytes < 1:
             raise ValueError("Remote command output limit must be positive.")
-        _stdin, stdout, stderr = client.exec_command(command, get_pty=False)
+        _, stdout, _ = client.exec_command(
+            command, get_pty=False, timeout=15
+        )
         channel = stdout.channel
         output = bytearray()
         error_output = bytearray()
@@ -110,6 +116,9 @@ class RemoteDispatcher:
         last_metrics: tuple[float | None, float | None, int | None] = (None, None, None)
         last_metrics_at = 0.0
         while not channel.exit_status_ready():
+            transport = client.get_transport()
+            if not transport or not transport.is_active():
+                raise ConnectionError("SSH transport disconnected while command was running.")
             if cancel_event and cancel_event.is_set():
                 try:
                     if cancel_remote:
@@ -130,12 +139,22 @@ class RemoteDispatcher:
                 raise TimeoutError(
                     f"Remote download had no transfer progress for {idle_timeout_seconds} seconds."
                 )
+            received = bytearray()
             if channel.recv_ready():
-                output.extend(channel.recv(65536))
+                data = channel.recv(65536)
+                output.extend(data)
+                received.extend(data)
                 del output[:-max_output_bytes]
             if channel.recv_stderr_ready():
-                error_output.extend(channel.recv_stderr(65536))
+                data = channel.recv_stderr(65536)
+                error_output.extend(data)
+                received.extend(data)
                 del error_output[:-65536]
+            if received and on_output:
+                clean = _ANSI_ESCAPE.sub(b"", bytes(received)).decode(
+                    "utf-8", errors="replace"
+                )
+                on_output(clean)
             parsed_progress, speed, file_size = _parse_transfer_metrics(output + error_output)
             metrics = (parsed_progress, speed, file_size)
             now = time.monotonic()
@@ -153,10 +172,20 @@ class RemoteDispatcher:
                 last_metrics_at = now
             time.sleep(0.1)
         while channel.recv_ready():
-            output.extend(channel.recv(65536))
+            data = channel.recv(65536)
+            output.extend(data)
+            if on_output:
+                on_output(
+                    _ANSI_ESCAPE.sub(b"", data).decode("utf-8", errors="replace")
+                )
             del output[:-max_output_bytes]
         while channel.recv_stderr_ready():
-            error_output.extend(channel.recv_stderr(65536))
+            data = channel.recv_stderr(65536)
+            error_output.extend(data)
+            if on_output:
+                on_output(
+                    _ANSI_ESCAPE.sub(b"", data).decode("utf-8", errors="replace")
+                )
             del error_output[:-65536]
         final_metrics = _parse_transfer_metrics(output + error_output)
         if on_transfer_metrics:
@@ -310,6 +339,8 @@ class RemoteDispatcher:
         match_existing_series: bool = False,
         series_name: str | None = None,
         series_match_prefixes: str | None = None,
+        on_log: Callable[[str], None] | None = None,
+        on_command: Callable[[str], None] | None = None,
     ) -> DispatchResult:
         if not 1 <= axel_connections <= 12:
             raise ValueError("Axel connections must be between 1 and 12.")
@@ -341,6 +372,10 @@ class RemoteDispatcher:
         final_root = destination_root or node.watch_path
         client = self._connect(node)
         try:
+            def run_remote(command: str, *args, **kwargs) -> str:
+                kwargs.setdefault("on_output", on_log)
+                return self._run(client, command, *args, **kwargs)
+
             if cancel_event and cancel_event.is_set():
                 raise DispatchCancelled("Download cancelled before it started.")
             if match_existing_series:
@@ -348,8 +383,7 @@ class RemoteDispatcher:
                     raise ValueError("Series name is required for existing-folder matching.")
                 if len(relative_path.parts) < 3:
                     raise ValueError("Series destination path is invalid for folder matching.")
-                listing = self._run(
-                    client,
+                listing = run_remote(
                     f"find {shlex.quote(final_root)} -mindepth 1 -maxdepth 1 "
                     "-type d -print0 | head -z -n 10001",
                     max_output_bytes=3 * 1024 * 1024,
@@ -392,8 +426,7 @@ class RemoteDispatcher:
                 f"&& chmod 0755 {shlex.quote(final_dir)} "
                 f"&& rm -f -- {q_stage} {q_state_file} {shlex.quote(pid_file)}"
             )
-            self._run(
-                client,
+            run_remote(
                 prepare,
             )
             if downloader == "wget":
@@ -408,7 +441,7 @@ class RemoteDispatcher:
                     use_proxy = "yes"
                 download = (
                     f"{proxy_env}"
-                        f"wget -q -cO {q_stage} --tries=99 --retry-connrefused "
+                    f"wget -cO {q_stage} --tries=99 --retry-connrefused "
                     f"--user-agent={q_ua} -e use_proxy={use_proxy} {q_url}"
                 )
             elif proxy_scheme == "socks5":
@@ -425,14 +458,14 @@ class RemoteDispatcher:
                 download = (
                     f"http_proxy={safe_proxy} https_proxy={safe_proxy} "
                     f"HTTP_PROXY={safe_proxy} HTTPS_PROXY={safe_proxy} "
-                    f"axel -q -n {axel_connections} -o {q_stage} "
+                    f"axel -n {axel_connections} -o {q_stage} "
                     f"--user-agent={q_ua} {q_url}"
                 )
             elif proxy_url:
                 raise RuntimeError("Proxy URL scheme must be http, https, or socks5.")
             else:
                 download = (
-                    f"axel -q -n {axel_connections} -o {q_stage} "
+                    f"axel -n {axel_connections} -o {q_stage} "
                     f"--user-agent={q_ua} {q_url}"
                 )
             remote_download = (
@@ -454,8 +487,9 @@ class RemoteDispatcher:
                 "exit \"$download_status\""
             )
             try:
-                self._run(
-                    client,
+                if on_command:
+                    on_command(remote_download)
+                run_remote(
                     remote_download,
                     on_progress,
                     cancel_event,
@@ -475,7 +509,7 @@ class RemoteDispatcher:
                     "-of default=noprint_wrappers=1:nokey=1 "
                     f"{q_stage}"
                 )
-                if not self._run(client, probe).strip():
+                if not run_remote(probe, cancel_event=cancel_event).strip():
                     raise RuntimeError("ffprobe found no video codec in the downloaded stream.")
                 if cancel_event and cancel_event.is_set():
                     raise DispatchCancelled("Download cancelled by request.")
@@ -485,18 +519,19 @@ class RemoteDispatcher:
                     f"[ \"$(stat -c %d {shlex.quote(stage_dir)})\" = "
                     f"\"$(stat -c %d {shlex.quote(final_dir)})\" ]"
                 )
-                self._run(client, same_filesystem)
+                run_remote(same_filesystem)
                 move = (
                     f"mv -Tn -- {q_stage} {shlex.quote(final_path)} "
                     f"&& rm -f -- {shlex.quote(pid_file)} && test ! -e {q_stage}"
                 )
-                self._run(client, move)
-                self._run(client, f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}")
+                run_remote(move)
+                run_remote(
+                    f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}"
+                )
                 return DispatchResult(final_path=final_path)
             except Exception as original_error:
                 try:
-                    self._run(
-                        client,
+                    run_remote(
                         f"rm -f -- {q_stage} {q_state_file} {shlex.quote(pid_file)} && "
                         f"rmdir --ignore-fail-on-non-empty {shlex.quote(staging_job_dir)}",
                     )

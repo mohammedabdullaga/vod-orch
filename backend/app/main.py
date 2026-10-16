@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import json
 import time
@@ -12,7 +13,7 @@ import httpx
 from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 
 from app.config import settings
 from app.auth import (
@@ -402,8 +403,10 @@ def toggle_category(payload: CategoryToggle):
 def get_queue():
     with SessionLocal() as db:
         rows = db.execute(
-            select(QueueItem, Account.username)
+            select(QueueItem, Account.username, Node.host)
             .outerjoin(Account, QueueItem.account_id == Account.id)
+            .outerjoin(StorageRoute, StorageRoute.kind == QueueItem.kind)
+            .outerjoin(Node, Node.id == StorageRoute.node_id)
             .where(QueueItem.hidden_from_dashboard.is_(False))
             .order_by(QueueItem.created_at.desc())
             .limit(500)
@@ -415,11 +418,84 @@ def get_queue():
         "series_id": item.series_id,
         "series_title": item.series_title, "season": item.season, "episode": item.episode,
         "status": item.status, "progress": item.progress, "account": username,
+        "host": host,
         "file_size_bytes": item.file_size_bytes,
         "speed_bytes_per_second": item.speed_bytes_per_second,
         "final_path": item.final_path,
-        "error": item.error, "retries": item.retries,
-    } for item, username in rows]
+        "error": item.error, "last_error": item.last_error, "retries": item.retries,
+    } for item, username, host in rows]
+
+
+@app.get("/api/tasks/{task_id}/logs/stream")
+def stream_task_logs(task_id: int):
+    with SessionLocal() as db:
+        if not db.get(QueueItem, task_id):
+            raise HTTPException(status_code=404, detail="Task not found.")
+
+    async def event_stream():
+        cursor = 0
+        last_snapshot = None
+        last_heartbeat = time.monotonic()
+        terminal_statuses = {"COMPLETED", "FAILED", "CANCELLED"}
+        while True:
+            with SessionLocal() as db:
+                row = db.execute(
+                    select(
+                        QueueItem.task_log,
+                        QueueItem.task_log_offset,
+                        QueueItem.dispatched_command,
+                        QueueItem.status,
+                        QueueItem.last_error,
+                        Account.username,
+                        Node.host,
+                    )
+                    .outerjoin(Account, Account.id == QueueItem.account_id)
+                    .outerjoin(StorageRoute, StorageRoute.kind == QueueItem.kind)
+                    .outerjoin(Node, Node.id == StorageRoute.node_id)
+                    .where(QueueItem.id == task_id)
+                ).first()
+            if row is None:
+                return
+            task_log, task_log_offset, command, status, last_error, account, host = row
+            command = decrypt_secret(command) if command else None
+            task_log = task_log or ""
+            log_start = max(0, task_log_offset - len(task_log))
+            reset = cursor < log_start or cursor > task_log_offset
+            delta = (
+                task_log
+                if reset
+                else task_log[cursor - log_start :]
+            )
+            cursor = task_log_offset
+            snapshot = {
+                "log": delta,
+                "reset": reset,
+                "command": command,
+                "status": status,
+                "last_error": last_error,
+                "account": account,
+                "host": host,
+            }
+            serialized = json.dumps(snapshot)
+            if serialized != last_snapshot:
+                yield f"data: {serialized}\n\n"
+                last_snapshot = serialized
+                last_heartbeat = time.monotonic()
+            elif time.monotonic() - last_heartbeat >= 15:
+                yield ": keep-alive\n\n"
+                last_heartbeat = time.monotonic()
+            if status in terminal_statuses:
+                return
+            await asyncio.sleep(0.75)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/queue/clear-completed")
@@ -496,6 +572,10 @@ def retry_item(payload: RetryRequest):
         item.progress = 0
         item.retry_after = None
         item.error = None
+        item.last_error = None
+        item.dispatched_command = None
+        item.task_log = ""
+        item.task_log_offset = 0
         item.retries = 0
         item.attempted_account_ids = json.dumps(
             sorted(account.id for account in accounts if account.id != next_account.id)
@@ -592,6 +672,11 @@ def cancel_queue_item(item_id: int):
         status_code = 404 if detail == "Queue item not found." else 409
         raise HTTPException(status_code=status_code, detail=detail) from exc
     return {"ok": True, "status": status}
+
+
+@app.post("/api/tasks/{task_id}/abort")
+def abort_task(task_id: int):
+    return cancel_queue_item(task_id)
 
 
 @app.get("/api/accounts")
