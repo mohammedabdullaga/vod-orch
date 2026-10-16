@@ -961,6 +961,42 @@ def list_storage_nodes():
     return [_node_json(node) for node in nodes]
 
 
+@app.post("/api/nodes/check-ssh")
+def check_storage_ssh_connections():
+    with SessionLocal() as db:
+        nodes = db.scalars(select(Node).order_by(Node.id)).all()
+        if not nodes:
+            raise HTTPException(
+                status_code=409,
+                detail="Add a storage server before checking SSH connections.",
+            )
+        results = []
+        for node in nodes:
+            try:
+                dispatcher.test_connection(node)
+            except Exception as exc:
+                logger.exception("SSH connection check failed for node %s", node.id)
+                node.last_connected_at = None
+                results.append({
+                    "id": node.id,
+                    "name": node.name,
+                    "host": node.host,
+                    "connected": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+            else:
+                node.last_connected_at = datetime.now(timezone.utc)
+                results.append({
+                    "id": node.id,
+                    "name": node.name,
+                    "host": node.host,
+                    "connected": True,
+                    "error": None,
+                })
+        db.commit()
+    return {"results": results}
+
+
 @app.post("/api/nodes")
 def add_storage_node(payload: SSHSettings):
     staging_path = _validated_remote_path(payload.staging_path, "Staging directory")

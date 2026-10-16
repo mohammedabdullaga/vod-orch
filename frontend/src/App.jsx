@@ -555,6 +555,23 @@ function App() {
               <form onSubmit={addProxy} className="mt-4 flex gap-2 border-t border-slate-800 pt-4"><input required placeholder="http://user:pass@host:port" value={proxyUrl} onChange={(e) => setProxyUrl(e.target.value)} className="field" /><button disabled={busy} className="primary"><Plus size={15} />Add</button></form>
             </div>
           </section>
+          <section className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-indigo-900/50 bg-indigo-950/20 p-5 lg:col-span-2">
+            <div>
+              <h2 className="font-semibold text-white">SSH connectivity check</h2>
+              <p className="mt-1 text-xs text-slate-400">Test the saved SSH credentials, host-key trust, and storage paths on every configured storage server.</p>
+            </div>
+            <button
+              type="button"
+              disabled={busy || !nodes.length}
+              onClick={() => act(
+                () => api.post("/nodes/check-ssh"),
+                ({ data }) => data.results.map((result) =>
+                  `${result.name} (${result.host}): ${result.connected ? "Connected" : `Failed — ${result.error}`}`
+                ).join(" · "),
+              )}
+              className="secondary shrink-0 disabled:cursor-not-allowed disabled:opacity-40"
+            ><Wifi size={15} />Check SSH connections</button>
+          </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320] lg:col-span-2">
             <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Server size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Storage servers &amp; routing</h2><p className="text-xs text-slate-500">Movies and series are assigned independently. SSH host keys must be trusted on the daemon.</p></div></div>
             <div className="grid gap-5 p-5 lg:grid-cols-2">
