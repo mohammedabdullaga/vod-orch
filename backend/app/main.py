@@ -46,6 +46,7 @@ from app.services.provider_client import (
 )
 from app.security import decrypt_secret, encrypt_secret, mask_secret
 from app.services.dispatcher import RemoteDispatcher
+from app.services.m3u_fetch_worker import M3UFetchWorker
 from app.services.poller import CategoryPoller
 from app.services.worker_pool import WorkerPool
 from app.routers.content import (
@@ -62,6 +63,7 @@ dispatcher = RemoteDispatcher(
 )
 poller = CategoryPoller()
 worker_pool = WorkerPool(dispatcher)
+m3u_fetch_worker = M3UFetchWorker()
 
 
 @asynccontextmanager
@@ -70,11 +72,13 @@ async def lifespan(_app: FastAPI):
         raise RuntimeError("Set APP_ENCRYPTION_KEY before starting the API.")
     validate_auth_settings()
     init_db()
+    await m3u_fetch_worker.start()
     await poller.start()
     await worker_pool.start()
     yield
     await worker_pool.stop()
     await poller.stop()
+    await m3u_fetch_worker.stop()
 
 
 app = FastAPI(title="Media Ingestion Engine", version="1.0.0", lifespan=lifespan)
@@ -88,6 +92,7 @@ app.add_middleware(
 )
 app.state.worker_pool = worker_pool
 app.state.dispatcher = dispatcher
+app.state.m3u_fetch_worker = m3u_fetch_worker
 app.include_router(content_router)
 app.include_router(queue_router)
 app.include_router(playlist_router)

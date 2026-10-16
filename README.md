@@ -282,6 +282,9 @@ If the dashboard and API are served from different browser origins, set `CORS_OR
 | `GET` / `PUT` | `/api/settings/provider-proxy` | Persist the provider API proxy used for browsing and background polling |
 | `GET` / `POST` / `PUT` / `DELETE` | `/api/nodes` | List, add, update, or remove storage servers |
 | `GET` / `PUT` | `/api/settings/storage-routing` | Assign Series and Movies to their storage server |
+| `POST` | `/api/playlists/import` | Enqueue an M3U fetch on the VPS and return a job ID |
+| `POST` | `/api/playlists/{playlist_id}/refresh` | Enqueue an M3U refresh on the VPS |
+| `GET` | `/api/playlists/jobs/{job_id}` | Read M3U fetch/import job status and result |
 
 The interactive OpenAPI documentation is at `/docs` on the API origin; keep it behind the same access controls as the API.
 
@@ -290,6 +293,7 @@ The interactive OpenAPI documentation is at `/docs` on the API origin; keep it b
 - A worker is created for each enabled provider account and reconciled on every worker-pool poll; adding an account wakes the pool immediately. Each queue item is claimed by one idle worker for the same provider endpoint, and its stream URL is rebuilt with that worker's credentials.
 - Manual browser queue requests wake the account worker immediately and use the same provider/type/stream identity and safe destination layout as polled items. Repeated queued/completed items are reported as skipped.
 - On daemon startup, interrupted `DOWNLOADING` and `VERIFYING` jobs are reset to `PENDING` for recovery.
+- M3U imports and refreshes run in the VPS backend worker and persist their job status in SQLite; the dashboard polls for completion instead of holding a Cloudflare-proxied request open. Interrupted M3U jobs resume after daemon restart. Transient HTTP 429/5xx and network errors are retried up to three times with backoff; permanent failures include a safe error in the job status.
 - Queue stream IDs are unique. Existing queue items are not re-created when polled again.
 - Failed jobs are retried with exponential backoff up to `MAX_RETRIES`; manual retry is also available.
 - **Stop all & clear all** cancels active work, cancels pending work and hides every queue entry. Records remain internally as deduplication tombstones; completed media files are never deleted by this action. Monitored categories remain enabled and can enqueue future new streams.

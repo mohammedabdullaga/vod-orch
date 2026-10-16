@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Check, ChevronDown, Download, Film, LayoutGrid, List, LoaderCircle, Search, Tv, X,
 } from "lucide-react";
+import { waitForM3uJob } from "./m3uJobs";
 
 const kindFor = (type) => type === "series" ? "series" : "vod";
 
@@ -227,8 +228,14 @@ export default function ContentBrowser({
     try {
       if (sourceType === "m3u") {
         if (forceRefresh) {
-          await api.post(`/playlists/${sourcePlaylistId}/refresh`, null, {
+          const { data: job } = await api.post(`/playlists/${sourcePlaylistId}/refresh`, null, {
             params: { proxy_id: providerProxyId ? Number(providerProxyId) : 0 },
+          });
+          setNotice("Refreshing the M3U catalog on the VPS…");
+          await waitForM3uJob(api, job.job_id, (state) => {
+            if (state.status === "RUNNING") {
+              setNotice("The VPS is downloading and indexing the M3U playlist…");
+            }
           });
           const { data: refreshedCategories } = await api.get(
             `/playlists/${sourcePlaylistId}/categories`,

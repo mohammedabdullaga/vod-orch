@@ -87,6 +87,26 @@ class M3UPlaylist(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class M3UFetchJob(Base):
+    __tablename__ = "m3u_fetch_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    operation: Mapped[str] = mapped_column(String(16))
+    name: Mapped[str] = mapped_column(String(255))
+    playlist_id: Mapped[int | None] = mapped_column(
+        ForeignKey("m3u_playlists.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_url_encrypted: Mapped[str] = mapped_column(Text)
+    proxy_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
+    entry_count: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
 class M3UEntry(Base):
     __tablename__ = "m3u_entries"
     __table_args__ = (

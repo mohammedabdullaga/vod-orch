@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import axios from "axios";
 import ContentBrowser from "./ContentBrowser";
+import { waitForM3uJob } from "./m3uJobs";
 import {
   Activity, Check, CircleAlert, Clapperboard, Film, Gauge, LogOut, LockKeyhole,
   Play, Plus, Radio, RefreshCw, Server, Settings2, Trash2, Tv, Wifi, XCircle,
@@ -270,19 +271,30 @@ function App() {
   const importPlaylist = (event) => {
     event.preventDefault();
     act(async () => {
-      await api.post("/playlists/import", {
+      const { data: job } = await api.post("/playlists/import", {
         ...playlistForm,
         proxy_id: playlistForm.proxy_id ? Number(playlistForm.proxy_id) : null,
       });
+      setNotice("Fetching the M3U playlist on the VPS and saving it to SQLite…");
+      const result = await waitForM3uJob(api, job.job_id, (state) => {
+        if (state.status === "RUNNING") {
+          setNotice("The VPS is downloading and indexing the M3U playlist…");
+        }
+      });
       setPlaylistForm((form) => ({ name: "", url: "", proxy_id: form.proxy_id }));
       await loadSettings();
-    }, "M3U playlist fetched and saved to the local catalog.");
+      return result;
+    }, (result) => `M3U playlist fetched on the VPS: ${result.entry_count} entries saved to SQLite.`);
   };
   const refreshPlaylist = (playlist) => act(
     async () => {
-      const { data } = await api.post(`/playlists/${playlist.id}/refresh`);
+      const { data: job } = await api.post(`/playlists/${playlist.id}/refresh`);
+      setNotice(`Refreshing ${playlist.name} on the VPS…`);
+      const data = await waitForM3uJob(api, job.job_id, (state) => {
+        if (state.status === "RUNNING") setNotice(`Refreshing and indexing ${playlist.name} on the VPS…`);
+      });
       await loadSettings();
-      return data;
+      return { ...data, name: playlist.name };
     },
     (data) => `Refreshed ${playlist.name}: ${data.entry_count} entries stored.`,
   );

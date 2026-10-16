@@ -18,6 +18,7 @@ from app.config import settings
 from app.models import (
     Account,
     M3UEntry,
+    M3UFetchJob,
     M3UPlaylist,
     MonitoredCategory,
     Node,
@@ -35,7 +36,6 @@ from app.services.provider_client import (
     stream_url,
 )
 from app.security import decrypt_secret, encrypt_secret
-from app.services.m3u import fetch_playlist, replace_playlist_entries
 from app.services.content_paths import (
     category_directory_name,
     clean_content_name,
@@ -159,34 +159,6 @@ class M3UPlaylistCreate(BaseModel):
 
 class M3UPlaylistProxyUpdate(BaseModel):
     proxy_id: int | None = Field(default=None, ge=0)
-
-
-def _m3u_fetch_http_exception(exc: Exception, operation: str) -> HTTPException:
-    if isinstance(exc, httpx.HTTPStatusError):
-        status_code = exc.response.status_code
-        logger.warning("M3U %s source returned HTTP %s", operation, status_code)
-        return HTTPException(
-            status_code=502,
-            detail=f"M3U source returned HTTP {status_code}. Check the playlist URL and assigned proxy.",
-        )
-    if isinstance(exc, httpx.TimeoutException):
-        logger.warning("M3U %s request timed out", operation)
-        return HTTPException(
-            status_code=504,
-            detail="M3U source request timed out. Check the source and assigned proxy.",
-        )
-    if isinstance(exc, httpx.RequestError):
-        error_type = type(exc).__name__
-        logger.warning("M3U %s network request failed (%s)", operation, error_type)
-        return HTTPException(
-            status_code=502,
-            detail=f"M3U network request failed ({error_type}). Check the source URL and assigned proxy.",
-        )
-    logger.error("M3U %s failed (%s)", operation, type(exc).__name__)
-    return HTTPException(
-        status_code=502,
-        detail=f"Could not fetch or parse the M3U playlist ({type(exc).__name__}).",
-    )
 
 
 def _playlist_category_id(playlist_id: int, group_title: str) -> str:
@@ -320,64 +292,85 @@ def list_m3u_playlists() -> list[dict[str, Any]]:
 
 
 @playlist_router.post("/import")
-async def import_m3u_playlist(payload: M3UPlaylistCreate) -> dict[str, Any]:
+def import_m3u_playlist(
+    payload: M3UPlaylistCreate,
+    request: Request,
+) -> dict[str, Any]:
     if not payload.name.strip():
         raise HTTPException(status_code=422, detail="Playlist name cannot be blank.")
     proxy_id = payload.proxy_id or None
     try:
-        proxy_url = resolve_provider_proxy(proxy_id)
+        resolve_provider_proxy(proxy_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    try:
-        entries = await fetch_playlist(payload.url, proxy_url)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        raise _m3u_fetch_http_exception(exc, "import") from exc
-    if not entries:
-        raise HTTPException(status_code=422, detail="The M3U playlist contains no usable HTTP streams.")
+    source = urlsplit(payload.url)
+    if source.scheme.lower() not in ("http", "https") or not source.netloc:
+        raise HTTPException(
+            status_code=422,
+            detail="Playlist URL must be an absolute HTTP or HTTPS URL.",
+        )
     with SessionLocal() as db:
-        playlist = M3UPlaylist(
+        job = M3UFetchJob(
+            operation="import",
             name=payload.name.strip(),
             source_url_encrypted=encrypt_secret(payload.url),
             proxy_id=proxy_id,
-            entry_count=0,
-            fetched_at=utc_now(),
+            status="PENDING",
         )
-        db.add(playlist)
+        db.add(job)
         db.commit()
-        db.refresh(playlist)
-        playlist_id = playlist.id
-    count = await asyncio.to_thread(replace_playlist_entries, playlist_id, entries)
-    return {"id": playlist_id, "name": payload.name.strip(), "entry_count": count}
+        job_id = job.id
+    request.app.state.m3u_fetch_worker.wake()
+    return {"job_id": job_id, "status": "PENDING"}
 
 
 @playlist_router.post("/{playlist_id}/refresh")
-async def refresh_m3u_playlist(playlist_id: int) -> dict[str, Any]:
+def refresh_m3u_playlist(playlist_id: int, request: Request) -> dict[str, Any]:
     with SessionLocal() as db:
         playlist = db.get(M3UPlaylist, playlist_id)
         if not playlist:
             raise HTTPException(status_code=404, detail="M3U playlist not found.")
-        source_url = decrypt_secret(playlist.source_url_encrypted)
+        source_url_encrypted = playlist.source_url_encrypted
         proxy_id = playlist.proxy_id
     try:
-        proxy_url = resolve_provider_proxy(proxy_id)
+        resolve_provider_proxy(proxy_id)
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail=f"The assigned M3U proxy is unavailable. Replace it before refreshing: {exc}",
         ) from exc
-    try:
-        entries = await fetch_playlist(source_url, proxy_url)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        exception = _m3u_fetch_http_exception(exc, f"refresh for playlist {playlist_id}")
-        raise exception from exc
-    if not entries:
-        raise HTTPException(status_code=422, detail="The refreshed playlist contains no usable HTTP streams.")
-    count = await asyncio.to_thread(replace_playlist_entries, playlist_id, entries)
-    return {"id": playlist_id, "entry_count": count}
+    with SessionLocal() as db:
+        job = M3UFetchJob(
+            operation="refresh",
+            name="",
+            playlist_id=playlist_id,
+            source_url_encrypted=source_url_encrypted,
+            proxy_id=proxy_id,
+            status="PENDING",
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+    request.app.state.m3u_fetch_worker.wake()
+    return {"job_id": job_id, "playlist_id": playlist_id, "status": "PENDING"}
+
+
+@playlist_router.get("/jobs/{job_id}")
+def get_m3u_fetch_job(job_id: int) -> dict[str, Any]:
+    with SessionLocal() as db:
+        job = db.get(M3UFetchJob, job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="M3U fetch job not found.")
+        return {
+            "job_id": job.id,
+            "operation": job.operation,
+            "playlist_id": job.playlist_id,
+            "status": job.status,
+            "entry_count": job.entry_count,
+            "error": job.error,
+            "created_at": job.created_at.isoformat(),
+            "updated_at": job.updated_at.isoformat(),
+        }
 
 
 @playlist_router.put("/{playlist_id}/proxy")
