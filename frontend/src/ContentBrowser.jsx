@@ -142,6 +142,9 @@ export default function ContentBrowser({
     () => items.filter((item) => selectedItems.has(item.id)),
     [items, selectedItems],
   );
+  const selectedMonitoredCategories = categories.filter(
+    (category) => selectedCategories.has(category.category_id) && category.monitored,
+  );
   const knownEpisodeCount = selectedTitles.reduce(
     (total, item) => total + (Number(item.total_episodes) || 0),
     0,
@@ -173,8 +176,11 @@ export default function ContentBrowser({
     });
   };
 
-  const monitorSelected = async () => {
-    const selected = categories.filter((category) => selectedCategories.has(category.category_id));
+  const setSelectedMonitoring = async (monitored) => {
+    const selected = categories.filter((category) =>
+      selectedCategories.has(category.category_id)
+      && (monitored || category.monitored)
+    );
     if (!selected.length) return setNotice("Select at least one category to monitor.");
     setBusy(true);
     setNotice("");
@@ -184,16 +190,27 @@ export default function ContentBrowser({
           category_id: category.category_id,
           name: category.category_name,
           kind: kindFor(type),
-          monitored: true,
+          monitored,
           destination_path: category.destination_path || null,
           match_existing_series: category.match_existing_series || false,
           strip_prefixes: category.strip_prefixes || "",
         });
       }
       setCategories((current) => current.map((category) =>
-        selectedCategories.has(category.category_id) ? { ...category, monitored: true } : category
+        selected.some((selectedCategory) => selectedCategory.category_id === category.category_id)
+          ? { ...category, monitored }
+          : category
       ));
-      setNotice(`Monitoring enabled for ${selected.length} categor${selected.length === 1 ? "y" : "ies"}.`);
+      setSelectedCategories((current) => {
+        const next = new Set(current);
+        selected.forEach((category) => next.delete(category.category_id));
+        return next;
+      });
+      setNotice(
+        monitored
+          ? `Monitoring enabled for ${selected.length} categor${selected.length === 1 ? "y" : "ies"}.`
+          : `Monitoring disabled for ${selected.length} categor${selected.length === 1 ? "y" : "ies"}.`
+      );
     } catch (error) {
       setNotice(error.response?.data?.detail || "Could not update category monitoring.");
     } finally {
@@ -726,7 +743,12 @@ export default function ContentBrowser({
               </div>
               <div className="mt-3 flex items-center justify-between text-xs">
                 <span className="text-slate-500">{selectedCategories.size} selected</span>
-                <button onClick={selectVisibleCategories} className="text-indigo-300 hover:text-indigo-200">Select visible</button>
+                <div className="flex items-center gap-3">
+                  {selectedCategories.size > 0 && <button onClick={() => setSelectedCategories(new Set())} className="text-slate-400 hover:text-slate-200">Clear selection</button>}
+                  <button onClick={selectVisibleCategories} disabled={!visibleCategories.length} className="text-indigo-300 hover:text-indigo-200 disabled:opacity-40">
+                    {visibleCategories.length && visibleCategories.every((category) => selectedCategories.has(category.category_id)) ? "Deselect visible" : "Select visible"}
+                  </button>
+                </div>
               </div>
             </div>
             <div className="max-h-72 overflow-y-auto p-2">
@@ -740,7 +762,10 @@ export default function ContentBrowser({
               {!visibleCategories.length && <p className="px-3 py-8 text-center text-sm text-slate-500">{sourceType === "m3u" && !playlists.length ? "Import an M3U playlist in Settings & Accounts." : sourceType === "xtream" && !providerAccounts.length ? "Add an enabled Xtream account to browse." : categories.length ? "No matching categories." : "No categories available for this source and type."}</p>}
             </div>
             <div className="grid gap-2 border-t border-slate-800 p-3 sm:grid-cols-2">
-              {sourceType === "xtream" && <button disabled={busy || !selectedCategories.size} onClick={monitorSelected} className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-40">Monitor selected</button>}
+              {sourceType === "xtream" && <>
+                <button disabled={busy || !selectedCategories.size} onClick={() => setSelectedMonitoring(true)} className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-40">Monitor selected</button>
+                {selectedMonitoredCategories.length > 0 && <button disabled={busy} onClick={() => setSelectedMonitoring(false)} className="rounded-lg border border-amber-800/70 px-3 py-2 text-xs font-medium text-amber-300 hover:bg-amber-950/40 disabled:opacity-40">Stop monitoring selected ({selectedMonitoredCategories.length})</button>}
+              </>}
               <button disabled={busy || !selectedCategories.size} onClick={() => browseSelected()} className="rounded-lg bg-indigo-500 px-3 py-2 text-xs font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">Browse selected</button>
               <button disabled={busy || !selectedCategories.size} onClick={() => browseSelected(true)} title={sourceType === "m3u" ? "Fetch the latest playlist and replace its saved catalog." : "Fetch fresh categories and titles from the provider instead of using cached data."} className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-300 hover:border-slate-500 hover:text-white disabled:opacity-40">{sourceType === "m3u" ? "Refresh playlist" : "Refresh from provider"}</button>
             </div>
