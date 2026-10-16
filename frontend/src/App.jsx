@@ -252,6 +252,17 @@ function App() {
       ({ data }) => `Cleared ${data.cleared_count} completed item${data.cleared_count === 1 ? "" : "s"} from the dashboard list. Downloaded files were not deleted.`,
     );
   };
+  const forceRequeuePending = () => {
+    const pendingCount = status?.queue?.pending || 0;
+    if (!pendingCount) return;
+    if (!window.confirm(
+      `Force requeue all ${pendingCount} pending task${pendingCount === 1 ? "" : "s"}? Account assignments and retry history will be reset, then workers will be notified.`
+    )) return;
+    act(
+      () => api.post("/queue/requeue-pending"),
+      ({ data }) => `${data.message} Requeued ${data.requeued_count} task${data.requeued_count === 1 ? "" : "s"}.`,
+    );
+  };
   const stopAllAndClearQueue = () => {
     const counts = status?.queue || {};
     const total = [
@@ -454,7 +465,7 @@ function App() {
             {statCards.map(([label, value, Icon, color]) => <div key={label} className="rounded-2xl border border-slate-800 bg-[#0d1320] p-5"><div className="flex items-center justify-between"><span className="text-sm text-slate-400">{label}</span><Icon size={17} className={color} /></div><div className="mt-3 text-3xl font-semibold text-white">{value}</div></div>)}
           </div>
           <section className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0d1320]">
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-5 py-4"><div><h2 className="font-semibold text-white">Ingestion queue</h2><p className="mt-1 text-xs text-slate-500">Latest 500 discovered streams</p></div><div className="flex flex-wrap items-center gap-2"><button onClick={clearDownloadedList} disabled={busy || !(counts.completed || 0)} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 size={14} />Clear downloaded list</button><button onClick={stopAllAndClearQueue} disabled={busy || ![counts.pending, counts.downloading, counts.verifying, counts.completed, counts.failed, counts.cancelled, counts.cancelling].some((value) => value > 0)} className="inline-flex items-center gap-1.5 rounded-lg border border-rose-900/70 px-3 py-2 text-xs text-rose-300 hover:bg-rose-950/40 disabled:cursor-not-allowed disabled:opacity-40"><XCircle size={14} />Stop all &amp; clear all</button><button onClick={refresh} disabled={busy} className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white disabled:opacity-40" aria-label="Refresh queue"><RefreshCw size={16} /></button></div></div>
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-5 py-4"><div><h2 className="font-semibold text-white">Ingestion queue</h2><p className="mt-1 text-xs text-slate-500">Latest 500 discovered streams</p></div><div className="flex flex-wrap items-center gap-2"><button onClick={forceRequeuePending} disabled={busy || !(counts.pending || 0)} className="inline-flex items-center gap-1.5 rounded-lg border border-amber-800/70 bg-amber-950/20 px-3 py-2 text-xs text-amber-200 hover:bg-amber-950/40 disabled:cursor-not-allowed disabled:opacity-40"><RefreshCw size={14} />Force requeue pending ({counts.pending || 0})</button><button onClick={clearDownloadedList} disabled={busy || !(counts.completed || 0)} className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"><Trash2 size={14} />Clear downloaded list</button><button onClick={stopAllAndClearQueue} disabled={busy || ![counts.pending, counts.downloading, counts.verifying, counts.completed, counts.failed, counts.cancelled, counts.cancelling].some((value) => value > 0)} className="inline-flex items-center gap-1.5 rounded-lg border border-rose-900/70 px-3 py-2 text-xs text-rose-300 hover:bg-rose-950/40 disabled:cursor-not-allowed disabled:opacity-40"><XCircle size={14} />Stop all &amp; clear all</button><button onClick={refresh} disabled={busy} className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white disabled:opacity-40" aria-label="Refresh queue"><RefreshCw size={16} /></button></div></div>
             <div className="flex flex-wrap gap-2 border-b border-slate-800 px-5 py-3">
               {queueFilters.map((filter) => (
                 <button

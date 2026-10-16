@@ -596,6 +596,45 @@ def retry_item(payload: RetryRequest):
     return {"ok": True}
 
 
+@app.post("/api/queue/requeue-pending")
+def requeue_pending_items():
+    message = "Manually requeued by administrator; waiting for worker dispatch.\n"
+    with SessionLocal() as db:
+        items = db.scalars(
+            select(QueueItem).where(
+                QueueItem.status == "PENDING",
+                QueueItem.hidden_from_dashboard.is_(False),
+            )
+        ).all()
+        for item in items:
+            item.account_id = None
+            item.attempted_account_ids = "[]"
+            item.retry_after = None
+            item.retries = 0
+            item.progress = 0
+            item.file_size_bytes = None
+            item.speed_bytes_per_second = None
+            item.dispatched_command = None
+            item.last_error = None
+            item.error = None
+            item.task_log = (item.task_log + message)[-262144:]
+            item.task_log_offset += len(message)
+            item.updated_at = utc_now()
+        db.commit()
+        requeued_count = len(items)
+    if requeued_count:
+        worker_pool.wake()
+    return {
+        "ok": True,
+        "requeued_count": requeued_count,
+        "message": (
+            "Pending tasks were reset and workers were notified."
+            if requeued_count
+            else "There are no pending tasks to requeue."
+        ),
+    }
+
+
 @app.post("/api/tasks/purge-history")
 async def purge_task_history(payload: PurgeTaskHistoryRequest):
     try:
