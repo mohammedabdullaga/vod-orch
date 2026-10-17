@@ -447,6 +447,8 @@ def get_queue(
         "speed_bytes_per_second": item.speed_bytes_per_second,
         "final_path": item.final_path,
         "error": item.error, "last_error": item.last_error, "retries": item.retries,
+        "retry_after": item.retry_after.isoformat() if item.retry_after else None,
+        "retry_limit": settings.max_retries,
     } for item, username, host in rows]
 
 

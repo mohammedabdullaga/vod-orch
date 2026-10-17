@@ -98,6 +98,14 @@ class WorkerPool:
                         continue
                     self._workers.pop(account_id).cancel()
                     self._wakeups.pop(account_id, None)
+                with SessionLocal() as db:
+                    released_retries = self._release_due_retries(db, utc_now())
+                if released_retries:
+                    logger.info(
+                        "Released %s failed queue item(s) for automatic retry.",
+                        released_retries,
+                    )
+                    self.wake()
                 if time.monotonic() >= next_reconciliation:
                     self._reconcile_worker_state()
                     next_reconciliation = time.monotonic() + 15
@@ -790,69 +798,65 @@ class WorkerPool:
             self.wake()
 
     @staticmethod
-    def _release_due_retries(db, now) -> None:
-        due = db.execute(
-            select(
-                QueueItem.id,
-                QueueItem.attempted_account_ids,
-                QueueItem.source_provider_url,
-            ).where(
+    def _release_due_retries(db, now) -> int:
+        due = db.scalars(
+            select(QueueItem).where(
                 QueueItem.status == "FAILED",
                 QueueItem.retry_after.is_not(None),
                 QueueItem.retry_after <= now,
                 QueueItem.retries < settings.max_retries,
             )
         ).all()
-        for item_id, history, source_provider_url in due:
+        released = 0
+        for item in due:
             try:
                 attempted_account_ids = {
-                    int(value) for value in json.loads(history or "[]")
+                    int(value)
+                    for value in json.loads(item.attempted_account_ids or "[]")
                 }
             except (json.JSONDecodeError, TypeError, ValueError):
-                db.execute(
-                    update(QueueItem)
-                    .where(
-                        QueueItem.id == item_id,
-                        QueueItem.status == "FAILED",
-                        QueueItem.retry_after <= now,
-                    )
-                    .values(
-                        retry_after=None,
-                        error="Invalid account retry history; inspect the queue record before retrying.",
-                        updated_at=utc_now(),
-                    )
+                item.retry_after = None
+                item.error = (
+                    "Invalid account retry history; inspect the queue record before retrying."
                 )
+                item.updated_at = utc_now()
                 continue
             accounts_query = select(Account.id).where(Account.enabled.is_(True))
-            if source_provider_url and not source_provider_url.startswith("m3u:"):
-                item = db.get(QueueItem, item_id)
-                if item and item.provider_stream_id is None:
-                    accounts_query = select(Account.id).where(
-                        Account.enabled.is_(True),
-                        Account.provider_url == source_provider_url,
-                    )
+            if (
+                item.source_provider_url
+                and not item.source_provider_url.startswith("m3u:")
+                and item.provider_stream_id is None
+            ):
+                accounts_query = select(Account.id).where(
+                    Account.enabled.is_(True),
+                    Account.provider_url == item.source_provider_url,
+                )
             eligible_accounts = list(db.scalars(accounts_query).all())
             available_account_ids = set(eligible_accounts)
             if not available_account_ids - attempted_account_ids:
                 attempted_account_ids = set()
-            db.execute(
-                update(QueueItem)
-                .where(
-                    QueueItem.id == item_id,
-                    QueueItem.status == "FAILED",
-                    QueueItem.retry_after <= now,
-                )
-                .values(
-                    status="PENDING",
-                    account_id=None,
-                    attempted_account_ids=json.dumps(sorted(attempted_account_ids)),
-                    retry_after=None,
-                    error=None,
-                    updated_at=utc_now(),
-                )
+            retry_message = (
+                f"Automatic retry {item.retries + 1}/{settings.max_retries} "
+                "released to the queue.\n"
+            )
+            item.status = "PENDING"
+            item.account_id = None
+            item.attempted_account_ids = json.dumps(sorted(attempted_account_ids))
+            item.retry_after = None
+            item.error = None
+            item.task_log = (item.task_log + retry_message)[-_TASK_LOG_LIMIT:]
+            item.task_log_offset += len(retry_message)
+            item.updated_at = utc_now()
+            released += 1
+            logger.info(
+                "Queue item %s scheduled as automatic retry %s/%s.",
+                item.id,
+                item.retries + 1,
+                settings.max_retries,
             )
         if due:
             db.commit()
+        return released
 
     @staticmethod
     def _release_claim(item_id: int, account_id: int) -> None:

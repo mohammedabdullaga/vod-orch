@@ -194,7 +194,7 @@ sudo chown media-ingestion:media-ingestion /opt/media-ingestion/backend/.env
 sudo chmod 0600 /opt/media-ingestion/backend/.env
 ```
 
-Other supported settings are `SESSION_TTL_SECONDS` (default `28800`), `POLL_INTERVAL_SECONDS` (default `300`), `PROVIDER_CATALOG_TTL_SECONDS` (default `1800`), `PROVIDER_SERIES_DETAILS_TTL_SECONDS` (default `21600`), `WORKER_POLL_SECONDS` (default `2`), `MAX_RETRIES` (default `5`), `REQUEST_TIMEOUT_SECONDS` (default `30`), and `REMOTE_JOB_TIMEOUT_SECONDS` (default `86400`).
+Other supported settings are `SESSION_TTL_SECONDS` (default `28800`), `POLL_INTERVAL_SECONDS` (default `300`), `PROVIDER_CATALOG_TTL_SECONDS` (default `1800`), `PROVIDER_SERIES_DETAILS_TTL_SECONDS` (default `21600`), `WORKER_POLL_SECONDS` (default `2`), `MAX_RETRIES` (default `20`), `REQUEST_TIMEOUT_SECONDS` (default `30`), and `REMOTE_JOB_TIMEOUT_SECONDS` (default `86400`).
 
 ### 5. Install and start systemd service
 
@@ -309,7 +309,7 @@ The interactive OpenAPI documentation is at `/docs` on the API origin; keep it b
 - The **Force requeue pending** action on the queue resets the account assignment, retry history, and last error for all visible pending tasks, logs the manual reset, and immediately wakes workers. The response reports how many items have a configured storage route and compatible enabled account, plus any blocked content kinds and worker-pool health; requeueing itself does not decrement the pending count until a worker claims a task.
 - Xtream catalog sync runs in a VPS backend worker and persists its cache, status, and progress in SQLite; the dashboard polls progress instead of holding a Cloudflare-proxied request open. Interrupted syncs are re-queued from the beginning after daemon restart. M3U imports remain supported by legacy API routes but are not exposed in the primary dashboard.
 - Queue stream IDs are unique. Existing queue items are not re-created when polled again.
-- Failed jobs are retried with exponential backoff up to `MAX_RETRIES`; manual retry is also available.
+- Failed jobs are retried automatically with exponential backoff up to `MAX_RETRIES` (default `20`, with delays capped at one hour); due retries are released by the scheduler and wake account workers. The queue shows whether a retry is scheduled, the next attempt number, or whether retries are exhausted. Manual retry remains available to start a fresh retry cycle. Set `MAX_RETRIES=20` in an existing VPS `.env`; its current value overrides the default.
 - **Stop all & clear all** cancels active work, cancels pending work and hides every queue entry. Records remain internally as deduplication tombstones; completed media files are never deleted by this action. Monitored categories remain enabled and can enqueue future new streams.
 - **Clean Task History & Reset Queue** in Settings can delete all history, only failed/completed items, only pending items, or reconcile stale worker state without deleting task records. Active jobs selected by the cleanup are cancelled first, and their staging artifacts are cleaned before their records are deleted. Completed media is preserved.
 - SSH host-key checking is strict. The daemon must trust the storage server key before a test or download can succeed.

@@ -21,7 +21,7 @@ class Settings:
         os.getenv("PROVIDER_SERIES_DETAILS_INTERVAL_SECONDS", "3")
     )
     worker_poll_seconds: int = int(os.getenv("WORKER_POLL_SECONDS", "2"))
-    max_retries: int = int(os.getenv("MAX_RETRIES", "5"))
+    max_retries: int = int(os.getenv("MAX_RETRIES", "20"))
     request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
     remote_job_timeout_seconds: int = int(os.getenv("REMOTE_JOB_TIMEOUT_SECONDS", "86400"))
     remote_download_idle_timeout_seconds: int = int(
@@ -41,6 +41,8 @@ class Settings:
     )
 
     def __post_init__(self) -> None:
+        if self.max_retries < 1:
+            raise ValueError("MAX_RETRIES must be at least 1.")
         if not 1 <= self.default_axel_connections <= 12:
             raise ValueError("DEFAULT_AXEL_CONNECTIONS must be between 1 and 12.")
         if self.provider_series_details_interval_seconds < 0:
