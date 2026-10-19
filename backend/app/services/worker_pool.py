@@ -5,6 +5,7 @@ import re
 import threading
 import time
 from datetime import timedelta
+from pathlib import PurePosixPath
 
 from sqlalchemy import delete, or_, select, update
 
@@ -21,7 +22,12 @@ from app.models import (
 )
 from app.services.provider_client import stream_url
 from app.security import decrypt_secret, encrypt_secret
-from app.services.content_paths import safe_extension
+from app.services.content_paths import (
+    clean_content_name,
+    legacy_identity_segment,
+    safe_extension,
+    series_identity_key,
+)
 from app.services.dispatcher import DispatchCancelled, RemoteDispatcher
 
 logger = logging.getLogger(__name__)
@@ -932,6 +938,26 @@ class WorkerPool:
                 else:
                     stream_url_value = decrypt_secret(item.stream_url_encrypted)
                 user_agent = account.user_agent or "Mozilla"
+                series_name = item.series_title if item.kind == "series" else None
+                source_url = item.source_provider_url or account.provider_url
+                series_id = item.series_id or item.provider_stream_id or item.stream_id
+                legacy_series_folder = (
+                    legacy_identity_segment(
+                        clean_content_name(
+                            series_name,
+                            category.strip_prefixes if category else None,
+                        ),
+                        series_id,
+                        source_url,
+                    )
+                    if series_name
+                    else None
+                )
+                series_key = (
+                    series_identity_key(series_id, source_url)
+                    if series_name
+                    else None
+                )
                 destination_root = (
                     item.destination_path
                     or (category.destination_path if category else None)
@@ -990,8 +1016,10 @@ class WorkerPool:
                 ),
                 downloader=downloader,
                 match_existing_series=match_existing_series,
-                series_name=series_match_name,
+                series_name=series_match_name or series_name,
                 series_match_prefixes=series_match_prefixes,
+                series_identity=series_key,
+                legacy_series_folder=legacy_series_folder,
                 on_log=lambda text: self._append_task_log(
                     item_id, self._redact_task_text(text, stream_url_value, proxy_url)
                 ),
@@ -1005,10 +1033,75 @@ class WorkerPool:
                     item.status = "COMPLETED"
                     item.progress = 100
                     item.final_path = result.final_path
+                    if result.relative_path:
+                        item.file_name = result.relative_path
                     item.error = None
                     item.last_error = None
                     item.retry_after = None
                     db.commit()
+                    should_compact_legacy_folder = bool(
+                        result.relative_path
+                        and series_name
+                        and series_key
+                        and legacy_series_folder
+                        and not match_existing_series
+                        and item.series_id
+                        and not db.scalar(
+                            select(QueueItem.id)
+                            .where(
+                                QueueItem.series_id == item.series_id,
+                                QueueItem.source_provider_url
+                                == item.source_provider_url,
+                                QueueItem.status.in_(
+                                    ("PENDING", "DOWNLOADING", "VERIFYING", "CANCELLING")
+                                ),
+                            )
+                            .limit(1)
+                        )
+                    )
+                    series_prefixes = category.strip_prefixes if category else None
+                else:
+                    should_compact_legacy_folder = False
+                    series_prefixes = None
+            if should_compact_legacy_folder:
+                try:
+                    compacted_path = await asyncio.to_thread(
+                        self.dispatcher.compact_series_folder,
+                        node,
+                        destination_root,
+                        result.relative_path,
+                        series_name,
+                        series_key,
+                        legacy_series_folder,
+                        series_prefixes,
+                    )
+                    if compacted_path:
+                        compacted_final_path = str(
+                            PurePosixPath(destination_root) / compacted_path
+                        )
+                        with SessionLocal() as db:
+                            item = db.get(QueueItem, item_id)
+                            if item and item.status == "COMPLETED":
+                                item.file_name = compacted_path
+                                item.final_path = compacted_final_path
+                                item.task_log = (
+                                    item.task_log
+                                    + "Renamed legacy series folder to a readable title after downloads completed.\n"
+                                )[-_TASK_LOG_LIMIT:]
+                                item.task_log_offset += len(
+                                    "Renamed legacy series folder to a readable title after downloads completed.\n"
+                                )
+                                db.commit()
+                        logger.info(
+                            "Renamed series folder for completed task %s to %s.",
+                            item_id,
+                            compacted_path,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Could not rename legacy series folder after task %s completed.",
+                        item_id,
+                    )
         except DispatchCancelled:
             logger.info("Download job %s was cancelled.", item_id)
             self._mark_cancelled(item_id)

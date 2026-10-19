@@ -11,12 +11,17 @@ import paramiko
 
 from app.config import settings
 from app.models import Node
-from app.services.content_paths import match_series_directory
+from app.services.content_paths import (
+    clean_content_name,
+    match_series_directory,
+    safe_filename,
+)
 
 
 @dataclass(frozen=True)
 class DispatchResult:
     final_path: str
+    relative_path: str | None = None
 
 
 class DispatchCancelled(Exception):
@@ -221,6 +226,77 @@ class RemoteDispatcher:
         finally:
             client.close()
 
+    def compact_series_folder(
+        self,
+        node: Node,
+        destination_root: str,
+        file_name: str,
+        series_name: str,
+        series_identity: str,
+        legacy_series_folder: str,
+        strip_prefixes: str | None = None,
+    ) -> str | None:
+        relative_path = PurePosixPath(file_name)
+        if len(relative_path.parts) < 3:
+            return None
+        current_folder = relative_path.parts[-3]
+        readable_folder = safe_filename(
+            clean_content_name(series_name, strip_prefixes),
+            max_length=180,
+        )
+        if current_folder != legacy_series_folder or current_folder == readable_folder:
+            return None
+
+        category_root = PurePosixPath(destination_root).joinpath(
+            *relative_path.parts[:-3]
+        )
+        command = (
+            "set -eu\n"
+            f"base={shlex.quote(str(category_root))}\n"
+            f"readable={shlex.quote(readable_folder)}\n"
+            f"legacy={shlex.quote(legacy_series_folder)}\n"
+            f"identity={shlex.quote(series_identity)}\n"
+            'lock="$base/.vod-orch-series-name.lock"\n'
+            "acquired=0\n"
+            "for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do\n"
+            '  if mkdir -- "$lock" 2>/dev/null; then acquired=1; break; fi\n'
+            '  if [ -d "$lock" ] && '
+            '[ "$(( $(date +%s) - $(stat -c %Y -- "$lock") ))" -gt 60 ]; then '
+            'rmdir -- "$lock" 2>/dev/null || true; fi\n'
+            "  sleep 0.1\n"
+            "done\n"
+            '[ "$acquired" -eq 1 ] || { echo "Timed out locking series folder naming." >&2; exit 1; }\n'
+            "trap 'rmdir -- \"$lock\" 2>/dev/null || true' EXIT\n"
+            'legacy_path="$base/$legacy"\n'
+            'candidate="$base/$readable"\n'
+            'if [ -d "$candidate" ] && [ -f "$candidate/.vod-orch-series-id" ] '
+            '&& [ "$(cat -- "$candidate/.vod-orch-series-id")" = "$identity" ]; then\n'
+            '  printf "%s\\n" "already-readable"\n'
+            'elif [ -e "$candidate" ] || [ ! -d "$legacy_path" ]; then\n'
+            '  printf "%s\\n" "unchanged"\n'
+            "else\n"
+            '  printf "%s\\n" "$identity" > "$legacy_path/.vod-orch-series-id"\n'
+            '  mv -T -- "$legacy_path" "$candidate"\n'
+            '  printf "%s\\n" "renamed"\n'
+            "fi\n"
+        )
+        client = self._connect(node)
+        try:
+            result = self._run(client, command).strip()
+        finally:
+            client.close()
+        if result not in ("already-readable", "unchanged", "renamed"):
+            raise RuntimeError("Remote series folder cleanup returned an invalid result.")
+        if result not in ("renamed", "already-readable"):
+            return None
+        return str(
+            PurePosixPath(
+                *relative_path.parts[:-3],
+                readable_folder,
+                *relative_path.parts[-2:],
+            )
+        )
+
     def scan_library_files(
         self,
         node: Node,
@@ -357,6 +433,8 @@ class RemoteDispatcher:
         match_existing_series: bool = False,
         series_name: str | None = None,
         series_match_prefixes: str | None = None,
+        series_identity: str | None = None,
+        legacy_series_folder: str | None = None,
         on_log: Callable[[str], None] | None = None,
         on_command: Callable[[str], None] | None = None,
     ) -> DispatchResult:
@@ -419,6 +497,80 @@ class RemoteDispatcher:
                 )
                 final_root = str(PurePosixPath(final_root) / matched_folder)
                 relative_path = PurePosixPath(*relative_path.parts[-2:])
+            elif (
+                series_name
+                and series_identity
+                and len(relative_path.parts) >= 3
+                and relative_path.parts[-3]
+                in (
+                    safe_filename(
+                        clean_content_name(series_name, series_match_prefixes),
+                        max_length=180,
+                    ),
+                    legacy_series_folder or "",
+                )
+            ):
+                parts = relative_path.parts
+                category_parts = parts[:-3]
+                readable_folder = parts[-3]
+                season_and_file = parts[-2:]
+                legacy_folder = legacy_series_folder or readable_folder
+                category_root = PurePosixPath(final_root).joinpath(*category_parts)
+                resolve_folder = (
+                    "set -eu\n"
+                    f"base={shlex.quote(str(category_root))}\n"
+                    f"readable={shlex.quote(readable_folder)}\n"
+                    f"legacy={shlex.quote(legacy_folder)}\n"
+                    f"identity={shlex.quote(series_identity)}\n"
+                    'mkdir -p -- "$base"\n'
+                    'lock="$base/.vod-orch-series-name.lock"\n'
+                    "acquired=0\n"
+                    "for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do\n"
+                    '  if mkdir -- "$lock" 2>/dev/null; then acquired=1; break; fi\n'
+                    '  if [ -d "$lock" ] && '
+                    '[ "$(( $(date +%s) - $(stat -c %Y -- "$lock") ))" -gt 60 ]; then '
+                    'rmdir -- "$lock" 2>/dev/null || true; fi\n'
+                    "  sleep 0.1\n"
+                    "done\n"
+                    '[ "$acquired" -eq 1 ] || { echo "Timed out locking series folder naming." >&2; exit 1; }\n'
+                    "trap 'rmdir -- \"$lock\" 2>/dev/null || true' EXIT\n"
+                    'candidate="$base/$readable"\n'
+                    'legacy_path="$base/$legacy"\n'
+                    'marker="$candidate/.vod-orch-series-id"\n'
+                    'if [ -d "$candidate" ] && [ -f "$marker" ] && '
+                    '[ "$(cat -- "$marker")" = "$identity" ]; then\n'
+                    '  chosen="$readable"\n'
+                    'elif [ -d "$legacy_path" ]; then\n'
+                    '  if [ -f "$legacy_path/.vod-orch-series-id" ] && '
+                    '[ "$(cat -- "$legacy_path/.vod-orch-series-id")" != "$identity" ]; then '
+                    'echo "Legacy series folder identity does not match." >&2; exit 1; fi\n'
+                    '  printf "%s\\n" "$identity" > "$legacy_path/.vod-orch-series-id"\n'
+                    '  chosen="$legacy"\n'
+                    'elif [ ! -e "$candidate" ]; then\n'
+                    '  mkdir -- "$candidate"\n'
+                    '  printf "%s\\n" "$identity" > "$marker"\n'
+                    '  chosen="$readable"\n'
+                    "else\n"
+                    '  chosen="$legacy"\n'
+                    '  if [ ! -d "$legacy_path" ]; then\n'
+                    '    mkdir -- "$legacy_path"\n'
+                    '    printf "%s\\n" "$identity" > "$legacy_path/.vod-orch-series-id"\n'
+                    "  fi\n"
+                    "fi\n"
+                    'printf "%s\\n" "$chosen"\n'
+                )
+                resolved_folder = run_remote(resolve_folder).strip()
+                if (
+                    not resolved_folder
+                    or "/" in resolved_folder
+                    or resolved_folder in (".", "..")
+                ):
+                    raise RuntimeError("Remote series folder resolver returned an unsafe name.")
+                relative_path = PurePosixPath(
+                    *category_parts,
+                    resolved_folder,
+                    *season_and_file,
+                )
             staging_job_dir = str(
                 PurePosixPath(node.staging_path) / ".vod-orch-jobs" / str(job_id)
             )
@@ -546,7 +698,15 @@ class RemoteDispatcher:
                 )
                 run_remote(move)
                 run_remote(_rmdir_if_present(staging_job_dir))
-                return DispatchResult(final_path=final_path)
+                effective_relative_path = str(
+                    PurePosixPath(final_path).relative_to(
+                        PurePosixPath(destination_root or node.watch_path)
+                    )
+                )
+                return DispatchResult(
+                    final_path=final_path,
+                    relative_path=effective_relative_path,
+                )
             except Exception as original_error:
                 try:
                     run_remote(

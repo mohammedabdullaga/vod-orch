@@ -138,11 +138,22 @@ def safe_provider_id(provider_id: str, provider_url: str) -> str:
     return f"{safe_id}-{digest}" if safe_id else digest
 
 
-def identity_segment(title: str, provider_id: str, provider_url: str) -> str:
+def legacy_identity_segment(title: str, provider_id: str, provider_url: str) -> str:
     return (
         f"{safe_filename(title, max_length=130)} "
         f"[{safe_provider_id(provider_id, provider_url)}]"
     )
+
+
+def identity_segment(title: str, provider_id: str, provider_url: str) -> str:
+    del provider_id, provider_url
+    return safe_filename(title, max_length=180)
+
+
+def series_identity_key(series_id: str, provider_url: str) -> str:
+    return hashlib.sha256(
+        f"{provider_url.rstrip('/')}\0{series_id}".encode("utf-8")
+    ).hexdigest()
 
 
 def safe_extension(value: str) -> str:
