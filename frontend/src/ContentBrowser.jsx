@@ -27,6 +27,7 @@ function InventoryBadge({ status }) {
 export default function ContentBrowser({
   api,
   routing,
+  nodes = [],
   onQueued,
   proxies,
   providerProxyId,
@@ -50,6 +51,9 @@ export default function ContentBrowser({
   const [pendingQueue, setPendingQueue] = useState(null);
   const [pendingSeries, setPendingSeries] = useState(null);
   const [pendingMissingOnly, setPendingMissingOnly] = useState(false);
+  const [destinationMode, setDestinationMode] = useState("auto");
+  const [destinationNodeId, setDestinationNodeId] = useState("");
+  const [destinationPath, setDestinationPath] = useState("");
   const [availableAccounts, setAvailableAccounts] = useState([]);
   const [selectedWorkerIds, setSelectedWorkerIds] = useState(new Set());
   const [availableProxies, setAvailableProxies] = useState([]);
@@ -278,8 +282,8 @@ export default function ContentBrowser({
   };
 
   const queueEntries = async (entries) => {
-    if (!nodeId) {
-      setNotice(`Assign a storage server for ${nodeLabel} in Settings & Accounts before adding downloads.`);
+    if (!nodeId && !nodes.length) {
+      setNotice("Add a storage server in Settings & Accounts before adding downloads.");
       return;
     }
     if (!entries.length) {
@@ -298,6 +302,10 @@ export default function ContentBrowser({
       const eligible = data.accounts.filter((account) => account.eligible);
       setPendingQueue(entries);
       setPendingSeries(null);
+      const defaultNode = nodes.find((node) => node.id === nodeId) || nodes[0];
+      setDestinationMode("auto");
+      setDestinationNodeId(String(defaultNode?.id || ""));
+      setDestinationPath(defaultNode?.watch_path || "");
       setAvailableAccounts(data.accounts);
       setSelectedWorkerIds(new Set(eligible.map((account) => account.id)));
       const proxies = data.proxies || [];
@@ -316,8 +324,8 @@ export default function ContentBrowser({
   };
 
   const prepareSeriesQueue = async (series, missingOnly = false) => {
-    if (!nodeId) {
-      setNotice(`Assign a storage server for ${nodeLabel} in Settings & Accounts before adding downloads.`);
+    if (!nodeId && !nodes.length) {
+      setNotice("Add a storage server in Settings & Accounts before adding downloads.");
       return;
     }
     if (!series.length) {
@@ -337,6 +345,10 @@ export default function ContentBrowser({
       setPendingQueue([]);
       setPendingSeries(series);
       setPendingMissingOnly(missingOnly);
+      const defaultNode = nodes.find((node) => node.id === nodeId) || nodes[0];
+      setDestinationMode("auto");
+      setDestinationNodeId(String(defaultNode?.id || ""));
+      setDestinationPath(defaultNode?.watch_path || "");
       setAvailableAccounts(data.accounts);
       setSelectedWorkerIds(new Set(eligible.map((account) => account.id)));
       const proxies = data.proxies || [];
@@ -359,6 +371,23 @@ export default function ContentBrowser({
       setNotice("Choose at least one free provider account.");
       return;
     }
+    if (
+      destinationMode === "manual"
+      && (!destinationNodeId || !destinationPath.trim())
+    ) {
+      setNotice("Choose a storage server and enter an absolute destination path.");
+      return;
+    }
+    if (destinationMode === "auto" && !nodeId) {
+      setNotice("No automatic server is assigned for this content type. Choose Manual destination or configure storage routing.");
+      return;
+    }
+    const manualDestination = destinationMode === "manual"
+      ? {
+        destination_node_id: Number(destinationNodeId),
+        destination_path: destinationPath.trim(),
+      }
+      : { destination_node_id: null, destination_path: null };
     setBusy(true);
     setNotice("");
     try {
@@ -370,6 +399,7 @@ export default function ContentBrowser({
           source_account_id: Number(sourceAccountId),
           provider_proxy_id: providerProxyId ? Number(providerProxyId) : 0,
           account_ids: accountIds,
+          ...manualDestination,
           proxy_mode: proxyMode === "node" ? "selected" : "direct",
           proxy_id: proxyMode === "node" ? Number(selectedProxyId) : null,
           downloader,
@@ -402,7 +432,7 @@ export default function ContentBrowser({
       const { data } = await api.post("/queue/manual-batch", {
         content_type: type === "series" ? "SERIES" : "MOVIE",
         source_account_id: Number(sourceAccountId),
-        target_node_id: String(nodeId),
+        ...manualDestination,
         account_ids: accountIds,
         proxy_mode: proxyMode === "node" ? "selected" : "direct",
         proxy_id: proxyMode === "node" ? Number(selectedProxyId) : null,
@@ -427,6 +457,7 @@ export default function ContentBrowser({
     setPendingQueue(null);
     setPendingSeries(null);
     setPendingMissingOnly(false);
+    setDestinationMode("auto");
   };
 
   const toggleWorker = (accountId) => {
@@ -878,6 +909,76 @@ export default function ContentBrowser({
                 })}
               </div>
             </div>
+            <fieldset className="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+              <legend className="px-1 text-sm font-medium text-slate-200">Storage destination</legend>
+              <p className="mb-3 text-xs text-slate-500">
+                Applies to this batch: one episode, selected episodes, a whole series, one movie, or the selected movies from a category.
+              </p>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <label className={`cursor-pointer rounded-lg border px-3 py-3 ${destinationMode === "auto" ? "border-indigo-500 bg-indigo-950/30" : "border-slate-800 bg-slate-900/50"}`}>
+                  <input
+                    type="radio"
+                    name="queue-destination-mode"
+                    value="auto"
+                    checked={destinationMode === "auto"}
+                    onChange={() => setDestinationMode("auto")}
+                    className="mr-2 accent-indigo-500"
+                  />
+                  <span className="text-sm text-slate-200">Auto · configured destination</span>
+                  <span className="mt-1 block text-xs text-slate-500">
+                    {nodeId
+                      ? `${nodes.find((node) => String(node.id) === String(nodeId))?.name || nodeLabel} · ${nodes.find((node) => String(node.id) === String(nodeId))?.watch_path || "configured route"} · category path respected`
+                      : `No automatic ${nodeLabel.toLowerCase()} server is assigned.`}
+                  </span>
+                </label>
+                <label className={`cursor-pointer rounded-lg border px-3 py-3 ${destinationMode === "manual" ? "border-indigo-500 bg-indigo-950/30" : "border-slate-800 bg-slate-900/50"}`}>
+                  <input
+                    type="radio"
+                    name="queue-destination-mode"
+                    value="manual"
+                    checked={destinationMode === "manual"}
+                    disabled={!nodes.length}
+                    onChange={() => setDestinationMode("manual")}
+                    className="mr-2 accent-indigo-500"
+                  />
+                  <span className="text-sm text-slate-200">Manual · choose server and path</span>
+                  <span className="mt-1 block text-xs text-slate-500">Overrides the default destination for this batch only.</span>
+                </label>
+              </div>
+              {destinationMode === "manual" && <div className="mt-3 space-y-3">
+                <label className="block text-xs text-slate-400">
+                  Storage server
+                  <select
+                    value={destinationNodeId}
+                    onChange={(event) => {
+                      const node = nodes.find((candidate) => String(candidate.id) === event.target.value);
+                      setDestinationNodeId(event.target.value);
+                      setDestinationPath(node?.watch_path || "");
+                    }}
+                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#090d16] px-3 py-2 text-sm text-slate-200"
+                  >
+                    <option value="">Choose a server</option>
+                    {nodes.map((node) => (
+                      <option key={node.id} value={node.id}>
+                        {node.name} · {node.host} · {node.watch_path}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="block text-xs text-slate-400">
+                  Absolute destination path on the selected server
+                  <input
+                    value={destinationPath}
+                    onChange={(event) => setDestinationPath(event.target.value)}
+                    placeholder="/mnt/media/custom-folder"
+                    className="mt-1.5 w-full rounded-lg border border-slate-700 bg-[#090d16] px-3 py-2 font-mono text-sm text-slate-200 outline-none focus:border-indigo-400"
+                  />
+                </label>
+                <p className="text-[11px] text-slate-500">
+                  Use this as the library root. The generated category/series/season folders are kept underneath it.
+                </p>
+              </div>}
+            </fieldset>
             <fieldset>
               <legend className="mb-2 text-sm font-medium text-slate-200">Download client</legend>
               <div className="grid gap-2 sm:grid-cols-2">

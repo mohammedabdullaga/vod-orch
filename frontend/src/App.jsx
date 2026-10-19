@@ -496,7 +496,7 @@ function App() {
             <div className="overflow-x-auto"><table className="w-full min-w-[780px] text-left text-sm">
               <thead className="bg-slate-900/60 text-xs uppercase tracking-wide text-slate-500"><tr><th className="px-5 py-3">Title</th><th className="px-4 py-3">Type</th><th className="px-4 py-3">Status</th><th className="px-4 py-3">Progress</th><th className="px-4 py-3">Worker / Transfer</th><th className="px-4 py-3">Action</th></tr></thead>
               <tbody className="divide-y divide-slate-800/80">{visibleQueue.length ? visibleQueue.map((item) => <tr key={item.id} className="hover:bg-slate-800/20">
-                <td className="px-5 py-4"><div className="font-medium text-slate-200">{item.title}</div>{item.series_title && <div className="mt-1 text-xs text-slate-500">{item.series_title} · S{item.season ?? "—"} E{item.episode ?? "—"}</div>}{item.final_path && <div className="mt-1 max-w-[30rem] truncate font-mono text-[10px] text-slate-500" title={item.final_path}>Saved to: {item.final_path}</div>}</td>
+                <td className="px-5 py-4"><div className="font-medium text-slate-200">{item.title}</div>{item.series_title && <div className="mt-1 text-xs text-slate-500">{item.series_title} · S{item.season ?? "—"} E{item.episode ?? "—"}</div>}{item.final_path ? <div className="mt-1 max-w-[30rem] truncate font-mono text-[10px] text-slate-500" title={item.final_path}>Saved to: {item.final_path}</div> : <div className="mt-1 max-w-[30rem] truncate text-[10px] text-slate-600" title={item.destination_path || item.host || ""}>{item.host ? `Storage: ${item.host}${item.destination_path ? ` · ${item.destination_path}` : " · auto path"}` : "Storage destination pending"}</div>}</td>
                 <td className="px-4 py-4 text-slate-400">{item.kind === "series" ? <Tv size={16} /> : <Film size={16} />}</td>
                 <td className="px-4 py-4"><div className="flex flex-col items-start gap-1"><Status status={item.status} />{item.status === "FAILED" && (item.retry_after ? <span className="text-[11px] text-amber-300">Automatic retry scheduled · attempt {item.retries + 1}/{item.retry_limit}</span> : item.retries >= item.retry_limit ? <span className="text-[11px] text-rose-300">Automatic retry limit reached ({item.retry_limit})</span> : <span className="text-[11px] text-slate-500">No automatic retry scheduled</span>)}</div></td>
                 <td className="px-4 py-4"><div className="flex items-center gap-2"><div className="h-1.5 w-20 overflow-hidden rounded bg-slate-800"><div className="h-full bg-indigo-400" style={{ width: `${item.progress || 0}%` }} /></div><span className="text-xs text-slate-500">{Math.round(item.progress || 0)}%</span></div></td>
@@ -509,6 +509,7 @@ function App() {
         {tab === tabs[1] && <ContentBrowser
           api={api}
           routing={routing}
+          nodes={nodes}
           onQueued={refresh}
           proxies={proxies.filter((proxy) => proxy.enabled)}
           providerProxyId={providerProxyId}

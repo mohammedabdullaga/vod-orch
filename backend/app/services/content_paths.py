@@ -2,6 +2,7 @@ import hashlib
 import re
 import unicodedata
 from difflib import SequenceMatcher
+from pathlib import PurePosixPath
 
 
 _AUTO_RELEASE_PREFIX = re.compile(
@@ -147,6 +148,20 @@ def identity_segment(title: str, provider_id: str, provider_url: str) -> str:
 def safe_extension(value: str) -> str:
     extension = "".join(char for char in value.lstrip(".") if char.isalnum())[:12]
     return extension or "mkv"
+
+
+def validate_remote_path(value: str) -> str:
+    path = value.strip()
+    if "\x00" in path:
+        raise ValueError("contains an invalid character.")
+    normalized = PurePosixPath(path)
+    if (
+        not normalized.is_absolute()
+        or ".." in normalized.parts
+        or normalized == PurePosixPath("/")
+    ):
+        raise ValueError("must be an absolute path other than / and cannot contain '..'.")
+    return str(normalized)
 
 
 def season_number(value: object) -> int | None:

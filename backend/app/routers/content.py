@@ -47,6 +47,7 @@ from app.services.content_paths import (
     safe_extension,
     season_number as parse_season_number,
     stream_identity,
+    validate_remote_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -1093,6 +1094,8 @@ class ManualBatchRequest(BaseModel):
     source_account_id: int | None = Field(default=None, ge=1)
     source_playlist_id: int | None = Field(default=None, ge=1)
     target_node_id: str | None = Field(default=None, max_length=64)
+    destination_node_id: int | None = Field(default=None, ge=1)
+    destination_path: str | None = Field(default=None, max_length=4096)
     account_ids: list[int] | None = Field(default=None, min_length=1, max_length=100)
     proxy_mode: Literal["node", "selected", "direct"] | None = None
     proxy_id: int | None = Field(default=None, ge=1)
@@ -1112,6 +1115,8 @@ class SeriesQueueBatchRequest(BaseModel):
     source_account_id: int | None = Field(default=None, ge=1)
     source_playlist_id: int | None = Field(default=None, ge=1)
     provider_proxy_id: int | None = Field(default=None, ge=0)
+    destination_node_id: int | None = Field(default=None, ge=1)
+    destination_path: str | None = Field(default=None, max_length=4096)
     account_ids: list[int] = Field(min_length=1, max_length=100)
     proxy_mode: Literal["selected", "direct"] = "direct"
     proxy_id: int | None = Field(default=None, ge=1)
@@ -1170,15 +1175,32 @@ def _queue_manual_batch(
             f"m3u:{playlist.id}" if playlist is not None else account.provider_url
         )
         route = db.get(StorageRoute, kind)
-        node = db.get(Node, route.node_id) if route else None
+        if (payload.destination_node_id is None) != (payload.destination_path is None):
+            raise HTTPException(
+                status_code=422,
+                detail="Manual destination requires both a storage server and a path.",
+            )
+        destination_path = None
+        if payload.destination_path is not None:
+            try:
+                destination_path = validate_remote_path(payload.destination_path)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        node = (
+            db.get(Node, payload.destination_node_id)
+            if payload.destination_node_id is not None
+            else db.get(Node, route.node_id) if route else None
+        )
         if not node:
             label = "series" if kind == "series" else "movie"
             raise HTTPException(
                 status_code=409,
-                detail=f"Assign a storage node for {label} content before queueing.",
+                detail=f"Assign an automatic storage route or choose a manual server for {label} content before queueing.",
             )
         legacy_target = "series_node" if kind == "series" else "movie_node"
-        if payload.target_node_id not in (None, str(node.id), legacy_target):
+        if payload.destination_node_id is None and payload.target_node_id not in (
+            None, str(node.id), legacy_target
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="The requested node does not match the configured content-type route.",
@@ -1422,6 +1444,8 @@ def _queue_manual_batch(
                 "category_id": category_id,
                 "category_name": category_name,
                 "series_id": series_id,
+                "destination_node_id": payload.destination_node_id,
+                "destination_path": destination_path,
                 "proxy_mode": payload.proxy_mode,
                 "proxy_id": selected_proxy_id,
                 "downloader": payload.downloader,
@@ -1493,6 +1517,17 @@ async def prepare_series_batch(
         raise HTTPException(status_code=422, detail="Select a download proxy or choose direct connection.")
     if payload.proxy_mode == "direct" and payload.proxy_id is not None:
         raise HTTPException(status_code=422, detail="Direct connection cannot include a proxy ID.")
+    if (payload.destination_node_id is None) != (payload.destination_path is None):
+        raise HTTPException(
+            status_code=422,
+            detail="Manual destination requires both a storage server and a path.",
+        )
+    destination_path = None
+    if payload.destination_path is not None:
+        try:
+            destination_path = validate_remote_path(payload.destination_path)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     with SessionLocal() as db:
         selected_accounts = db.scalars(
@@ -1525,11 +1560,17 @@ async def prepare_series_batch(
             )
         route = db.get(StorageRoute, "series")
         series_node = db.get(Node, route.node_id) if route else None
-        if not series_node:
+        destination_node = (
+            db.get(Node, payload.destination_node_id)
+            if payload.destination_node_id is not None
+            else series_node
+        )
+        if not destination_node:
             raise HTTPException(
                 status_code=409,
-                detail="Assign a storage node for series content before queueing.",
+                detail="Assign an automatic storage route or choose a manual server for series content before queueing.",
             )
+        series_node = series_node or destination_node
         if payload.proxy_mode == "selected":
             proxy = db.get(Proxy, payload.proxy_id)
             if not proxy or not proxy.enabled:
@@ -1599,6 +1640,8 @@ async def prepare_series_batch(
                     selection.category_id,
                     selection.category_name,
                 )
+                if route is None and payload.destination_path is not None:
+                    root = payload.destination_path
                 if root is None:
                     raise HTTPException(
                         status_code=409,
@@ -1703,6 +1746,8 @@ async def prepare_series_batch(
                     content_type="SERIES",
                     source_account_id=payload.source_account_id,
                     source_playlist_id=payload.source_playlist_id,
+                    destination_node_id=payload.destination_node_id,
+                    destination_path=destination_path,
                     account_ids=payload.account_ids,
                     proxy_mode=payload.proxy_mode,
                     proxy_id=payload.proxy_id,

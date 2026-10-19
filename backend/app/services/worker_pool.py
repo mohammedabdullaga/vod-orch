@@ -6,7 +6,7 @@ import threading
 import time
 from datetime import timedelta
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, update
 
 from app.config import settings
 from app.models import (
@@ -279,7 +279,10 @@ class WorkerPool:
             requeued = 0
             diagnosed = 0
             for item in pending:
-                if item.kind not in routed_kinds:
+                has_destination = (
+                    item.kind in routed_kinds or item.destination_node_id is not None
+                )
+                if not has_destination:
                     reason = (
                         f"No storage route is configured for {item.kind} tasks; "
                         "the task remains pending.\n"
@@ -319,12 +322,12 @@ class WorkerPool:
                     }
                     reason = ""
 
-                if item.kind in routed_kinds and not eligible_ids:
+                if has_destination and not eligible_ids:
                     reason = (
                         "No enabled provider account matches this pending task; "
                         "the task remains pending.\n"
                     )
-                elif item.kind in routed_kinds:
+                elif has_destination:
                     idle_eligible_ids = eligible_ids & set(idle_accounts)
                     if not idle_eligible_ids:
                         reason = (
@@ -441,7 +444,10 @@ class WorkerPool:
                 select(QueueItem)
                 .where(
                     QueueItem.status == "PENDING",
-                    QueueItem.kind.in_(select(StorageRoute.kind)),
+                    or_(
+                        QueueItem.kind.in_(select(StorageRoute.kind)),
+                        QueueItem.destination_node_id.is_not(None),
+                    ),
                 )
                 .order_by(QueueItem.created_at, QueueItem.id)
             ).all()
@@ -732,7 +738,7 @@ class WorkerPool:
                     )
                 await asyncio.sleep(min(0.1, remaining))
 
-            cleanup_targets: list[tuple[int, str, int, bool]] = []
+            cleanup_targets: list[tuple[int, str, int, bool, str]] = []
             with SessionLocal() as db:
                 for item in db.scalars(
                     select(QueueItem).where(QueueItem.id.in_(selected_ids))
@@ -748,7 +754,11 @@ class WorkerPool:
                     )
                     if node is None:
                         route = db.get(StorageRoute, item.kind)
-                        node = db.get(Node, route.node_id) if route else None
+                        node = (
+                            db.get(Node, item.destination_node_id)
+                            if item.destination_node_id is not None
+                            else db.get(Node, route.node_id) if route else None
+                        )
                     if node is None:
                         raise RuntimeError(
                             f"Cannot clean remote artifacts for task {item.id}: "
@@ -760,21 +770,22 @@ class WorkerPool:
                             item.file_name,
                             node.id,
                             bool(item.remote_match_existing_series),
+                            item.destination_path or node.watch_path,
                         )
                     )
                 nodes_by_id = {
                     node_id: db.get(Node, node_id)
-                    for _, _, node_id, _ in cleanup_targets
+                    for _, _, node_id, _, _ in cleanup_targets
                 }
 
-            for item_id, file_name, node_id, match_existing in cleanup_targets:
+            for item_id, file_name, node_id, match_existing, destination_root in cleanup_targets:
                 node = nodes_by_id[node_id]
                 await asyncio.to_thread(
                     self.dispatcher.cleanup_failed_job,
                     node,
                     item_id,
                     file_name,
-                    node.watch_path,
+                    destination_root,
                     False,
                     match_existing,
                 )
@@ -883,7 +894,11 @@ class WorkerPool:
                     return
                 account = db.get(Account, account_id)
                 route = db.get(StorageRoute, item.kind)
-                node = db.get(Node, route.node_id) if route else None
+                node = (
+                    db.get(Node, item.destination_node_id)
+                    if item.destination_node_id is not None
+                    else db.get(Node, route.node_id) if route else None
+                )
                 category = db.scalar(
                     select(MonitoredCategory).where(
                         MonitoredCategory.kind == item.kind,
@@ -899,6 +914,7 @@ class WorkerPool:
                     return
                 match_existing_series = bool(
                     category
+                    and not item.destination_path
                     and item.kind == "series"
                     and category.match_existing_series
                 )
@@ -917,9 +933,9 @@ class WorkerPool:
                     stream_url_value = decrypt_secret(item.stream_url_encrypted)
                 user_agent = account.user_agent or "Mozilla"
                 destination_root = (
-                    category.destination_path
-                    if category and category.destination_path
-                    else node.watch_path
+                    item.destination_path
+                    or (category.destination_path if category else None)
+                    or node.watch_path
                 )
                 series_match_name = item.series_title if match_existing_series else None
                 series_match_prefixes = (

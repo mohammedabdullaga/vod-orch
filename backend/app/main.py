@@ -45,6 +45,7 @@ from app.services.provider_client import (
     resolve_provider_proxy,
     resolve_provider_proxy_selection,
 )
+from app.services.content_paths import validate_remote_path
 from app.security import decrypt_secret, encrypt_secret, mask_secret
 from app.services.dispatcher import RemoteDispatcher
 from app.services.catalog_sync_worker import ProviderCatalogSyncWorker
@@ -240,15 +241,13 @@ def _validated_remote_path(
         if allow_none:
             return None
         raise HTTPException(status_code=422, detail=f"{field_name} must be an absolute remote path.")
-    if "\x00" in path:
-        raise HTTPException(status_code=422, detail=f"{field_name} contains an invalid character.")
-    normalized = PurePosixPath(path.strip())
-    if not normalized.is_absolute() or ".." in normalized.parts or normalized == PurePosixPath("/"):
+    try:
+        return validate_remote_path(path)
+    except ValueError as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"{field_name} must be an absolute path other than / and cannot contain '..'.",
-        )
-    return str(normalized)
+            detail=f"{field_name} {exc}",
+        ) from exc
 
 
 def _account_json(account: Account) -> dict:
@@ -425,7 +424,12 @@ def get_queue(
             select(QueueItem, Account.username, Node.host)
             .outerjoin(Account, QueueItem.account_id == Account.id)
             .outerjoin(StorageRoute, StorageRoute.kind == QueueItem.kind)
-            .outerjoin(Node, Node.id == StorageRoute.node_id)
+            .outerjoin(
+                Node,
+                Node.id == func.coalesce(
+                    QueueItem.destination_node_id, StorageRoute.node_id
+                ),
+            )
             .where(QueueItem.hidden_from_dashboard.is_(False))
         )
         if status is not None:
@@ -443,6 +447,8 @@ def get_queue(
         "series_title": item.series_title, "season": item.season, "episode": item.episode,
         "status": item.status, "progress": item.progress, "account": username,
         "host": host,
+        "destination_path": item.destination_path,
+        "destination_node_id": item.destination_node_id,
         "file_size_bytes": item.file_size_bytes,
         "speed_bytes_per_second": item.speed_bytes_per_second,
         "final_path": item.final_path,
@@ -655,7 +661,10 @@ def requeue_pending_items():
         blocked_by_kind: dict[str, str] = {}
         for item in items:
             pending_by_kind[item.kind] = pending_by_kind.get(item.kind, 0) + 1
-            if item.kind not in routed_kinds:
+            if (
+                item.kind not in routed_kinds
+                and item.destination_node_id is None
+            ):
                 blocked_by_kind[item.kind] = "No storage route is configured."
                 continue
             if item.provider_stream_id or (
@@ -747,7 +756,11 @@ def cleanup_failed_queue_item(item_id: int):
                 detail="Storage cleanup is available only for failed queue items.",
             )
         route = db.get(StorageRoute, item.kind)
-        node = db.get(Node, route.node_id) if route else None
+        node = (
+            db.get(Node, item.destination_node_id)
+            if item.destination_node_id is not None
+            else db.get(Node, route.node_id) if route else None
+        )
         if not node:
             raise HTTPException(
                 status_code=409,
@@ -764,14 +777,14 @@ def cleanup_failed_queue_item(item_id: int):
             else None
         )
         destination_root = (
-            category.destination_path
-            if category and category.destination_path
-            else node.watch_path
+            item.destination_path
+            or (category.destination_path if category else None)
+            or node.watch_path
         )
-        prune_empty_final_directories = not bool(
-            category and category.match_existing_series
+        match_existing_series = bool(
+            category and not item.destination_path and category.match_existing_series
         )
-        match_existing_series = bool(category and category.match_existing_series)
+        prune_empty_final_directories = not match_existing_series
         file_name = item.file_name
         item.status = "CLEANING"
         item.retry_after = None
@@ -1218,6 +1231,20 @@ def delete_storage_node(node_id: int):
             raise HTTPException(
                 status_code=409,
                 detail=f"Reassign {kinds} storage before removing this node.",
+            )
+        destination_tasks = db.scalar(
+            select(func.count(QueueItem.id)).where(
+                QueueItem.destination_node_id == node_id,
+                QueueItem.status.notin_(("COMPLETED", "CANCELLED")),
+            )
+        )
+        if destination_tasks:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"This server is selected by {destination_tasks} unfinished queue task(s). "
+                    "Reassign or clear those tasks before removing the server."
+                ),
             )
         db.delete(node)
         db.commit()
