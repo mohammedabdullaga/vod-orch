@@ -25,6 +25,7 @@ from app.security import decrypt_secret, encrypt_secret
 from app.services.content_paths import (
     clean_content_name,
     legacy_identity_segment,
+    legacy_identity_suffix,
     safe_extension,
     series_identity_key,
 )
@@ -953,6 +954,11 @@ class WorkerPool:
                     if series_name
                     else None
                 )
+                legacy_series_suffix = (
+                    legacy_identity_suffix(series_id, source_url)
+                    if series_name
+                    else None
+                )
                 series_key = (
                     series_identity_key(series_id, source_url)
                     if series_name
@@ -966,7 +972,7 @@ class WorkerPool:
                 series_match_name = item.series_title if match_existing_series else None
                 series_match_prefixes = (
                     category.strip_prefixes
-                    if match_existing_series and category
+                    if category and item.kind == "series"
                     else None
                 )
                 if item.proxy_mode == "selected":
@@ -1020,6 +1026,7 @@ class WorkerPool:
                 series_match_prefixes=series_match_prefixes,
                 series_identity=series_key,
                 legacy_series_folder=legacy_series_folder,
+                legacy_series_suffix=legacy_series_suffix,
                 on_log=lambda text: self._append_task_log(
                     item_id, self._redact_task_text(text, stream_url_value, proxy_url)
                 ),
@@ -1044,6 +1051,7 @@ class WorkerPool:
                         and series_name
                         and series_key
                         and legacy_series_folder
+                        and legacy_series_suffix
                         and not match_existing_series
                         and item.series_id
                         and not db.scalar(
@@ -1072,25 +1080,80 @@ class WorkerPool:
                         result.relative_path,
                         series_name,
                         series_key,
-                        legacy_series_folder,
+                        legacy_series_suffix,
                         series_prefixes,
                     )
                     if compacted_path:
-                        compacted_final_path = str(
-                            PurePosixPath(destination_root) / compacted_path
-                        )
                         with SessionLocal() as db:
                             item = db.get(QueueItem, item_id)
                             if item and item.status == "COMPLETED":
-                                item.file_name = compacted_path
-                                item.final_path = compacted_final_path
-                                item.task_log = (
-                                    item.task_log
-                                    + "Renamed legacy series folder to a readable title after downloads completed.\n"
-                                )[-_TASK_LOG_LIMIT:]
-                                item.task_log_offset += len(
-                                    "Renamed legacy series folder to a readable title after downloads completed.\n"
-                                )
+                                old_relative_prefix = PurePosixPath(
+                                    result.relative_path
+                                ).parts[:-2]
+                                new_relative_prefix = PurePosixPath(
+                                    compacted_path
+                                ).parts[:-2]
+                                old_final_prefix = PurePosixPath(
+                                    destination_root
+                                ).joinpath(*old_relative_prefix).parts
+                                new_final_prefix = PurePosixPath(
+                                    destination_root
+                                ).joinpath(*new_relative_prefix).parts
+                                completed_items = db.scalars(
+                                    select(QueueItem).where(
+                                        QueueItem.kind == "series",
+                                        QueueItem.series_id == item.series_id,
+                                        QueueItem.source_provider_url
+                                        == item.source_provider_url,
+                                        QueueItem.remote_node_id == node.id,
+                                        QueueItem.status == "COMPLETED",
+                                    )
+                                ).all()
+                                for completed_item in completed_items:
+                                    stored_relative = PurePosixPath(
+                                        completed_item.file_name
+                                    )
+                                    if (
+                                        stored_relative.parts[
+                                            : len(old_relative_prefix)
+                                        ]
+                                        == old_relative_prefix
+                                    ):
+                                        completed_item.file_name = str(
+                                            PurePosixPath(
+                                                *new_relative_prefix,
+                                                *stored_relative.parts[
+                                                    len(old_relative_prefix) :
+                                                ],
+                                            )
+                                        )
+                                    if completed_item.final_path:
+                                        stored_final = PurePosixPath(
+                                            completed_item.final_path
+                                        )
+                                        if (
+                                            stored_final.parts[
+                                                : len(old_final_prefix)
+                                            ]
+                                            == old_final_prefix
+                                        ):
+                                            completed_item.final_path = str(
+                                                PurePosixPath(
+                                                    *new_final_prefix,
+                                                    *stored_final.parts[
+                                                        len(old_final_prefix) :
+                                                    ],
+                                                )
+                                            )
+                                item = db.get(QueueItem, item_id)
+                                if item and item.status == "COMPLETED":
+                                    item.task_log = (
+                                        item.task_log
+                                        + "Renamed legacy series folder to a readable title after downloads completed.\n"
+                                    )[-_TASK_LOG_LIMIT:]
+                                    item.task_log_offset += len(
+                                        "Renamed legacy series folder to a readable title after downloads completed.\n"
+                                    )
                                 db.commit()
                         logger.info(
                             "Renamed series folder for completed task %s to %s.",

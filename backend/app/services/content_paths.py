@@ -6,10 +6,11 @@ from pathlib import PurePosixPath
 
 
 _AUTO_RELEASE_PREFIX = re.compile(
-    r"^(?:(?:[A-Z0-9]{2,4}[-_]){1,3}[A-Z0-9]{2,8}"
+    r"^(?:(?:[A-Z0-9]{2,4}[-_]){1,3}[A-Z0-9]{1,8}"
     r"|(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{1,8}(?:-[a-z0-9]{1,8}){1,3})"
     r"(?::|\s+-\s+|\s+)"
 )
+_LEGACY_IDENTITY_SUFFIX = re.compile(r"\s+\[[A-Za-z0-9_-]+-[a-f0-9]{16}\]$")
 
 
 def parse_strip_prefixes(value: str | None) -> tuple[str, ...]:
@@ -25,6 +26,7 @@ def parse_strip_prefixes(value: str | None) -> tuple[str, ...]:
 
 def clean_content_name(value: str, prefixes: str | None = None) -> str:
     cleaned = value.strip()
+    cleaned = _LEGACY_IDENTITY_SUFFIX.sub("", cleaned)
     cleaned = _AUTO_RELEASE_PREFIX.sub("", cleaned, count=1)
     strip_prefixes = tuple(
         sorted(set(parse_strip_prefixes(prefixes)) | {"4k"}, key=len, reverse=True)
@@ -141,8 +143,12 @@ def safe_provider_id(provider_id: str, provider_url: str) -> str:
 def legacy_identity_segment(title: str, provider_id: str, provider_url: str) -> str:
     return (
         f"{safe_filename(title, max_length=130)} "
-        f"[{safe_provider_id(provider_id, provider_url)}]"
+        f"[{legacy_identity_suffix(provider_id, provider_url)}]"
     )
+
+
+def legacy_identity_suffix(provider_id: str, provider_url: str) -> str:
+    return safe_provider_id(provider_id, provider_url)
 
 
 def identity_segment(title: str, provider_id: str, provider_url: str) -> str:
