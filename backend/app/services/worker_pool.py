@@ -785,16 +785,19 @@ class WorkerPool:
                     for _, _, node_id, _, _ in cleanup_targets
                 }
 
+            cleanup_by_node: dict[
+                int, list[tuple[int, str, str, bool]]
+            ] = {}
             for item_id, file_name, node_id, match_existing, destination_root in cleanup_targets:
+                cleanup_by_node.setdefault(node_id, []).append(
+                    (item_id, file_name, destination_root, match_existing)
+                )
+            for node_id, jobs in cleanup_by_node.items():
                 node = nodes_by_id[node_id]
                 await asyncio.to_thread(
-                    self.dispatcher.cleanup_failed_job,
+                    self.dispatcher.cleanup_failed_jobs,
                     node,
-                    item_id,
-                    file_name,
-                    destination_root,
-                    False,
-                    match_existing,
+                    jobs,
                 )
 
             with SessionLocal() as db:

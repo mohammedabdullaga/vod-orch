@@ -59,6 +59,7 @@ function App() {
   const [queueFilter, setQueueFilter] = useState("all");
   const [status, setStatus] = useState(null);
   const [queue, setQueue] = useState([]);
+  const refreshInFlight = useRef(false);
   const [logTask, setLogTask] = useState(null);
   const [purgeDialogOpen, setPurgeDialogOpen] = useState(false);
   const [purgeOptions, setPurgeOptions] = useState({
@@ -101,6 +102,8 @@ function App() {
   }, []);
 
   const refresh = useCallback(async () => {
+    if (refreshInFlight.current) return;
+    refreshInFlight.current = true;
     try {
       const statusFilter = ["pending", "completed", "failed", "cancelled"].includes(queueFilter)
         ? queueFilter.toUpperCase()
@@ -113,7 +116,11 @@ function App() {
       setStatus(s.data);
       setQueue(q.data);
       setCatalogSyncJobs(Object.fromEntries(syncJobs.data.map((job) => [job.account_id, job])));
-    } catch (error) { setNotice(error.response?.data?.detail || "Could not reach the backend API."); }
+    } catch (error) {
+      setNotice(error.response?.data?.detail || "Could not reach the backend API.");
+    } finally {
+      refreshInFlight.current = false;
+    }
   }, [queueFilter]);
   useEffect(() => {
     if (!authenticated) return undefined;

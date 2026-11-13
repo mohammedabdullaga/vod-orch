@@ -429,6 +429,120 @@ class RemoteDispatcher:
         finally:
             client.close()
 
+    def cleanup_failed_jobs(
+        self,
+        node: Node,
+        jobs: list[tuple[int, str, str, bool]],
+        batch_size: int = 50,
+    ) -> None:
+        if batch_size < 1:
+            raise ValueError("Cleanup batch size must be positive.")
+        if not jobs:
+            return
+
+        cleanup_jobs: list[
+            tuple[tuple[str, str], str, tuple[str, str], str, str]
+        ] = []
+        for job_id, file_name, destination_root, match_existing_series in jobs:
+            relative_path = PurePosixPath(file_name)
+            if (
+                relative_path.is_absolute()
+                or not relative_path.parts
+                or any(part in ("", ".", "..") for part in relative_path.parts)
+                or "\\" in file_name
+            ):
+                raise ValueError("Content destination must be a safe relative POSIX path.")
+            if match_existing_series:
+                if len(relative_path.parts) < 3:
+                    raise ValueError("Series destination path is invalid for folder matching.")
+                relative_path = PurePosixPath(*relative_path.parts[-2:])
+
+            staging_job_dir = str(
+                PurePosixPath(node.staging_path) / ".vod-orch-jobs" / str(job_id)
+            )
+            staging_file = str(
+                PurePosixPath(staging_job_dir) / f"{relative_path.name}.part-{job_id}"
+            )
+            legacy_staging_dir = str(
+                PurePosixPath(node.staging_path) / relative_path.parent
+            )
+            legacy_staging_file = str(
+                PurePosixPath(legacy_staging_dir)
+                / f"{relative_path.name}.part-{job_id}"
+            )
+            pid_files = (
+                f"{staging_file}.pid",
+                f"{legacy_staging_file}.pid",
+            )
+            state_files = (
+                f"{staging_file}.st",
+                f"{legacy_staging_file}.st",
+            )
+            root = PurePosixPath(destination_root)
+            final_directory = root / relative_path.parent
+            if final_directory.parts[: len(root.parts)] != root.parts:
+                raise ValueError(
+                    "Content destination is outside the configured storage root."
+                )
+
+            cleanup_jobs.append(
+                (
+                    pid_files,
+                    staging_file,
+                    state_files,
+                    legacy_staging_file,
+                    staging_job_dir,
+                )
+            )
+
+        client = self._connect(node)
+        try:
+            for start in range(0, len(cleanup_jobs), batch_size):
+                batch = cleanup_jobs[start : start + batch_size]
+                pid_paths = " ".join(
+                    shlex.quote(path)
+                    for job in batch
+                    for path in job[0]
+                )
+                command_parts = [
+                    "pids=''",
+                    f"for pid_file in {pid_paths}; do "
+                    'if [ -s "$pid_file" ]; then pid=$(cat -- "$pid_file"); '
+                    'case "$pid" in ""|0|1|*[!0-9]*) ;; *) '
+                    'kill -TERM -- "-$pid" 2>/dev/null || true; '
+                    'pids="$pids $pid";; esac; fi; done',
+                    'if [ -n "$pids" ]; then sleep 1; '
+                    'for pid in $pids; do '
+                    'kill -KILL -- "-$pid" 2>/dev/null || true; '
+                    'if kill -0 -- "-$pid" 2>/dev/null; then '
+                    'echo "Could not stop remote task process $pid." >&2; exit 1; '
+                    "fi; done; fi",
+                ]
+                for (
+                    _pid_files,
+                    staging_file,
+                    state_files,
+                    legacy_staging_file,
+                    staging_job_dir,
+                ) in batch:
+                    remove_files = " ".join(
+                        shlex.quote(path)
+                        for path in (
+                            staging_file,
+                            *state_files,
+                            *_pid_files,
+                            legacy_staging_file,
+                        )
+                    )
+                    command_parts.append(
+                        f"rm -f -- {remove_files} "
+                        f"&& {_rmdir_if_present(staging_job_dir)}"
+                    )
+                command = "set -eu\n" + "\n".join(command_parts)
+                self._run(client, command)
+        finally:
+            client.close()
+
     def dispatch(
         self,
         node: Node,

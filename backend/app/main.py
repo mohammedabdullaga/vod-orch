@@ -107,11 +107,36 @@ app.include_router(playlist_router)
 
 @app.middleware("http")
 async def require_admin_session(request: Request, call_next):
+    async def call_and_log_slow_request():
+        started_at = time.monotonic()
+        try:
+            response = await call_next(request)
+        except Exception:
+            elapsed = time.monotonic() - started_at
+            if elapsed >= 5:
+                logger.exception(
+                    "API request %s %s failed after %.1f seconds.",
+                    request.method,
+                    request.url.path,
+                    elapsed,
+                )
+            raise
+        elapsed = time.monotonic() - started_at
+        if elapsed >= 5:
+            logger.warning(
+                "Slow API request %s %s completed with status %s in %.1f seconds.",
+                request.method,
+                request.url.path,
+                response.status_code,
+                elapsed,
+            )
+        return response
+
     if request.method == "OPTIONS" or not request.url.path.startswith("/api/") or request.url.path in (
         "/api/auth/login",
         "/api/auth/session",
     ):
-        return await call_next(request)
+        return await call_and_log_slow_request()
 
     session = read_session(request.cookies.get(COOKIE_NAME))
     if not session:
@@ -120,7 +145,7 @@ async def require_admin_session(request: Request, call_next):
         session["csrf"], request.headers.get("X-CSRF-Token")
     ):
         return JSONResponse(status_code=403, content={"detail": "CSRF token is missing or invalid."})
-    return await call_next(request)
+    return await call_and_log_slow_request()
 
 
 class LoginRequest(BaseModel):
