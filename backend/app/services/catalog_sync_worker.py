@@ -15,7 +15,6 @@ from app.models import (
 from app.services.provider_client import (
     cached_provider_action,
     invalidate_provider_action_cache,
-    parse_series_episodes,
     resolve_provider_proxy,
 )
 
@@ -25,6 +24,7 @@ CATALOG_ACTIONS = (
     ("series", "get_series_categories", "get_series"),
     ("vod", "get_vod_categories", "get_vod_streams"),
 )
+CATALOG_REQUEST_CONCURRENCY = 4
 
 
 class ProviderCatalogSyncWorker:
@@ -180,12 +180,23 @@ class ProviderCatalogSyncWorker:
 
         proxy_url = resolve_provider_proxy(proxy_id)
         category_records: list[tuple[str, str, str]] = []
-        for kind, category_action, list_action in CATALOG_ACTIONS:
-            categories, cache_state = await self._fetch_action(
-                account,
-                category_action,
-                proxy_url,
-            )
+        category_results = await asyncio.gather(
+            *(
+                self._fetch_action(account, category_action, proxy_url)
+                for _, category_action, _ in CATALOG_ACTIONS
+            ),
+            return_exceptions=True,
+        )
+        category_error = next(
+            (result for result in category_results if isinstance(result, BaseException)),
+            None,
+        )
+        if category_error:
+            raise category_error
+        for (kind, category_action, list_action), (categories, cache_state) in zip(
+            CATALOG_ACTIONS,
+            category_results,
+        ):
             if not isinstance(categories, list) or any(
                 not isinstance(row, dict) for row in categories
             ):
@@ -203,14 +214,20 @@ class ProviderCatalogSyncWorker:
                 if category_id is not None:
                     category_records.append((kind, str(category_id), list_action))
 
-        series_ids: set[str] = set()
-        for kind, category_id, list_action in category_records:
-            rows, cache_state = await self._fetch_action(
-                account,
-                list_action,
-                proxy_url,
-                category_id=category_id,
-            )
+        semaphore = asyncio.Semaphore(CATALOG_REQUEST_CONCURRENCY)
+
+        async def fetch_category_list(
+            kind: str,
+            category_id: str,
+            list_action: str,
+        ) -> None:
+            async with semaphore:
+                rows, cache_state = await self._fetch_action(
+                    account,
+                    list_action,
+                    proxy_url,
+                    category_id=category_id,
+                )
             if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
                 invalidate_provider_action_cache(
                     account, list_action, category_id=category_id
@@ -218,17 +235,6 @@ class ProviderCatalogSyncWorker:
                 raise ValueError(
                     f"Provider returned invalid {list_action} data for category {category_id}."
                 )
-            new_series_ids: set[str] = set()
-            for row in rows:
-                stream_id = row.get(
-                    "series_id" if kind == "series" else "stream_id",
-                    row.get("id"),
-                )
-                if stream_id is None:
-                    continue
-                if kind == "series":
-                    new_series_ids.add(str(stream_id))
-            series_ids.update(new_series_ids)
             self._progress(
                 job_id,
                 phase=f"{kind}_lists",
@@ -238,48 +244,36 @@ class ProviderCatalogSyncWorker:
                 cache_hits_delta=int(cache_state == "hit"),
             )
 
-        self._progress(job_id, phase="series_details", total_series=len(series_ids))
-        for series_id in sorted(series_ids):
-            details, cache_state = await self._fetch_action(
-                account,
-                "get_series_info",
-                proxy_url,
-                series_id=series_id,
-            )
-            invalid_details = False
-            try:
-                parse_series_episodes(details)
-            except ValueError as exc:
-                invalidate_provider_action_cache(
-                    account,
-                    "get_series_info",
-                    series_id=series_id,
-                )
-                logger.warning(
-                    "Skipping invalid series details for account %s series %s (%s)",
-                    account_id,
-                    series_id,
-                    exc,
-                )
-                invalid_details = True
-            self._progress(
-                job_id,
-                phase="series_details",
-                series_details_delta=1,
-                stale_delta=int(cache_state == "stale"),
-                cache_hits_delta=int(cache_state == "hit"),
-                invalid_series_details_delta=int(invalid_details),
-            )
+        list_results = await asyncio.gather(
+            *(
+                fetch_category_list(kind, category_id, list_action)
+                for kind, category_id, list_action in category_records
+            ),
+            return_exceptions=True,
+        )
+        list_error = next(
+            (result for result in list_results if isinstance(result, BaseException)),
+            None,
+        )
+        if list_error:
+            raise list_error
 
         with SessionLocal() as db:
             job = db.get(ProviderCatalogSyncJob, job_id)
-            if job:
+            if job and job.status == "RUNNING":
                 job.status = "COMPLETED"
                 job.phase = "completed"
                 job.error = None
                 job.updated_at = utc_now()
                 db.commit()
-        logger.info("Provider catalog sync job %s completed for account %s", job_id, account_id)
+        logger.info(
+            "Provider catalog sync job %s completed catalog lists for account %s "
+            "(%s categories, up to %s concurrent requests); series details remain lazy-loaded",
+            job_id,
+            account_id,
+            len(category_records),
+            CATALOG_REQUEST_CONCURRENCY,
+        )
 
     @staticmethod
     async def _fetch_action(

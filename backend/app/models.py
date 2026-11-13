@@ -95,6 +95,7 @@ class ProviderCatalogSyncJob(Base):
         ForeignKey("accounts.id", ondelete="CASCADE"), index=True
     )
     proxy_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    attempted_account_ids: Mapped[str] = mapped_column(Text, default="[]")
     status: Mapped[str] = mapped_column(String(16), default="PENDING", index=True)
     phase: Mapped[str] = mapped_column(String(32), default="queued")
     categories_processed: Mapped[int] = mapped_column(Integer, default=0)
@@ -377,6 +378,7 @@ def init_db() -> None:
                 "cache_hits": "INTEGER NOT NULL DEFAULT 0",
                 "invalid_series_details": "INTEGER NOT NULL DEFAULT 0",
                 "stale_responses": "INTEGER NOT NULL DEFAULT 0",
+                "attempted_account_ids": "TEXT NOT NULL DEFAULT '[]'",
             },
         }
         inspector = inspect(connection)

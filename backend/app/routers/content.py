@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import shlex
@@ -169,6 +170,10 @@ class CatalogSyncRequest(BaseModel):
     proxy_id: int | None = Field(default=None, ge=0)
 
 
+class CatalogSyncRetryRequest(BaseModel):
+    proxy_id: int | None = Field(default=None, ge=0)
+
+
 def _playlist_category_id(playlist_id: int, group_title: str) -> str:
     group_hash = hashlib.sha256(group_title.encode("utf-8")).hexdigest()[:16]
     return f"m3u:{playlist_id}:{group_hash}"
@@ -210,6 +215,7 @@ def start_catalog_sync(payload: CatalogSyncRequest, request: Request) -> dict[st
         job = ProviderCatalogSyncJob(
             account_id=payload.account_id,
             proxy_id=proxy_id,
+            attempted_account_ids=json.dumps([account.id]),
             status="PENDING",
             phase="queued",
         )
@@ -232,6 +238,8 @@ def _catalog_sync_job_json(
         "job_id": job.id,
         "account_id": job.account_id,
         "provider_url": provider_url,
+        "proxy_id": job.proxy_id,
+        "attempted_account_ids": json.loads(job.attempted_account_ids or "[]"),
         "status": job.status,
         "phase": job.phase,
         "categories_processed": job.categories_processed,
@@ -287,6 +295,95 @@ def stop_catalog_sync(job_id: int, request: Request) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"job_id": job_id, "status": status}
+
+
+@router.post("/catalog-sync/{job_id}/retry")
+def retry_catalog_sync(
+    job_id: int,
+    request: Request,
+    payload: CatalogSyncRetryRequest,
+) -> dict[str, Any]:
+    with SessionLocal() as db:
+        failed_job = db.get(ProviderCatalogSyncJob, job_id)
+        if not failed_job:
+            raise HTTPException(status_code=404, detail="Catalog sync job not found.")
+        if failed_job.status != "FAILED":
+            raise HTTPException(
+                status_code=409,
+                detail="Only a failed catalog sync can be retried.",
+            )
+        failed_account = db.get(Account, failed_job.account_id)
+        if not failed_account:
+            raise HTTPException(
+                status_code=409,
+                detail="The account used by this sync is no longer available.",
+            )
+        provider_url = failed_account.provider_url
+        active_job = db.scalar(
+            select(ProviderCatalogSyncJob.id)
+            .join(Account, Account.id == ProviderCatalogSyncJob.account_id)
+            .where(
+                Account.provider_url == provider_url,
+                ProviderCatalogSyncJob.status.in_(("PENDING", "RUNNING", "CANCELLING")),
+            )
+        )
+        if active_job is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="A catalog sync is already queued or running for this provider profile.",
+            )
+        try:
+            attempted = {
+                int(account_id)
+                for account_id in json.loads(failed_job.attempted_account_ids or "[]")
+            }
+        except (json.JSONDecodeError, TypeError, ValueError):
+            attempted = set()
+        attempted.add(failed_account.id)
+        candidates = db.scalars(
+            select(Account)
+            .where(
+                Account.provider_url == provider_url,
+                Account.enabled.is_(True),
+                Account.id.not_in(attempted),
+            )
+            .order_by(Account.id)
+        ).all()
+        if not candidates:
+            raise HTTPException(
+                status_code=409,
+                detail="No unused enabled account remains in this profile. Add another credential or start a fresh sync.",
+            )
+        next_account = candidates[0]
+        proxy_id = failed_job.proxy_id if payload.proxy_id is None else payload.proxy_id
+        if proxy_id == 0:
+            proxy_id = None
+        try:
+            resolve_provider_proxy(proxy_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        retry_job = ProviderCatalogSyncJob(
+            account_id=next_account.id,
+            proxy_id=proxy_id,
+            attempted_account_ids=json.dumps(
+                [*sorted(attempted), next_account.id]
+            ),
+            status="PENDING",
+            phase="queued",
+        )
+        db.add(retry_job)
+        db.commit()
+        retry_job_id = retry_job.id
+        next_account_id = next_account.id
+        proxy_id = retry_job.proxy_id
+    request.app.state.catalog_sync_worker.wake()
+    return {
+        "job_id": retry_job_id,
+        "status": "PENDING",
+        "provider_url": provider_url,
+        "account_id": next_account_id,
+        "proxy_id": proxy_id,
+    }
 
 
 def _playlist_entry_json(entry: M3UEntry, category_id: str) -> dict[str, Any]:

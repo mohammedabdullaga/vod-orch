@@ -71,6 +71,7 @@ function App() {
   const [categories, setCategories] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [catalogSyncJobs, setCatalogSyncJobs] = useState({});
+  const [catalogSyncProxyByProfile, setCatalogSyncProxyByProfile] = useState({});
   const [proxies, setProxies] = useState([]);
   const [providerProxyId, setProviderProxyId] = useState("");
   const [providerProxyReady, setProviderProxyReady] = useState(false);
@@ -413,12 +414,22 @@ function App() {
       setAccountForm(parsedAccounts[0]);
     }
   };
-  const syncCatalog = (accountId) => act(
+  const syncCatalog = (accountId, providerUrl) => act(
     () => api.post("/content/catalog-sync", {
       account_id: accountId,
-      proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+      proxy_id: (catalogSyncProxyByProfile[providerUrl] ?? providerProxyId)
+        ? Number(catalogSyncProxyByProfile[providerUrl] ?? providerProxyId)
+        : 0,
     }),
     "Xtream catalog sync queued. Progress will update here while the VPS caches categories, titles, and series episodes.",
+  );
+  const retryCatalogSync = (jobId, providerUrl) => act(
+    () => api.post(`/content/catalog-sync/${jobId}/retry`, {
+      proxy_id: (catalogSyncProxyByProfile[providerUrl] ?? providerProxyId)
+        ? Number(catalogSyncProxyByProfile[providerUrl] ?? providerProxyId)
+        : 0,
+    }),
+    ({ data }) => `Sync retry queued using the next account in the profile (account #${data.account_id}).`,
   );
   const stopCatalogSync = (jobId) => act(
     () => api.post(`/content/catalog-sync/${jobId}/stop`),
@@ -678,13 +689,26 @@ function App() {
               const syncing = job && ["PENDING", "RUNNING", "CANCELLING"].includes(job.status);
               const stopping = job?.status === "CANCELLING";
               const syncAccount = profile.accounts.find((account) => account.enabled);
+              const syncProxyId = catalogSyncProxyByProfile[profile.provider_url] ?? providerProxyId;
               return <div key={profile.provider_url} className="rounded-lg bg-slate-900/70 px-3 py-3">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0"><div className="text-sm font-medium text-slate-200">Provider profile</div><div className="truncate text-xs text-slate-500">{profile.provider_url}</div></div>
-                  <button type="button" disabled={busy || stopping || (!syncing && !syncAccount)} onClick={() => syncing ? stopCatalogSync(job.job_id) : syncCatalog(syncAccount.id)} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-indigo-400/30 px-2.5 py-1.5 text-xs text-indigo-200 hover:bg-indigo-500/10 disabled:opacity-40">
-                    {syncing ? <XCircle size={13} /> : <RefreshCw size={13} />}
-                    {stopping ? "Stopping…" : syncing ? "Stop sync" : syncAccount ? "Sync profile catalog" : "No enabled account"}
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label className="flex items-center gap-2 text-[11px] text-slate-400">
+                      Sync connection
+                      <select value={syncProxyId} onChange={(event) => setCatalogSyncProxyByProfile((current) => ({ ...current, [profile.provider_url]: event.target.value }))} disabled={busy || syncing} className="max-w-56 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-200 disabled:opacity-50">
+                        <option value="">Direct</option>
+                        {proxies.filter((proxy) => proxy.enabled).map((proxy) => <option key={proxy.id} value={String(proxy.id)}>Proxy #{proxy.id} · {proxy.url}</option>)}
+                      </select>
+                    </label>
+                    <button type="button" disabled={busy || stopping || (!syncing && !syncAccount)} onClick={() => syncing ? stopCatalogSync(job.job_id) : syncCatalog(syncAccount.id, profile.provider_url)} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-indigo-400/30 px-2.5 py-1.5 text-xs text-indigo-200 hover:bg-indigo-500/10 disabled:opacity-40">
+                      {syncing ? <XCircle size={13} /> : <RefreshCw size={13} />}
+                      {stopping ? "Stopping…" : syncing ? "Stop sync" : syncAccount ? "Sync profile catalog" : "No enabled account"}
+                    </button>
+                    {job?.status === "FAILED" && <button type="button" disabled={busy} onClick={() => retryCatalogSync(job.job_id, profile.provider_url)} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-400/30 px-2.5 py-1.5 text-xs text-amber-200 hover:bg-amber-500/10 disabled:opacity-40">
+                      <RefreshCw size={13} />Retry with next account
+                    </button>}
+                  </div>
                 </div>
                 <div className="mt-3 space-y-1.5 border-t border-slate-800 pt-2">
                   {profile.accounts.map((account) => <div key={account.id} className="flex items-center justify-between gap-3 text-xs">
@@ -695,13 +719,14 @@ function App() {
                 {job && <div className="mt-2 border-t border-slate-800 pt-2 text-[11px]">
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-400">
                     <span className={job.status === "COMPLETED" ? "text-emerald-300" : job.status === "FAILED" ? "text-rose-300" : job.status === "CANCELLED" ? "text-slate-400" : "text-indigo-300"}>{job.status} · {job.phase}</span>
+                    <span>Account: {accounts.find((account) => account.id === job.account_id)?.username || `#${job.account_id}`}</span>
+                    <span>Connection: {job.proxy_id ? `Proxy #${job.proxy_id}` : "Direct"}</span>
                     <span>{job.categories_processed} categories</span>
                     <span>{job.lists_processed} lists · {job.cached_items} titles</span>
-                    <span>{job.series_details_processed}/{job.total_series_details} series details</span>
+                    <span>Series episode details load when browsed</span>
                     {job.cache_hits > 0 && <span>{job.cache_hits} cached responses reused</span>}
                   </div>
                   {job.stale_responses > 0 && <p className="mt-1 text-amber-300">{job.stale_responses} refresh requests used stale cached data after provider/proxy errors.</p>}
-                  {job.invalid_series_details > 0 && <p className="mt-1 text-amber-300">{job.invalid_series_details} series returned malformed episode data and were skipped; other series continued syncing.</p>}
                   {job.error && <p className="mt-1 text-rose-300">{job.error}</p>}
                 </div>}
               </div>;
@@ -736,7 +761,7 @@ function App() {
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320] lg:col-span-2">
             <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Clapperboard size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Xtream catalog cache</h2><p className="text-xs text-slate-500">Catalog syncs run on the VPS and persist provider categories, titles, and episode mappings in SQLite.</p></div></div>
-            <p className="p-5 text-xs leading-5 text-slate-400">Each provider profile shares one catalog sync and cache across its credentials. Category and title lists are fetched first, then series episode details are fetched one series at a time and rate-limited to protect the provider. The selected provider API proxy is used for the entire sync. Running syncs can be stopped here; deleting a credential preserves shared catalog data. Existing saved M3U records are preserved but are no longer part of the primary browsing and import workflow.</p>
+            <p className="p-5 text-xs leading-5 text-slate-400">Each provider profile shares one catalog sync and cache across its credentials. Choose direct or an enabled proxy for each sync. A sync attempt uses one account; retrying a failed sync selects the next enabled, not-yet-tried credential in that profile and keeps the selected connection route. Category and title lists are fetched concurrently (up to four requests); series episode details load on demand when you browse a series, rather than delaying the catalog sync. Running syncs can be stopped here; deleting a credential preserves shared catalog data. Existing saved M3U records are preserved but are no longer part of the primary browsing and import workflow.</p>
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
             <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Gauge size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Proxy pool</h2><p className="text-xs text-slate-500">Proxy URLs are encrypted at rest</p></div></div>
