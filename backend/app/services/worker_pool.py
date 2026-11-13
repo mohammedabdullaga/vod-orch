@@ -679,7 +679,7 @@ class WorkerPool:
         try:
             reset_count = (
                 self._reconcile_worker_state()
-                if force_reset_account_busy_states
+                if scope == "all" or force_reset_account_busy_states
                 else 0
             )
             with SessionLocal() as db:
@@ -809,7 +809,12 @@ class WorkerPool:
                 "success": True,
                 "deleted_tasks_count": deleted,
                 "reset_account_states_count": reset_count,
-                "message": "Queue and task history successfully cleaned.",
+                "message": (
+                    "All queue history deleted; active work was stopped and stale "
+                    "worker/account state was reconciled."
+                    if scope == "all"
+                    else "Queue and task history successfully cleaned."
+                ),
             }
         finally:
             self._clearing_queue = False

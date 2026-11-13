@@ -97,6 +97,7 @@ The Vite development server uses `localhost:5173` and forwards `/api` to the bac
 7. **Cancel or clear**
    - Cancelling one active job signals its worker. The SSH command handler terminates the remote downloader process group and removes the partial staging file. The task log viewer provides the same action as **Abort job**.
    - **Stop all & clear all** prevents workers from claiming new pending jobs, cancels pending jobs, signals active jobs, waits for worker cancellation to finish, and hides all queue entries. It does not delete completed media files. Queue records remain internally as hidden deduplication tombstones; selected cancelled items can be queued again manually through the browser. Monitored categories remain enabled and may enqueue future new streams.
+   - In **Clean Task History & Reset Queue**, selecting both deletion scopes performs a full reset: it stops active downloads, cleans their staging artifacts, deletes every queue record (including hidden tombstones), and reconciles stale worker/account state. This removes deduplication history so the same content can be queued again. Existing final media files are preserved and will not be overwritten.
    - If SSH is unavailable, the VPS cannot guarantee that it killed an already-running remote process immediately. The bulk operation reports a timeout rather than clearing the list while tracked jobs are still running.
 
 ## Storage path configuration
