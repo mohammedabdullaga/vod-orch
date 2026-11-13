@@ -30,12 +30,14 @@ CATALOG_REQUEST_CONCURRENCY = 4
 class ProviderCatalogSyncWorker:
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._active_job_id: int | None = None
         self._active_job_task: asyncio.Task | None = None
         self._stopping = asyncio.Event()
         self._wake_event = asyncio.Event()
 
     async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
         with SessionLocal() as db:
             db.execute(
                 update(ProviderCatalogSyncJob)
@@ -86,17 +88,38 @@ class ProviderCatalogSyncWorker:
                 job.phase = "cancelled"
                 job.updated_at = utc_now()
                 db.commit()
-                self._wake_event.set()
+                self._signal_wakeup()
                 return job.status
-            if job.status == "RUNNING":
+            if job.status in ("RUNNING", "CANCELLING"):
                 job.status = "CANCELLING"
                 job.phase = "cancelling"
                 job.updated_at = utc_now()
                 db.commit()
-                if self._active_job_id == job_id and self._active_job_task:
-                    self._active_job_task.cancel()
+                task = (
+                    self._active_job_task
+                    if self._active_job_id == job_id
+                    else None
+                )
+                if task and not task.done():
+                    task_loop = task.get_loop()
+                    if not task_loop.is_closed():
+                        task_loop.call_soon_threadsafe(task.cancel)
+                    else:
+                        job.status = "CANCELLED"
+                        job.phase = "cancelled"
+                        job.updated_at = utc_now()
+                        db.commit()
+                else:
+                    job.status = "CANCELLED"
+                    job.phase = "cancelled"
+                    job.updated_at = utc_now()
+                    db.commit()
                 return job.status
             return job.status
+
+    def _signal_wakeup(self) -> None:
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._wake_event.set)
 
     def stop_profile(self, provider_url: str) -> None:
         with SessionLocal() as db:
@@ -105,7 +128,7 @@ class ProviderCatalogSyncWorker:
                 .join(Account, Account.id == ProviderCatalogSyncJob.account_id)
                 .where(
                     Account.provider_url == provider_url,
-                    ProviderCatalogSyncJob.status.in_(("PENDING", "RUNNING")),
+                    ProviderCatalogSyncJob.status.in_(("PENDING", "RUNNING", "CANCELLING")),
                 )
             ).all()
         for job_id in job_ids:

@@ -900,9 +900,7 @@ def get_account_availability(
             busy_rows = db.execute(
                 select(QueueItem.account_id, QueueItem.status).where(
                     QueueItem.account_id.in_(account_ids),
-                    QueueItem.status.in_(
-                        ("PENDING", "DOWNLOADING", "VERIFYING", "CANCELLING")
-                    ),
+                    QueueItem.status.in_(("DOWNLOADING", "VERIFYING", "CANCELLING")),
                 )
             ).all()
             for account_id, status in busy_rows:
@@ -943,7 +941,7 @@ def get_account_availability(
                     "Account is disabled."
                     if not account.enabled
                     else (
-                        "Account has queued or active downloads: "
+                        "Account has active downloads: "
                         + ", ".join(sorted(busy_statuses[account.id]))
                         + "."
                     )

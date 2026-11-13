@@ -289,7 +289,7 @@ def get_catalog_sync_status(job_id: int) -> dict[str, Any]:
 
 
 @router.post("/catalog-sync/{job_id}/stop")
-def stop_catalog_sync(job_id: int, request: Request) -> dict[str, Any]:
+async def stop_catalog_sync(job_id: int, request: Request) -> dict[str, Any]:
     try:
         status = request.app.state.catalog_sync_worker.stop_job(job_id)
     except ValueError as exc:
@@ -1348,14 +1348,14 @@ def _queue_manual_batch(
                     select(QueueItem.account_id).where(
                         QueueItem.account_id.in_(payload.account_ids),
                         QueueItem.status.in_(
-                            ("PENDING", "DOWNLOADING", "VERIFYING", "CANCELLING")
+                            ("DOWNLOADING", "VERIFYING", "CANCELLING")
                         ),
                     ).distinct()
                 ).all())
                 if busy_ids:
                     raise HTTPException(
                         status_code=409,
-                        detail="One or more selected accounts already have queued or active work. Refresh account availability.",
+                        detail="One or more selected accounts already have an active download. Refresh account availability.",
                     )
         selected_proxy_id = None
         if payload.proxy_mode == "node":
@@ -1673,13 +1673,13 @@ async def prepare_series_batch(
         busy_ids = set(db.scalars(
             select(QueueItem.account_id).where(
                 QueueItem.account_id.in_(payload.account_ids),
-                QueueItem.status.in_(("PENDING", "DOWNLOADING", "VERIFYING", "CANCELLING")),
+                QueueItem.status.in_(("DOWNLOADING", "VERIFYING", "CANCELLING")),
             ).distinct()
         ).all())
         if busy_ids:
             raise HTTPException(
                 status_code=409,
-                detail="One or more selected accounts already have queued or active work. Refresh account availability.",
+                detail="One or more selected accounts already have an active download. Refresh account availability.",
             )
         route = db.get(StorageRoute, "series")
         series_node = db.get(Node, route.node_id) if route else None
