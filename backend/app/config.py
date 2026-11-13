@@ -28,6 +28,9 @@ class Settings:
         os.getenv("REMOTE_DOWNLOAD_IDLE_TIMEOUT_SECONDS", "300")
     )
     default_axel_connections: int = int(os.getenv("DEFAULT_AXEL_CONNECTIONS", "12"))
+    master_user_agent: str = os.getenv(
+        "MASTER_USER_AGENT", "VLC/3.0.18 LibVLC/3.0.18"
+    )
     known_hosts_path: str = os.getenv("SSH_KNOWN_HOSTS", "")
     admin_username: str = os.getenv("ADMIN_USERNAME", "")
     admin_password: str = os.getenv("ADMIN_PASSWORD", "")
@@ -45,6 +48,8 @@ class Settings:
             raise ValueError("MAX_RETRIES must be at least 1.")
         if not 1 <= self.default_axel_connections <= 12:
             raise ValueError("DEFAULT_AXEL_CONNECTIONS must be between 1 and 12.")
+        if not self.master_user_agent.strip():
+            raise ValueError("MASTER_USER_AGENT cannot be empty.")
         if self.provider_series_details_interval_seconds < 0:
             raise ValueError("PROVIDER_SERIES_DETAILS_INTERVAL_SECONDS cannot be negative.")
         if self.remote_download_idle_timeout_seconds < 1:

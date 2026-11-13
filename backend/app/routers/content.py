@@ -1940,6 +1940,7 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
             .replace("`", "\\`")
             + '"'
         )
+        q_master_user_agent = shlex.quote(settings.master_user_agent.strip())
         account_lines = commands_by_account[assigned_account.id]
         account_lines.append(f"mkdir -p {q_parent} && chmod 0755 {q_parent}")
         if proxy_scheme == "socks5" and quoted_proxy:
@@ -1955,13 +1956,13 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
             account_lines.append(
                 f"http_proxy={quoted_proxy} https_proxy={quoted_proxy} "
                 f"HTTP_PROXY={quoted_proxy} HTTPS_PROXY={quoted_proxy} "
-                f"axel -n {axel_connections} -o {q_destination} "
-                f"--user-agent={q_user_agent} {q_url}"
+                f"axel -n {axel_connections} "
+                f"--user-agent={q_master_user_agent} -o {q_destination} {q_url}"
             )
         else:
             account_lines.append(
-                f"axel -n {axel_connections} -o {q_destination} "
-                f"--user-agent={q_user_agent} {q_url}"
+                f"axel -n {axel_connections} "
+                f"--user-agent={q_master_user_agent} -o {q_destination} {q_url}"
             )
     process_ids = []
     for index, script_account in enumerate(script_accounts, start=1):

@@ -638,6 +638,7 @@ class RemoteDispatcher:
                 .replace("`", "\\`")
                 + '"'
             )
+            q_master_ua = shlex.quote(settings.master_user_agent.strip())
             pid_file = f"{staging_file}.pid"
             state_file = f"{staging_file}.st"
             q_state_file = shlex.quote(state_file)
@@ -678,15 +679,15 @@ class RemoteDispatcher:
                 download = (
                     f"http_proxy={safe_proxy} https_proxy={safe_proxy} "
                     f"HTTP_PROXY={safe_proxy} HTTPS_PROXY={safe_proxy} "
-                    f"axel -q -n {axel_connections} -o {q_stage} "
-                    f"--user-agent={q_ua} {q_url}"
+                    f"axel -q -n {axel_connections} "
+                    f"--user-agent={q_master_ua} -o {q_stage} {q_url}"
                 )
             elif proxy_url:
                 raise RuntimeError("Proxy URL scheme must be http, https, or socks5.")
             else:
                 download = (
-                    f"axel -q -n {axel_connections} -o {q_stage} "
-                    f"--user-agent={q_ua} {q_url}"
+                    f"axel -q -n {axel_connections} "
+                    f"--user-agent={q_master_ua} -o {q_stage} {q_url}"
                 )
             remote_download = (
                 "unset http_proxy https_proxy ftp_proxy all_proxy "
