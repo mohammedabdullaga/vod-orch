@@ -433,8 +433,20 @@ function App() {
   );
   const stopCatalogSync = (jobId) => act(
     () => api.post(`/content/catalog-sync/${jobId}/stop`),
-    "Catalog sync stop requested.",
+    "Catalog sync stopped.",
   );
+  const clearCatalogSyncData = () => {
+    if (!window.confirm(
+      "Stop any running catalog syncs and clear all provider catalog caches and sync history? Accounts, monitored categories, queued downloads, and saved media will not be deleted. The next sync or browse will fetch provider data again.",
+    )) return;
+    act(async () => {
+      const { data } = await api.post("/content/catalog-sync/clear");
+      setCatalogSyncJobs({});
+      return data;
+    }, ({ sync_jobs, catalog_cache_entries, legacy_cache_entries }) =>
+      `Cleared ${catalog_cache_entries + legacy_cache_entries} cached catalog entries and ${sync_jobs} sync records. Accounts, queue, and media were preserved.`
+    );
+  };
   const addProxy = (event) => {
     event.preventDefault();
     act(async () => { await api.post("/proxies", { url: proxyUrl }); setProxyUrl(""); await loadSettings(); }, "Proxy added.");
@@ -760,8 +772,8 @@ function App() {
             </div>
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320] lg:col-span-2">
-            <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Clapperboard size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Xtream catalog cache</h2><p className="text-xs text-slate-500">Catalog syncs run on the VPS and persist provider categories, titles, and episode mappings in SQLite.</p></div></div>
-            <p className="p-5 text-xs leading-5 text-slate-400">Each provider profile shares one catalog sync and cache across its credentials. Choose direct or an enabled proxy for each sync. A sync attempt uses one account; retrying a failed sync selects the next enabled, not-yet-tried credential in that profile and keeps the selected connection route. Category and title lists are fetched concurrently (up to four requests); series episode details load on demand when you browse a series, rather than delaying the catalog sync. Running syncs can be stopped here; deleting a credential preserves shared catalog data. Existing saved M3U records are preserved but are no longer part of the primary browsing and import workflow.</p>
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-5 py-4"><div className="flex items-center gap-2"><Clapperboard size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Xtream catalog cache</h2><p className="text-xs text-slate-500">Catalog syncs run on the VPS and persist provider categories, titles, and episode mappings in SQLite.</p></div></div><button type="button" onClick={clearCatalogSyncData} disabled={busy} className="inline-flex items-center gap-1.5 rounded-lg border border-rose-400/30 px-3 py-2 text-xs font-medium text-rose-200 hover:bg-rose-500/10 disabled:opacity-40"><Trash2 size={13} />Clear all sync data</button></div>
+            <p className="p-5 text-xs leading-5 text-slate-400">Profiles group credentials by provider host and coordinate one sync at a time, but cached catalogs are isolated by username so account-specific IDs are not reused across credentials. Choose direct or an enabled proxy for each sync. A sync attempt uses one account; retrying a failed sync selects the next enabled, not-yet-tried credential in that profile and keeps the selected connection route. Category and title lists are fetched concurrently (up to four requests); series episode details load on demand when you browse a series, rather than delaying the catalog sync. Stop cancels the active provider request before reporting completion. Clear all sync data stops active syncs, then removes provider catalog caches and sync history across all profiles; accounts, monitored categories, queued downloads, and media files are preserved. The next sync or browse requests fresh provider data.</p>
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
             <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Gauge size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Proxy pool</h2><p className="text-xs text-slate-500">Proxy URLs are encrypted at rest</p></div></div>

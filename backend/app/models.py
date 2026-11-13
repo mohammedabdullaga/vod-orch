@@ -239,6 +239,9 @@ class QueueItem(Base):
     account_id: Mapped[int | None] = mapped_column(
         ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True
     )
+    source_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True
+    )
     destination_node_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     destination_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     remote_node_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -335,6 +338,52 @@ def init_db() -> None:
                 "INSERT INTO schema_migrations (version) VALUES (?)",
                 (cache_migration,),
             )
+        account_cache_migration = "provider-catalog-cache-account-scope-v2"
+        account_cache_migration_applied = connection.exec_driver_sql(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            (account_cache_migration,),
+        ).first()
+        if not account_cache_migration_applied:
+            connection.exec_driver_sql("DELETE FROM provider_profile_catalog_cache")
+            legacy_cache_rows = connection.exec_driver_sql(
+                "SELECT accounts.provider_url, accounts.username, "
+                "provider_catalog_cache.action, provider_catalog_cache.params_key, "
+                "provider_catalog_cache.payload, provider_catalog_cache.fetched_at "
+                "FROM provider_catalog_cache "
+                "JOIN accounts ON accounts.id = provider_catalog_cache.account_id "
+                "ORDER BY provider_catalog_cache.fetched_at DESC"
+            ).mappings()
+            for row in legacy_cache_rows:
+                try:
+                    stored_key = json.loads(row["params_key"])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(stored_key, dict):
+                    continue
+                cached_params = stored_key.get("params", stored_key)
+                if not isinstance(cached_params, dict):
+                    continue
+                params_key = json.dumps(
+                    {"username": row["username"], "params": cached_params},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                connection.exec_driver_sql(
+                    "INSERT OR IGNORE INTO provider_profile_catalog_cache "
+                    "(provider_url, action, params_key, payload, fetched_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        row["provider_url"].rstrip("/"),
+                        row["action"],
+                        params_key,
+                        row["payload"],
+                        row["fetched_at"],
+                    ),
+                )
+            connection.exec_driver_sql(
+                "INSERT INTO schema_migrations (version) VALUES (?)",
+                (account_cache_migration,),
+            )
 
         migrations = {
             "monitored_categories": {
@@ -356,6 +405,7 @@ def init_db() -> None:
                 "file_size_bytes": "INTEGER",
                 "speed_bytes_per_second": "FLOAT",
                 "attempted_account_ids": "TEXT NOT NULL DEFAULT '[]'",
+                "source_account_id": "INTEGER",
                 "remote_node_id": "INTEGER",
                 "destination_node_id": "INTEGER",
                 "destination_path": "TEXT",

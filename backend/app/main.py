@@ -608,6 +608,12 @@ def retry_item(payload: RetryRequest):
             .where(Account.enabled.is_(True))
             .order_by(Account.id)
         ).all()
+        if item.source_account_id is not None:
+            accounts = [
+                account
+                for account in accounts
+                if account.id == item.source_account_id
+            ]
         provider_url = item.source_provider_url
         if item.provider_stream_id is None and provider_url is None:
             previous_account = db.get(Account, item.account_id) if item.account_id else None
@@ -692,10 +698,40 @@ def requeue_pending_items():
             ):
                 blocked_by_kind[item.kind] = "No storage route is configured."
                 continue
-            if item.provider_stream_id or (
-                item.source_provider_url or ""
-            ).startswith("m3u:"):
+            if item.source_account_id is not None:
+                eligible = [
+                    account
+                    for account in enabled_accounts
+                    if account.id == item.source_account_id
+                ]
+            elif (item.source_provider_url or "").startswith("m3u:"):
                 eligible = enabled_accounts
+            elif item.provider_stream_id:
+                source_url = item.source_provider_url
+                if source_url is None:
+                    try:
+                        stored_url = decrypt_secret(item.stream_url_encrypted)
+                    except Exception as exc:
+                        logger.error(
+                            "Could not inspect pending task %s provider URL (%s).",
+                            item.id,
+                            type(exc).__name__,
+                        )
+                        blocked_by_kind[item.kind] = (
+                            "Some legacy tasks have unreadable provider URLs."
+                        )
+                        continue
+                    eligible = [
+                        account
+                        for account in enabled_accounts
+                        if stored_url.startswith(account.provider_url.rstrip("/") + "/")
+                    ]
+                else:
+                    eligible = [
+                        account
+                        for account in enabled_accounts
+                        if account.provider_url.rstrip("/") == source_url.rstrip("/")
+                    ]
             else:
                 source_url = item.source_provider_url
                 if source_url is None:
@@ -893,7 +929,12 @@ def get_account_availability(
             raise HTTPException(status_code=409, detail="The selected Xtream account is unavailable.")
         if source_playlist_id is not None and (not playlist or not playlist.enabled):
             raise HTTPException(status_code=409, detail="The selected M3U playlist is unavailable.")
-        accounts = db.scalars(select(Account).order_by(Account.id)).all()
+        accounts_query = select(Account).order_by(Account.id)
+        if source_account:
+            accounts_query = accounts_query.where(
+                Account.id == source_account.id
+            )
+        accounts = db.scalars(accounts_query).all()
         account_ids = [account.id for account in accounts]
         busy_statuses: dict[int, set[str]] = {}
         if account_ids:
@@ -997,7 +1038,7 @@ async def delete_account(account_id: int, request: Request):
             )
         provider_url = account.provider_url
 
-    request.app.state.catalog_sync_worker.stop_profile(provider_url)
+    await request.app.state.catalog_sync_worker.stop_profile(provider_url)
     with SessionLocal() as db:
         account = db.get(Account, account_id)
         if not account:

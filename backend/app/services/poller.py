@@ -216,6 +216,7 @@ class CategoryPoller:
                 file_name=file_name, series_title=series_title, season=season,
                 episode=episode, category_id=category_id, category_name=category_name,
                 source_provider_url=account.provider_url,
+                source_account_id=account.id,
                 series_id=series_id, status="PENDING", created_at=utc_now(),
             ))
             try:

@@ -155,6 +155,18 @@ def _provider_kind(content_type: str) -> tuple[str, str, str]:
     return "vod", "get_vod_categories", "get_vod_streams"
 
 
+def _provider_item_id(row: dict[str, Any], kind: str) -> Any:
+    keys = ("series_id", "id") if kind == "series" else ("stream_id", "id")
+    return next(
+        (
+            row[key]
+            for key in keys
+            if row.get(key) is not None and str(row[key]).strip()
+        ),
+        None,
+    )
+
+
 class M3UPlaylistCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     url: str = Field(min_length=8, max_length=4096)
@@ -180,7 +192,9 @@ def _playlist_category_id(playlist_id: int, group_title: str) -> str:
 
 
 @router.post("/catalog-sync")
-def start_catalog_sync(payload: CatalogSyncRequest, request: Request) -> dict[str, Any]:
+async def start_catalog_sync(payload: CatalogSyncRequest, request: Request) -> dict[str, Any]:
+    if request.app.state.catalog_sync_worker.clearing_data:
+        raise HTTPException(status_code=409, detail="Catalog sync data is being cleared. Try again shortly.")
     with SessionLocal() as db:
         account = db.get(Account, payload.account_id)
         if not account or not account.enabled:
@@ -199,7 +213,7 @@ def start_catalog_sync(payload: CatalogSyncRequest, request: Request) -> dict[st
             .join(Account, Account.id == ProviderCatalogSyncJob.account_id)
             .where(
                 Account.provider_url == account.provider_url,
-                ProviderCatalogSyncJob.status.in_(("PENDING", "RUNNING")),
+                ProviderCatalogSyncJob.status.in_(("PENDING", "RUNNING", "CANCELLING")),
             )
         )
         if active_job is not None:
@@ -291,18 +305,31 @@ def get_catalog_sync_status(job_id: int) -> dict[str, Any]:
 @router.post("/catalog-sync/{job_id}/stop")
 async def stop_catalog_sync(job_id: int, request: Request) -> dict[str, Any]:
     try:
-        status = request.app.state.catalog_sync_worker.stop_job(job_id)
+        status = await request.app.state.catalog_sync_worker.stop_job(job_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
     return {"job_id": job_id, "status": status}
 
 
+@router.post("/catalog-sync/clear")
+async def clear_catalog_sync_data(request: Request) -> dict[str, Any]:
+    try:
+        deleted = await request.app.state.catalog_sync_worker.clear_all_data()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, **deleted}
+
+
 @router.post("/catalog-sync/{job_id}/retry")
-def retry_catalog_sync(
+async def retry_catalog_sync(
     job_id: int,
     request: Request,
     payload: CatalogSyncRetryRequest,
 ) -> dict[str, Any]:
+    if request.app.state.catalog_sync_worker.clearing_data:
+        raise HTTPException(status_code=409, detail="Catalog sync data is being cleared. Try again shortly.")
     with SessionLocal() as db:
         failed_job = db.get(ProviderCatalogSyncJob, job_id)
         if not failed_job:
@@ -900,7 +927,7 @@ async def get_content_items(
             items_action,
         )
         for row in rows:
-            item_id = row.get("series_id", row.get("stream_id", row.get("id")))
+            item_id = _provider_item_id(row, kind)
             if item_id is None:
                 continue
             item_id = str(item_id)
@@ -1273,16 +1300,12 @@ def _queue_manual_batch(
             raise HTTPException(status_code=409, detail="The selected M3U playlist is unavailable.")
         account = None
         if playlist is None:
-            account = (
-                db.get(Account, payload.source_account_id)
-                if payload.source_account_id is not None
-                else db.scalar(
-                    select(Account)
-                    .where(Account.enabled.is_(True))
-                    .order_by(Account.id)
-                    .limit(1)
+            if payload.source_account_id is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Select the Xtream account that supplied the catalog IDs.",
                 )
-            )
+            account = db.get(Account, payload.source_account_id)
             if not account or not account.enabled:
                 raise HTTPException(
                     status_code=409,
@@ -1342,6 +1365,13 @@ def _queue_manual_batch(
                 raise HTTPException(
                     status_code=409,
                     detail="Selected download accounts must be enabled.",
+                )
+            if account and any(
+                selected.id != account.id for selected in selected_accounts
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Xtream downloads must use the account that supplied the catalog IDs.",
                 )
             if not allow_existing_account_queue:
                 busy_ids = set(db.scalars(
@@ -1564,6 +1594,7 @@ def _queue_manual_batch(
                 "title": title,
                 "kind": kind,
                 "source_provider_url": source_provider_url,
+                "source_account_id": account.id if account else None,
                 "category_id": category_id,
                 "category_name": category_name,
                 "series_id": series_id,
@@ -1585,8 +1616,15 @@ def _queue_manual_batch(
                 "season": season,
                 "episode": episode,
                 "account_id": (
-                    selected_accounts[(payload.account_offset + assigned_count) % len(selected_accounts)].id
-                    if selected_accounts else None
+                    account.id
+                    if account
+                    else (
+                        selected_accounts[
+                            (payload.account_offset + assigned_count) % len(selected_accounts)
+                        ].id
+                        if selected_accounts
+                        else None
+                    )
                 ),
                 "status": "PENDING",
                 "hidden_from_dashboard": False,
@@ -1670,6 +1708,13 @@ async def prepare_series_batch(
             not source_account or not source_account.enabled
         ):
             raise HTTPException(status_code=409, detail="The source Xtream account is unavailable.")
+        if source_account and any(
+            selected.id != source_account.id for selected in selected_accounts
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Xtream downloads must use the account that supplied the catalog IDs.",
+            )
         busy_ids = set(db.scalars(
             select(QueueItem.account_id).where(
                 QueueItem.account_id.in_(payload.account_ids),
@@ -1931,6 +1976,11 @@ class GenerateScriptRequest(BaseModel):
 @router.post("/generate-script")
 def generate_bash_script(payload: GenerateScriptRequest) -> Response:
     kind = "series" if payload.content_type == "SERIES" else "vod"
+    if payload.source_account_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Select the Xtream account that supplied the catalog IDs.",
+        )
     account = _provider_account(payload.source_account_id)
     with SessionLocal() as db:
         if payload.account_ids is not None:
@@ -1951,6 +2001,11 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
                 raise HTTPException(
                     status_code=409,
                     detail="Every selected script download account must be enabled.",
+                )
+            if any(script_account.id != account.id for script_account in script_accounts):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Xtream scripts must use the account that supplied the catalog IDs.",
                 )
         else:
             script_accounts = [account]

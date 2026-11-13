@@ -40,6 +40,44 @@ _ERROR_LINE = re.compile(
 )
 
 
+def _source_account_for_item(
+    item: QueueItem, accounts: dict[int, Account]
+) -> Account | None:
+    if item.source_account_id is not None:
+        return accounts.get(item.source_account_id)
+    if (
+        not item.provider_stream_id
+        or (item.source_provider_url or "").startswith("m3u:")
+    ):
+        return None
+    try:
+        stored_url = decrypt_secret(item.stream_url_encrypted)
+    except RuntimeError as exc:
+        logger.error(
+            "Could not inspect queue item %s source account (%s).",
+            item.id,
+            type(exc).__name__,
+        )
+        return None
+    extension = safe_extension(item.file_name.rsplit(".", 1)[-1])
+    for account in accounts.values():
+        if (
+            item.source_provider_url
+            and account.provider_url.rstrip("/") != item.source_provider_url.rstrip("/")
+        ):
+            continue
+        try:
+            if stream_url(account, item.kind, item.provider_stream_id, extension) == stored_url:
+                return account
+        except (RuntimeError, ValueError):
+            logger.warning(
+                "Could not reconstruct provider URL for queue item %s account %s.",
+                item.id,
+                account.id,
+            )
+    return None
+
+
 class WorkerPool:
     def __init__(self, dispatcher: RemoteDispatcher) -> None:
         self.dispatcher = dispatcher
@@ -289,18 +327,35 @@ class WorkerPool:
                 has_destination = (
                     item.kind in routed_kinds or item.destination_node_id is not None
                 )
+                if (
+                    item.source_account_id is None
+                    and item.provider_stream_id
+                    and not (item.source_provider_url or "").startswith("m3u:")
+                ):
+                    source_account = _source_account_for_item(item, all_accounts)
+                    if source_account is not None:
+                        item.source_account_id = source_account.id
+                        item.source_provider_url = source_account.provider_url
+                        item.attempted_account_ids = "[]"
                 if not has_destination:
                     reason = (
                         f"No storage route is configured for {item.kind} tasks; "
                         "the task remains pending.\n"
                     )
                     eligible_ids: set[int] = set()
+                elif item.source_account_id is not None:
+                    eligible_ids = (
+                        {item.source_account_id}
+                        if item.source_account_id in all_accounts
+                        else set()
+                    )
+                    reason = ""
                 elif item.source_provider_url and item.source_provider_url.startswith("m3u:"):
                     eligible_ids = set(all_accounts)
                     reason = ""
                 elif item.provider_stream_id:
-                    eligible_ids = set(all_accounts)
-                    reason = ""
+                    eligible_ids = set()
+                    reason = "The source account for this Xtream item could not be identified.\n"
                 else:
                     source_url = item.source_provider_url
                     if source_url is None:
@@ -458,8 +513,36 @@ class WorkerPool:
                 )
                 .order_by(QueueItem.created_at, QueueItem.id)
             ).all()
+            enabled_accounts = {
+                candidate.id: candidate
+                for candidate in db.scalars(
+                    select(Account).where(Account.enabled.is_(True))
+                ).all()
+            }
             candidate = None
             for item in candidates:
+                if (
+                    item.source_account_id is None
+                    and item.provider_stream_id
+                    and not (item.source_provider_url or "").startswith("m3u:")
+                ):
+                    source_account = _source_account_for_item(item, enabled_accounts)
+                    if source_account is None:
+                        logger.warning(
+                            "Queue item %s is waiting because its source account cannot be identified.",
+                            item.id,
+                        )
+                        continue
+                    item.source_account_id = source_account.id
+                    item.source_provider_url = source_account.provider_url
+                    item.attempted_account_ids = "[]"
+                    db.flush()
+                if item.source_account_id is not None:
+                    if item.account_id != item.source_account_id:
+                        item.account_id = item.source_account_id
+                        db.flush()
+                    if item.source_account_id != account_id:
+                        continue
                 if item.account_id not in (None, account_id):
                     assigned_account = db.get(Account, item.account_id)
                     assigned_worker = self._workers.get(item.account_id)
@@ -507,8 +590,7 @@ class WorkerPool:
                     item.source_provider_url = account.provider_url
                     db.flush()
                 elif (
-                    item.provider_stream_id is None
-                    and not item.source_provider_url.startswith("m3u:")
+                    not item.source_provider_url.startswith("m3u:")
                     and item.source_provider_url.rstrip("/")
                     != account.provider_url.rstrip("/")
                 ):
@@ -529,20 +611,27 @@ class WorkerPool:
                     db.flush()
                     continue
                 if account_id in attempted_account_ids:
-                    eligible_account_ids = set(db.scalars(
-                        select(Account.id).where(Account.enabled.is_(True))
-                    ).all())
-                    if (
-                        item.source_provider_url
-                        and not item.source_provider_url.startswith("m3u:")
-                        and item.provider_stream_id is None
-                    ):
-                        eligible_account_ids = set(db.scalars(
+                    if item.source_account_id is not None:
+                        eligible_account_ids = {
+                            item.source_account_id
+                        } if db.scalar(
                             select(Account.id).where(
+                                Account.id == item.source_account_id,
                                 Account.enabled.is_(True),
-                                Account.provider_url == item.source_provider_url,
                             )
-                        ).all())
+                        ) is not None else set()
+                    else:
+                        eligible_query = select(Account.id).where(
+                            Account.enabled.is_(True)
+                        )
+                        if (
+                            item.source_provider_url
+                            and not item.source_provider_url.startswith("m3u:")
+                        ):
+                            eligible_query = eligible_query.where(
+                                Account.provider_url == item.source_provider_url
+                            )
+                        eligible_account_ids = set(db.scalars(eligible_query).all())
                     if eligible_account_ids - attempted_account_ids:
                         continue
                     attempted_account_ids.clear()
@@ -848,10 +937,14 @@ class WorkerPool:
                 item.updated_at = utc_now()
                 continue
             accounts_query = select(Account.id).where(Account.enabled.is_(True))
-            if (
+            if item.source_account_id is not None:
+                accounts_query = select(Account.id).where(
+                    Account.enabled.is_(True),
+                    Account.id == item.source_account_id,
+                )
+            elif (
                 item.source_provider_url
                 and not item.source_provider_url.startswith("m3u:")
-                and item.provider_stream_id is None
             ):
                 accounts_query = select(Account.id).where(
                     Account.enabled.is_(True),

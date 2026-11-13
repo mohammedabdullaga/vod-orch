@@ -4,16 +4,20 @@ import logging
 from typing import Any
 
 import httpx
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from app.models import (
     Account,
+    ProviderCatalogCache,
+    ProviderProfileCatalogCache,
     ProviderCatalogSyncJob,
     SessionLocal,
     utc_now,
 )
 from app.services.provider_client import (
+    begin_catalog_cache_clear,
     cached_provider_action,
+    end_catalog_cache_clear,
     invalidate_provider_action_cache,
     resolve_provider_proxy,
 )
@@ -35,6 +39,11 @@ class ProviderCatalogSyncWorker:
         self._active_job_task: asyncio.Task | None = None
         self._stopping = asyncio.Event()
         self._wake_event = asyncio.Event()
+        self._clearing_data = False
+
+    @property
+    def clearing_data(self) -> bool:
+        return self._clearing_data
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -78,7 +87,8 @@ class ProviderCatalogSyncWorker:
     def wake(self) -> None:
         self._wake_event.set()
 
-    def stop_job(self, job_id: int) -> str:
+    async def stop_job(self, job_id: int) -> str:
+        task = None
         with SessionLocal() as db:
             job = db.get(ProviderCatalogSyncJob, job_id)
             if not job:
@@ -101,27 +111,37 @@ class ProviderCatalogSyncWorker:
                     else None
                 )
                 if task and not task.done():
-                    task_loop = task.get_loop()
-                    if not task_loop.is_closed():
-                        task_loop.call_soon_threadsafe(task.cancel)
-                    else:
-                        job.status = "CANCELLED"
-                        job.phase = "cancelled"
-                        job.updated_at = utc_now()
-                        db.commit()
+                    task.cancel()
                 else:
                     job.status = "CANCELLED"
                     job.phase = "cancelled"
                     job.updated_at = utc_now()
                     db.commit()
+                    return job.status
+            else:
                 return job.status
+
+        if task and not task.done():
+            try:
+                await asyncio.wait_for(task, timeout=15)
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    "Catalog sync did not stop within 15 seconds; clear was not performed."
+                ) from exc
+        self._finish_cancelled(job_id)
+        with SessionLocal() as db:
+            job = db.get(ProviderCatalogSyncJob, job_id)
+            if not job:
+                raise ValueError("Catalog sync job not found.")
             return job.status
 
     def _signal_wakeup(self) -> None:
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._wake_event.set)
 
-    def stop_profile(self, provider_url: str) -> None:
+    async def stop_profile(self, provider_url: str) -> None:
         with SessionLocal() as db:
             job_ids = db.scalars(
                 select(ProviderCatalogSyncJob.id)
@@ -132,10 +152,48 @@ class ProviderCatalogSyncWorker:
                 )
             ).all()
         for job_id in job_ids:
-            self.stop_job(job_id)
+            await self.stop_job(job_id)
+
+    async def clear_all_data(self) -> dict[str, int]:
+        if self._clearing_data:
+            raise RuntimeError("Catalog sync data is already being cleared.")
+        self._clearing_data = True
+        begin_catalog_cache_clear()
+        try:
+            with SessionLocal() as db:
+                job_ids = db.scalars(
+                    select(ProviderCatalogSyncJob.id).where(
+                        ProviderCatalogSyncJob.status.in_(
+                            ("PENDING", "RUNNING", "CANCELLING")
+                        )
+                    )
+                ).all()
+            for job_id in job_ids:
+                await self.stop_job(job_id)
+
+            with SessionLocal() as db:
+                deleted_jobs = db.execute(delete(ProviderCatalogSyncJob))
+                deleted_profile_cache = db.execute(delete(ProviderProfileCatalogCache))
+                deleted_legacy_cache = db.execute(delete(ProviderCatalogCache))
+                counts = {
+                    "sync_jobs": deleted_jobs.rowcount or 0,
+                    "catalog_cache_entries": deleted_profile_cache.rowcount or 0,
+                    "legacy_cache_entries": deleted_legacy_cache.rowcount or 0,
+                }
+                db.commit()
+            return counts
+        finally:
+            end_catalog_cache_clear()
+            self._clearing_data = False
+            self.wake()
 
     async def _run(self) -> None:
         while not self._stopping.is_set():
+            if self._clearing_data:
+                self._wake_event.clear()
+                if self._clearing_data:
+                    await self._wake_event.wait()
+                continue
             job_id = self._claim_next()
             if job_id is not None:
                 process_task = asyncio.create_task(

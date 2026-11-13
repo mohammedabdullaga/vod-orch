@@ -23,15 +23,29 @@ from app.security import decrypt_secret
 logger = logging.getLogger(__name__)
 _series_details_lock = asyncio.Lock()
 _last_series_details_request_at = 0.0
+_catalog_cache_generation = 0
+_catalog_cache_clear_in_progress = False
 
 
-def _provider_cache_params_key(params: dict[str, Any]) -> str:
+def begin_catalog_cache_clear() -> None:
+    global _catalog_cache_generation, _catalog_cache_clear_in_progress
+    _catalog_cache_generation += 1
+    _catalog_cache_clear_in_progress = True
+
+
+def end_catalog_cache_clear() -> None:
+    global _catalog_cache_generation, _catalog_cache_clear_in_progress
+    _catalog_cache_generation += 1
+    _catalog_cache_clear_in_progress = False
+
+
+def _provider_cache_params_key(account: Account, params: dict[str, Any]) -> str:
     cache_params = {
         key: str(value) if key.endswith("_id") and value is not None else value
         for key, value in params.items()
     }
     return json.dumps(
-        cache_params,
+        {"username": account.username, "params": cache_params},
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -42,7 +56,7 @@ def invalidate_provider_action_cache(
     action: str,
     **params: Any,
 ) -> None:
-    params_key = _provider_cache_params_key(params)
+    params_key = _provider_cache_params_key(account, params)
     with SessionLocal() as db:
         db.execute(
             delete(ProviderProfileCatalogCache).where(
@@ -141,27 +155,29 @@ async def cached_provider_action(
     **params: Any,
 ) -> tuple[Any, str]:
     provider_url = account.provider_url.rstrip("/")
-    params_key = _provider_cache_params_key(params)
-    with SessionLocal() as db:
-        cached = db.scalar(
-            select(ProviderProfileCatalogCache).where(
-                ProviderProfileCatalogCache.provider_url == provider_url,
-                ProviderProfileCatalogCache.action == action,
-                ProviderProfileCatalogCache.params_key == params_key,
-            )
-        )
-        cached_payload = None
-        cached_at = None
-        if cached:
-            cached_at = cached.fetched_at
-            try:
-                cached_payload = json.loads(cached.payload)
-            except json.JSONDecodeError:
-                logger.warning(
-                    "Ignoring invalid cached provider payload for account %s action %s",
-                    account.id,
-                    action,
+    params_key = _provider_cache_params_key(account, params)
+    cache_generation = _catalog_cache_generation
+    cached_payload = None
+    cached_at = None
+    if not _catalog_cache_clear_in_progress:
+        with SessionLocal() as db:
+            cached = db.scalar(
+                select(ProviderProfileCatalogCache).where(
+                    ProviderProfileCatalogCache.provider_url == provider_url,
+                    ProviderProfileCatalogCache.action == action,
+                    ProviderProfileCatalogCache.params_key == params_key,
                 )
+            )
+            if cached:
+                cached_at = cached.fetched_at
+                try:
+                    cached_payload = json.loads(cached.payload)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Ignoring invalid cached provider payload for account %s action %s",
+                        account.id,
+                        action,
+                    )
 
     ttl_seconds = (
         settings.provider_series_details_ttl_seconds
@@ -204,7 +220,11 @@ async def cached_provider_action(
             )
         serialized_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     except Exception as exc:
-        if cached_payload is None:
+        if (
+            cached_payload is None
+            or _catalog_cache_clear_in_progress
+            or cache_generation != _catalog_cache_generation
+        ):
             raise
         logger.warning(
             "Provider refresh failed for account %s action %s (%s); serving stale catalog",
@@ -213,6 +233,12 @@ async def cached_provider_action(
             type(exc).__name__,
         )
         return cached_payload, "stale"
+
+    if (
+        _catalog_cache_clear_in_progress
+        or cache_generation != _catalog_cache_generation
+    ):
+        return payload, "refreshed"
 
     with SessionLocal() as db:
         entry = db.scalar(

@@ -556,7 +556,7 @@ export default function ContentBrowser({
       if (!accountIds.length) {
         throw new Error("No enabled and currently available download accounts were found.");
       }
-      if (!window.confirm(`The generated shell script contains provider stream URLs with account credentials and will distribute downloads across ${accountIds.length} available account${accountIds.length === 1 ? "" : "s"}. Only save it to a trusted location, and delete it after use. Continue?`)) return;
+      if (!window.confirm(`The generated shell script contains provider stream URLs with account credentials and will use the browsing account for every download. Only save it to a trusted location, and delete it after use. Continue?`)) return;
       const entries = await entriesForTitles(selectedTitles);
       if (!entries.length) throw new Error("No downloadable episodes or movies were found.");
       const { data } = await api.post("/content/generate-script", {
@@ -884,15 +884,14 @@ export default function ContentBrowser({
         <div className="flex min-h-full items-center justify-center">
         <section className="flex max-h-[calc(100vh-1.5rem)] w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-slate-700 bg-[#0d1320] shadow-2xl sm:max-h-[calc(100vh-2rem)]">
           <header className="flex items-start justify-between gap-4 border-b border-slate-800 px-5 py-4">
-            <div><h2 id="queue-confirm-title" className="font-semibold text-white">Confirm download assignment</h2><p className="mt-1 text-xs text-slate-400">{pendingSeries ? `${pendingCount} series will be prepared and queued as each finishes.` : `${pendingCount} item${pendingCount === 1 ? "" : "s"} will be queued across the free accounts you select.`}</p><p className="mt-1 text-[11px] text-indigo-300">Browsing with {providerAccounts.find((account) => String(account.id) === sourceAccountId)?.username || "the selected account"}; each download uses the credentials of its assigned account.</p></div>
+            <div><h2 id="queue-confirm-title" className="font-semibold text-white">Confirm download assignment</h2><p className="mt-1 text-xs text-slate-400">{pendingSeries ? `${pendingCount} series will be prepared and queued as each finishes.` : `${pendingCount} item${pendingCount === 1 ? "" : "s"} will be queued for the browsing account.`}</p><p className="mt-1 text-[11px] text-indigo-300">Browsing with {providerAccounts.find((account) => String(account.id) === sourceAccountId)?.username || "the selected account"}; downloads use this same account so provider stream IDs stay consistent.</p></div>
             <button type="button" onClick={cancelQueueConfirmation} disabled={busy} aria-label="Cancel queue confirmation" className="rounded-lg p-2 text-slate-400 hover:bg-slate-800"><X size={16} /></button>
           </header>
           <div className="min-h-0 space-y-5 overflow-y-auto p-5">
             {pendingSeries && <p className="rounded-lg border border-indigo-900/70 bg-indigo-950/30 px-3 py-2 text-xs text-indigo-200">Series details are requested at least 3 seconds apart. Each series is added to the download queue as soon as its details are ready.</p>}
             <div>
               <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-medium text-slate-200">Download accounts</h3><span className="text-xs text-slate-500">{selectedWorkerIds.size} selected</span></div>
-              <p className="mb-3 text-xs text-slate-500">Jobs are distributed round-robin. Each account runs at most one download at a time; selecting more free accounts increases parallel downloads.</p>
-              <p className="mb-3 text-[11px] text-indigo-300">Catalog sync does not reserve download accounts. Downloads use each selected worker’s own host and credentials. Cross-host downloading assumes the accounts share compatible catalog stream IDs.</p>
+              <p className="mb-3 text-xs text-slate-500">Xtream downloads stay bound to the account that supplied the catalog IDs. That account runs at most one active download; additional work waits for it to become available.</p>
               {!selectedWorkerIds.size && <p className="mb-3 rounded-lg border border-amber-800/60 bg-amber-950/30 px-3 py-2 text-xs text-amber-200">No accounts are currently eligible. Review the reason shown beside each account below.</p>}
               <div className="max-h-48 space-y-2 overflow-y-auto">
                 {availableAccounts.map((account) => {
