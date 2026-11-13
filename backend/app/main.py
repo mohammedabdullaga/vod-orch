@@ -983,18 +983,37 @@ def add_account(payload: AccountCreate):
 
 
 @app.delete("/api/accounts/{account_id}")
-def delete_account(account_id: int):
+async def delete_account(account_id: int, request: Request):
     with SessionLocal() as db:
         account = db.get(Account, account_id)
         if not account:
             raise HTTPException(status_code=404, detail="Account not found.")
         active = db.scalar(select(func.count(QueueItem.id)).where(
-            QueueItem.account_id == account_id, QueueItem.status.in_(("DOWNLOADING", "VERIFYING"))
+            QueueItem.account_id == account_id,
+            QueueItem.status.in_(("DOWNLOADING", "VERIFYING", "CANCELLING")),
         ))
         if active:
-            raise HTTPException(status_code=409, detail="Account has an active download.")
+            raise HTTPException(
+                status_code=409,
+                detail="This account has an active download. Stop or wait for it to finish before deleting the account.",
+            )
+        provider_url = account.provider_url
+
+    request.app.state.catalog_sync_worker.stop_profile(provider_url)
+    with SessionLocal() as db:
+        account = db.get(Account, account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="Account not found.")
         db.delete(account)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            logger.exception("Could not delete provider account %s", account_id)
+            raise HTTPException(
+                status_code=409,
+                detail="Account could not be deleted because related records are still in use.",
+            ) from exc
     return {"ok": True}
 
 

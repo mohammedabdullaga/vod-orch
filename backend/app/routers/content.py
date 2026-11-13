@@ -190,15 +190,17 @@ def start_catalog_sync(payload: CatalogSyncRequest, request: Request) -> dict[st
         if proxy_id == 0:
             proxy_id = None
         active_job = db.scalar(
-            select(ProviderCatalogSyncJob.id).where(
-                ProviderCatalogSyncJob.account_id == account.id,
+            select(ProviderCatalogSyncJob.id)
+            .join(Account, Account.id == ProviderCatalogSyncJob.account_id)
+            .where(
+                Account.provider_url == account.provider_url,
                 ProviderCatalogSyncJob.status.in_(("PENDING", "RUNNING")),
             )
         )
         if active_job is not None:
             raise HTTPException(
                 status_code=409,
-                detail="A catalog sync is already queued or running for this account.",
+                detail="A catalog sync is already queued or running for this provider profile.",
             )
     try:
         resolve_provider_proxy(proxy_id)
@@ -215,13 +217,21 @@ def start_catalog_sync(payload: CatalogSyncRequest, request: Request) -> dict[st
         db.commit()
         job_id = job.id
     request.app.state.catalog_sync_worker.wake()
-    return {"job_id": job_id, "status": "PENDING"}
+    return {
+        "job_id": job_id,
+        "status": "PENDING",
+        "provider_url": account.provider_url,
+    }
 
 
-def _catalog_sync_job_json(job: ProviderCatalogSyncJob) -> dict[str, Any]:
+def _catalog_sync_job_json(
+    job: ProviderCatalogSyncJob,
+    provider_url: str,
+) -> dict[str, Any]:
     return {
         "job_id": job.id,
         "account_id": job.account_id,
+        "provider_url": provider_url,
         "status": job.status,
         "phase": job.phase,
         "categories_processed": job.categories_processed,
@@ -243,15 +253,20 @@ def get_latest_catalog_sync_status() -> list[dict[str, Any]]:
     with SessionLocal() as db:
         latest_job_ids = (
             select(func.max(ProviderCatalogSyncJob.id).label("job_id"))
-            .group_by(ProviderCatalogSyncJob.account_id)
+            .join(Account, Account.id == ProviderCatalogSyncJob.account_id)
+            .group_by(Account.provider_url)
             .subquery()
         )
-        jobs = db.scalars(
-            select(ProviderCatalogSyncJob)
+        jobs = db.execute(
+            select(ProviderCatalogSyncJob, Account.provider_url)
+            .join(Account, Account.id == ProviderCatalogSyncJob.account_id)
             .where(ProviderCatalogSyncJob.id.in_(select(latest_job_ids.c.job_id)))
             .order_by(ProviderCatalogSyncJob.account_id)
         ).all()
-        return [_catalog_sync_job_json(job) for job in jobs]
+        return [
+            _catalog_sync_job_json(job, provider_url)
+            for job, provider_url in jobs
+        ]
 
 
 @router.get("/catalog-sync/{job_id}")
@@ -260,7 +275,18 @@ def get_catalog_sync_status(job_id: int) -> dict[str, Any]:
         job = db.get(ProviderCatalogSyncJob, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Catalog sync job not found.")
-        return _catalog_sync_job_json(job)
+        account = db.get(Account, job.account_id)
+        provider_url = account.provider_url if account else ""
+        return _catalog_sync_job_json(job, provider_url)
+
+
+@router.post("/catalog-sync/{job_id}/stop")
+def stop_catalog_sync(job_id: int, request: Request) -> dict[str, Any]:
+    try:
+        status = request.app.state.catalog_sync_worker.stop_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"job_id": job_id, "status": status}
 
 
 def _playlist_entry_json(entry: M3UEntry, category_id: str) -> dict[str, Any]:

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import axios from "axios";
 import ContentBrowser from "./ContentBrowser";
+import { parseXtreamM3uLink } from "./providerProfiles";
 import {
   Activity, Check, CircleAlert, Clapperboard, ClipboardCopy, Film, Gauge, LogOut, LockKeyhole,
   Play, Plus, Radio, RefreshCw, Server, Settings2, Terminal, Trash2, Tv, Wifi, X, XCircle,
@@ -83,6 +84,11 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [accountForm, setAccountForm] = useState({ provider_url: "", username: "", password: "", user_agent: "Mozilla" });
+  const [profileChoice, setProfileChoice] = useState("__new__");
+  const [newProfileUrl, setNewProfileUrl] = useState("");
+  const [accountEntryMode, setAccountEntryMode] = useState("manual");
+  const [m3uLinks, setM3uLinks] = useState("");
+  const [parsedM3uAccounts, setParsedM3uAccounts] = useState([]);
   const [proxyUrl, setProxyUrl] = useState("");
 
   useEffect(() => {
@@ -115,7 +121,7 @@ function App() {
       ]);
       setStatus(s.data);
       setQueue(q.data);
-      setCatalogSyncJobs(Object.fromEntries(syncJobs.data.map((job) => [job.account_id, job])));
+      setCatalogSyncJobs(Object.fromEntries(syncJobs.data.map((job) => [job.provider_url.replace(/\/+$/, ""), job])));
     } catch (error) {
       setNotice(error.response?.data?.detail || "Could not reach the backend API.");
     } finally {
@@ -140,7 +146,7 @@ function App() {
         api.get("/content/catalog-sync"),
       ]);
       setAccounts(a.data);
-      setCatalogSyncJobs(Object.fromEntries(syncJobs.data.map((job) => [job.account_id, job])));
+      setCatalogSyncJobs(Object.fromEntries(syncJobs.data.map((job) => [job.provider_url.replace(/\/+$/, ""), job])));
       setProxies(p.data);
       setProviderProxyId((selected) =>
         p.data.some((proxy) => proxy.enabled && String(proxy.id) === String(providerProxy.data.proxy_id))
@@ -325,7 +331,87 @@ function App() {
   };
   const addAccount = (event) => {
     event.preventDefault();
-    act(async () => { await api.post("/accounts", accountForm); setAccountForm({ provider_url: "", username: "", password: "", user_agent: "Mozilla" }); await loadSettings(); }, "Provider account added.");
+    if (accountEntryMode === "m3u") {
+      if (!parsedM3uAccounts.length) {
+        setNotice("Extract at least one valid M3U link before adding credentials.");
+        return;
+      }
+      act(async () => {
+        const added = [];
+        const failed = [];
+        for (const credential of parsedM3uAccounts) {
+          try {
+            await api.post("/accounts", credential);
+            added.push(credential.username);
+          } catch (error) {
+            failed.push({
+              provider_url: credential.provider_url,
+              username: credential.username,
+              message: error.response?.data?.detail || error.message || "Request failed.",
+            });
+          }
+        }
+        await loadSettings();
+        if (failed.length) {
+          setParsedM3uAccounts(parsedM3uAccounts.filter((credential) =>
+            failed.some((entry) =>
+              entry.username === credential.username &&
+              entry.provider_url === credential.provider_url
+            )
+          ));
+        } else {
+          setParsedM3uAccounts([]);
+          setM3uLinks("");
+        }
+        return { added, failed };
+      }, ({ added, failed }) => {
+        const result = [`Added ${added.length} account${added.length === 1 ? "" : "s"}.`];
+        if (failed.length) {
+          result.push(`Failed: ${failed.map((entry) => `${entry.username}: ${entry.message}`).join("; ")}`);
+        }
+        return result.join(" ");
+      });
+      return;
+    }
+    const providerUrl = profileChoice === "__new__" ? newProfileUrl.trim() : profileChoice;
+    if (!providerUrl) {
+      setNotice("Enter a provider URL for the new profile.");
+      return;
+    }
+    act(async () => {
+      await api.post("/accounts", { ...accountForm, provider_url: providerUrl });
+      setAccountForm({ provider_url: "", username: "", password: "", user_agent: "Mozilla" });
+      setProfileChoice(providerUrl.replace(/\/+$/, ""));
+      setNewProfileUrl("");
+      await loadSettings();
+    }, "Provider credential added to profile.");
+  };
+  const extractM3uAccounts = (event) => {
+    event.preventDefault();
+    const lines = m3uLinks.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (!lines.length) {
+      setParsedM3uAccounts([]);
+      setNotice("Paste one or more M3U get.php links first.");
+      return;
+    }
+    const parsedAccounts = [];
+    const errors = [];
+    lines.forEach((line, index) => {
+      try {
+        parsedAccounts.push(parseXtreamM3uLink(line));
+      } catch (error) {
+        errors.push(`Line ${index + 1}: ${error.message}`);
+      }
+    });
+    setParsedM3uAccounts(parsedAccounts);
+    setNotice(
+      `${parsedAccounts.length} account${parsedAccounts.length === 1 ? "" : "s"} extracted.` +
+      (errors.length ? ` ${errors.join(" ")}` : "")
+    );
+    if (parsedAccounts.length === 1) {
+      setNewProfileUrl(parsedAccounts[0].provider_url);
+      setAccountForm(parsedAccounts[0]);
+    }
   };
   const syncCatalog = (accountId) => act(
     () => api.post("/content/catalog-sync", {
@@ -333,6 +419,10 @@ function App() {
       proxy_id: providerProxyId ? Number(providerProxyId) : 0,
     }),
     "Xtream catalog sync queued. Progress will update here while the VPS caches categories, titles, and series episodes.",
+  );
+  const stopCatalogSync = (jobId) => act(
+    () => api.post(`/content/catalog-sync/${jobId}/stop`),
+    "Catalog sync stop requested.",
   );
   const addProxy = (event) => {
     event.preventDefault();
@@ -392,6 +482,10 @@ function App() {
     return nodes.find((node) => node.id === nodeId)?.watch_path || "";
   };
   const remove = (url, id) => act(async () => { await api.delete(`${url}/${id}`); await loadSettings(); }, "Removed successfully.");
+  const removeAccount = (account) => {
+    if (!window.confirm(`Delete credential "${account.username}" from ${account.provider_url}? Active downloads must finish first. Shared profile catalog data will be preserved.`)) return;
+    remove("/accounts", account.id);
+  };
   const testProxy = (id) => act(
     async () => (await api.post(`/proxies/${id}/test`)).data,
     (result) => `Proxy reachable: ${result.ip || "IP unavailable"} · ${result.latency_ms} ms`,
@@ -435,6 +529,12 @@ function App() {
     ["Completed", counts.completed || 0, Check, "text-emerald-300"],
     ["Failed", counts.failed || 0, CircleAlert, "text-rose-300"],
   ];
+  const accountProfiles = Object.values(accounts.reduce((profiles, account) => {
+    const providerUrl = account.provider_url.replace(/\/+$/, "");
+    if (!profiles[providerUrl]) profiles[providerUrl] = { provider_url: providerUrl, accounts: [] };
+    profiles[providerUrl].accounts.push(account);
+    return profiles;
+  }, {}));
   const activeStatuses = ["DOWNLOADING", "VERIFYING", "CLEANING", "CANCELLING"];
   const activeCount = activeStatuses.reduce((total, key) => total + (counts[key.toLowerCase()] || 0), 0);
   const queueFilters = [
@@ -573,22 +673,28 @@ function App() {
         {tab === tabs[3] && <div className="grid gap-6 lg:grid-cols-2">
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
             <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Radio size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Provider accounts</h2><p className="text-xs text-slate-500">One active download per enabled account</p></div></div>
-            <div className="space-y-2 p-5">{accounts.map((account) => {
-              const job = catalogSyncJobs[account.id];
-              const syncing = job && ["PENDING", "RUNNING"].includes(job.status);
-              return <div key={account.id} className="rounded-lg bg-slate-900/70 px-3 py-3">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0"><div className="text-sm text-slate-200">{account.username}</div><div className="truncate text-xs text-slate-500">{account.provider_url}</div></div>
-                  <div className="flex shrink-0 items-center gap-2">
-                    <button type="button" disabled={busy || syncing} onClick={() => syncCatalog(account.id)} className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-400/30 px-2.5 py-1.5 text-xs text-indigo-200 hover:bg-indigo-500/10 disabled:opacity-40">
-                      <RefreshCw size={13} className={syncing ? "animate-spin" : ""} />{syncing ? "Syncing…" : "Sync catalog"}
-                    </button>
-                    <button type="button" onClick={() => remove("/accounts", account.id)} className="p-2 text-slate-500 hover:text-rose-300" aria-label={`Remove ${account.username}`}><Trash2 size={15} /></button>
-                  </div>
+            <div className="space-y-3 p-5">{accountProfiles.map((profile) => {
+              const job = catalogSyncJobs[profile.provider_url];
+              const syncing = job && ["PENDING", "RUNNING", "CANCELLING"].includes(job.status);
+              const stopping = job?.status === "CANCELLING";
+              const syncAccount = profile.accounts.find((account) => account.enabled);
+              return <div key={profile.provider_url} className="rounded-lg bg-slate-900/70 px-3 py-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0"><div className="text-sm font-medium text-slate-200">Provider profile</div><div className="truncate text-xs text-slate-500">{profile.provider_url}</div></div>
+                  <button type="button" disabled={busy || stopping || (!syncing && !syncAccount)} onClick={() => syncing ? stopCatalogSync(job.job_id) : syncCatalog(syncAccount.id)} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-indigo-400/30 px-2.5 py-1.5 text-xs text-indigo-200 hover:bg-indigo-500/10 disabled:opacity-40">
+                    {syncing ? <XCircle size={13} /> : <RefreshCw size={13} />}
+                    {stopping ? "Stopping…" : syncing ? "Stop sync" : syncAccount ? "Sync profile catalog" : "No enabled account"}
+                  </button>
+                </div>
+                <div className="mt-3 space-y-1.5 border-t border-slate-800 pt-2">
+                  {profile.accounts.map((account) => <div key={account.id} className="flex items-center justify-between gap-3 text-xs">
+                    <div className="min-w-0"><span className="text-slate-200">{account.username}</span><span className={`ml-2 ${account.enabled ? "text-emerald-300" : "text-slate-500"}`}>{account.enabled ? "Enabled" : "Disabled"}</span></div>
+                    <button type="button" disabled={busy} onClick={() => removeAccount(account)} className="p-1.5 text-slate-500 hover:text-rose-300 disabled:opacity-40" aria-label={`Remove ${account.username}`}><Trash2 size={14} /></button>
+                  </div>)}
                 </div>
                 {job && <div className="mt-2 border-t border-slate-800 pt-2 text-[11px]">
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-400">
-                    <span className={job.status === "COMPLETED" ? "text-emerald-300" : job.status === "FAILED" ? "text-rose-300" : "text-indigo-300"}>{job.status} · {job.phase}</span>
+                    <span className={job.status === "COMPLETED" ? "text-emerald-300" : job.status === "FAILED" ? "text-rose-300" : job.status === "CANCELLED" ? "text-slate-400" : "text-indigo-300"}>{job.status} · {job.phase}</span>
                     <span>{job.categories_processed} categories</span>
                     <span>{job.lists_processed} lists · {job.cached_items} titles</span>
                     <span>{job.series_details_processed}/{job.total_series_details} series details</span>
@@ -601,16 +707,36 @@ function App() {
               </div>;
             })}
               <form onSubmit={addAccount} className="mt-4 space-y-2 border-t border-slate-800 pt-4">
-                <input required type="url" placeholder="Provider base URL" value={accountForm.provider_url} onChange={(e) => setAccountForm({ ...accountForm, provider_url: e.target.value })} className="field" />
-                <div className="grid grid-cols-2 gap-2"><input required placeholder="Username" value={accountForm.username} onChange={(e) => setAccountForm({ ...accountForm, username: e.target.value })} className="field" /><input required type="password" placeholder="Password" value={accountForm.password} onChange={(e) => setAccountForm({ ...accountForm, password: e.target.value })} className="field" /></div>
-                <input placeholder="User-Agent" value={accountForm.user_agent} onChange={(e) => setAccountForm({ ...accountForm, user_agent: e.target.value })} className="field" />
-                <button disabled={busy} className="primary"><Plus size={15} />Add account</button>
+                <div className="text-xs font-medium text-slate-300">Add credential to a provider profile</div>
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => setAccountEntryMode("manual")} className={`rounded-lg px-3 py-2 text-xs ${accountEntryMode === "manual" ? "bg-indigo-500/20 text-indigo-200" : "text-slate-400 hover:bg-slate-800"}`}>Username &amp; password</button>
+                  <button type="button" onClick={() => setAccountEntryMode("m3u")} className={`rounded-lg px-3 py-2 text-xs ${accountEntryMode === "m3u" ? "bg-indigo-500/20 text-indigo-200" : "text-slate-400 hover:bg-slate-800"}`}>M3U link(s)</button>
+                </div>
+                {accountEntryMode === "manual" ? <>
+                  <select value={profileChoice} onChange={(e) => setProfileChoice(e.target.value)} className="field">
+                    <option value="__new__">Create profile with a new provider URL</option>
+                    {accountProfiles.map((profile) => <option key={profile.provider_url} value={profile.provider_url}>{profile.provider_url}</option>)}
+                  </select>
+                  {profileChoice === "__new__" && <input required type="url" placeholder="Provider base URL" value={newProfileUrl} onChange={(e) => setNewProfileUrl(e.target.value)} className="field" />}
+                  <div className="grid grid-cols-2 gap-2"><input required placeholder="Username" value={accountForm.username} onChange={(e) => setAccountForm({ ...accountForm, username: e.target.value })} className="field" /><input required type="password" placeholder="Password" value={accountForm.password} onChange={(e) => setAccountForm({ ...accountForm, password: e.target.value })} className="field" /></div>
+                  <input placeholder="User-Agent" value={accountForm.user_agent} onChange={(e) => setAccountForm({ ...accountForm, user_agent: e.target.value })} className="field" />
+                  <button disabled={busy} className="primary"><Plus size={15} />Add credential</button>
+                </> : <>
+                  <textarea rows={3} value={m3uLinks} onChange={(e) => setM3uLinks(e.target.value)} placeholder={"Paste get.php M3U link(s), one per line\nhttp://provider.example/get.php?username=...&password=...&type=m3u_plus&output=ts"} className="field resize-y font-mono text-xs" />
+                  <button type="button" disabled={busy} onClick={extractM3uAccounts} className="secondary w-full">Extract host and credentials</button>
+                  {!!parsedM3uAccounts.length && <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-slate-800 bg-slate-950/60 p-2 text-xs">
+                    {parsedM3uAccounts.map((credential, index) => <div key={`${credential.provider_url}:${credential.username}:${index}`} className="flex flex-wrap justify-between gap-x-3 gap-y-1">
+                      <span className="text-slate-300">{credential.provider_url}</span><span className="text-indigo-200">{credential.username}</span>
+                    </div>)}
+                  </div>}
+                  <button disabled={busy || !parsedM3uAccounts.length} className="primary"><Plus size={15} />Add {parsedM3uAccounts.length || ""} extracted credential{parsedM3uAccounts.length === 1 ? "" : "s"}</button>
+                </>}
               </form>
             </div>
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320] lg:col-span-2">
             <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Clapperboard size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Xtream catalog cache</h2><p className="text-xs text-slate-500">Catalog syncs run on the VPS and persist provider categories, titles, and episode mappings in SQLite.</p></div></div>
-            <p className="p-5 text-xs leading-5 text-slate-400">Start a sync from an account above. Category and title lists are fetched first, then series episode details are fetched one series at a time and rate-limited to protect the provider. The selected provider API proxy is used for the entire sync. If a refresh fails but cached data exists, the job records and displays the stale response count instead of claiming every response was fresh. Existing saved M3U records are preserved but are no longer part of the primary browsing and import workflow.</p>
+            <p className="p-5 text-xs leading-5 text-slate-400">Each provider profile shares one catalog sync and cache across its credentials. Category and title lists are fetched first, then series episode details are fetched one series at a time and rate-limited to protect the provider. The selected provider API proxy is used for the entire sync. Running syncs can be stopped here; deleting a credential preserves shared catalog data. Existing saved M3U records are preserved but are no longer part of the primary browsing and import workflow.</p>
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
             <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Gauge size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Proxy pool</h2><p className="text-xs text-slate-500">Proxy URLs are encrypted at rest</p></div></div>

@@ -13,7 +13,7 @@ from app.config import settings
 from app.models import (
     Account,
     AppSettings,
-    ProviderCatalogCache,
+    ProviderProfileCatalogCache,
     Proxy,
     SessionLocal,
     utc_now,
@@ -25,17 +25,13 @@ _series_details_lock = asyncio.Lock()
 _last_series_details_request_at = 0.0
 
 
-def _provider_cache_params_key(account: Account, params: dict[str, Any]) -> str:
+def _provider_cache_params_key(params: dict[str, Any]) -> str:
     cache_params = {
         key: str(value) if key.endswith("_id") and value is not None else value
         for key, value in params.items()
     }
     return json.dumps(
-        {
-            "provider_url": account.provider_url.rstrip("/"),
-            "username": account.username,
-            "params": cache_params,
-        },
+        cache_params,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -46,13 +42,13 @@ def invalidate_provider_action_cache(
     action: str,
     **params: Any,
 ) -> None:
-    params_key = _provider_cache_params_key(account, params)
+    params_key = _provider_cache_params_key(params)
     with SessionLocal() as db:
         db.execute(
-            delete(ProviderCatalogCache).where(
-                ProviderCatalogCache.account_id == account.id,
-                ProviderCatalogCache.action == action,
-                ProviderCatalogCache.params_key == params_key,
+            delete(ProviderProfileCatalogCache).where(
+                ProviderProfileCatalogCache.provider_url == account.provider_url.rstrip("/"),
+                ProviderProfileCatalogCache.action == action,
+                ProviderProfileCatalogCache.params_key == params_key,
             )
         )
         db.commit()
@@ -144,13 +140,14 @@ async def cached_provider_action(
     force_refresh: bool = False,
     **params: Any,
 ) -> tuple[Any, str]:
-    params_key = _provider_cache_params_key(account, params)
+    provider_url = account.provider_url.rstrip("/")
+    params_key = _provider_cache_params_key(params)
     with SessionLocal() as db:
         cached = db.scalar(
-            select(ProviderCatalogCache).where(
-                ProviderCatalogCache.account_id == account.id,
-                ProviderCatalogCache.action == action,
-                ProviderCatalogCache.params_key == params_key,
+            select(ProviderProfileCatalogCache).where(
+                ProviderProfileCatalogCache.provider_url == provider_url,
+                ProviderProfileCatalogCache.action == action,
+                ProviderProfileCatalogCache.params_key == params_key,
             )
         )
         cached_payload = None
@@ -219,15 +216,15 @@ async def cached_provider_action(
 
     with SessionLocal() as db:
         entry = db.scalar(
-            select(ProviderCatalogCache).where(
-                ProviderCatalogCache.account_id == account.id,
-                ProviderCatalogCache.action == action,
-                ProviderCatalogCache.params_key == params_key,
+            select(ProviderProfileCatalogCache).where(
+                ProviderProfileCatalogCache.provider_url == provider_url,
+                ProviderProfileCatalogCache.action == action,
+                ProviderProfileCatalogCache.params_key == params_key,
             )
         )
         if entry is None:
-            entry = ProviderCatalogCache(
-                account_id=account.id,
+            entry = ProviderProfileCatalogCache(
+                provider_url=provider_url,
                 action=action,
                 params_key=params_key,
                 payload=serialized_payload,
@@ -242,10 +239,10 @@ async def cached_provider_action(
         except IntegrityError:
             db.rollback()
             entry = db.scalar(
-                select(ProviderCatalogCache).where(
-                    ProviderCatalogCache.account_id == account.id,
-                    ProviderCatalogCache.action == action,
-                    ProviderCatalogCache.params_key == params_key,
+                select(ProviderProfileCatalogCache).where(
+                    ProviderProfileCatalogCache.provider_url == provider_url,
+                    ProviderProfileCatalogCache.action == action,
+                    ProviderProfileCatalogCache.params_key == params_key,
                 )
             )
             if entry is None:

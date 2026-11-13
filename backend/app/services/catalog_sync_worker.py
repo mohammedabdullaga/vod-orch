@@ -30,6 +30,8 @@ CATALOG_ACTIONS = (
 class ProviderCatalogSyncWorker:
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
+        self._active_job_id: int | None = None
+        self._active_job_task: asyncio.Task | None = None
         self._stopping = asyncio.Event()
         self._wake_event = asyncio.Event()
 
@@ -53,6 +55,11 @@ class ProviderCatalogSyncWorker:
                     updated_at=utc_now(),
                 )
             )
+            db.execute(
+                update(ProviderCatalogSyncJob)
+                .where(ProviderCatalogSyncJob.status == "CANCELLING")
+                .values(status="CANCELLED", phase="cancelled", updated_at=utc_now())
+            )
             db.commit()
         self._task = asyncio.create_task(self._run(), name="provider-catalog-sync-worker")
 
@@ -69,15 +76,63 @@ class ProviderCatalogSyncWorker:
     def wake(self) -> None:
         self._wake_event.set()
 
+    def stop_job(self, job_id: int) -> str:
+        with SessionLocal() as db:
+            job = db.get(ProviderCatalogSyncJob, job_id)
+            if not job:
+                raise ValueError("Catalog sync job not found.")
+            if job.status == "PENDING":
+                job.status = "CANCELLED"
+                job.phase = "cancelled"
+                job.updated_at = utc_now()
+                db.commit()
+                self._wake_event.set()
+                return job.status
+            if job.status == "RUNNING":
+                job.status = "CANCELLING"
+                job.phase = "cancelling"
+                job.updated_at = utc_now()
+                db.commit()
+                if self._active_job_id == job_id and self._active_job_task:
+                    self._active_job_task.cancel()
+                return job.status
+            return job.status
+
+    def stop_profile(self, provider_url: str) -> None:
+        with SessionLocal() as db:
+            job_ids = db.scalars(
+                select(ProviderCatalogSyncJob.id)
+                .join(Account, Account.id == ProviderCatalogSyncJob.account_id)
+                .where(
+                    Account.provider_url == provider_url,
+                    ProviderCatalogSyncJob.status.in_(("PENDING", "RUNNING")),
+                )
+            ).all()
+        for job_id in job_ids:
+            self.stop_job(job_id)
+
     async def _run(self) -> None:
         while not self._stopping.is_set():
             job_id = self._claim_next()
             if job_id is not None:
+                process_task = asyncio.create_task(
+                    self._process(job_id),
+                    name=f"provider-catalog-sync-{job_id}",
+                )
+                self._active_job_id = job_id
+                self._active_job_task = process_task
                 try:
-                    await self._process(job_id)
+                    await process_task
+                except asyncio.CancelledError:
+                    if asyncio.current_task() and asyncio.current_task().cancelling():
+                        raise
+                    self._finish_cancelled(job_id)
                 except Exception as exc:
                     logger.exception("Provider catalog sync job %s crashed", job_id)
                     self._finish_failed(job_id, self._safe_error(exc))
+                finally:
+                    self._active_job_id = None
+                    self._active_job_task = None
                 continue
             self._wake_event.clear()
             if self._stopping.is_set():
@@ -281,6 +336,17 @@ class ProviderCatalogSyncWorker:
                 job.status = "FAILED"
                 job.phase = "failed"
                 job.error = message
+                job.updated_at = utc_now()
+                db.commit()
+
+    @staticmethod
+    def _finish_cancelled(job_id: int) -> None:
+        with SessionLocal() as db:
+            job = db.get(ProviderCatalogSyncJob, job_id)
+            if job and job.status in ("RUNNING", "CANCELLING"):
+                job.status = "CANCELLED"
+                job.phase = "cancelled"
+                job.error = None
                 job.updated_at = utc_now()
                 db.commit()
 

@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -66,6 +67,20 @@ class ProviderCatalogCache(Base):
     account_id: Mapped[int] = mapped_column(
         ForeignKey("accounts.id", ondelete="CASCADE"), index=True
     )
+    action: Mapped[str] = mapped_column(String(64))
+    params_key: Mapped[str] = mapped_column(Text)
+    payload: Mapped[str] = mapped_column(Text)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ProviderProfileCatalogCache(Base):
+    __tablename__ = "provider_profile_catalog_cache"
+    __table_args__ = (
+        UniqueConstraint("provider_url", "action", "params_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider_url: Mapped[str] = mapped_column(String(2048), index=True)
     action: Mapped[str] = mapped_column(String(64))
     params_key: Mapped[str] = mapped_column(Text)
     payload: Mapped[str] = mapped_column(Text)
@@ -275,6 +290,51 @@ class StorageRoute(Base):
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(version VARCHAR(128) PRIMARY KEY, applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        cache_migration = "shared-provider-profile-catalog-cache-v1"
+        cache_migration_applied = connection.exec_driver_sql(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            (cache_migration,),
+        ).first()
+        if not cache_migration_applied:
+            legacy_cache_rows = connection.exec_driver_sql(
+                "SELECT accounts.provider_url, provider_catalog_cache.action, "
+                "provider_catalog_cache.params_key, provider_catalog_cache.payload, "
+                "provider_catalog_cache.fetched_at "
+                "FROM provider_catalog_cache "
+                "JOIN accounts ON accounts.id = provider_catalog_cache.account_id "
+                "ORDER BY provider_catalog_cache.fetched_at DESC"
+            ).mappings()
+            for row in legacy_cache_rows:
+                try:
+                    cached_params = json.loads(row["params_key"]).get("params", {})
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    continue
+                params_key = json.dumps(
+                    cached_params,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                connection.exec_driver_sql(
+                    "INSERT OR IGNORE INTO provider_profile_catalog_cache "
+                    "(provider_url, action, params_key, payload, fetched_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        row["provider_url"].rstrip("/"),
+                        row["action"],
+                        params_key,
+                        row["payload"],
+                        row["fetched_at"],
+                    ),
+                )
+            connection.exec_driver_sql(
+                "INSERT INTO schema_migrations (version) VALUES (?)",
+                (cache_migration,),
+            )
+
         migrations = {
             "monitored_categories": {
                 "destination_path": "TEXT",
@@ -333,10 +393,6 @@ def init_db() -> None:
                             "(SELECT provider_proxy_id FROM app_settings WHERE id = 1) "
                             "WHERE proxy_id IS NULL"
                         )
-        connection.exec_driver_sql(
-            "CREATE TABLE IF NOT EXISTS schema_migrations "
-            "(version VARCHAR(128) PRIMARY KEY, applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"
-        )
         axel_migration = "default-axel-connections-12"
         already_applied = connection.exec_driver_sql(
             "SELECT 1 FROM schema_migrations WHERE version = ?",
