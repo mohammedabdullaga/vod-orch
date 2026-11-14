@@ -1005,7 +1005,10 @@ async def start_content_browse(
 
 
 @router.get("/items/browse/{job_id}")
-def get_content_browse_status(job_id: str) -> dict[str, Any]:
+def get_content_browse_status(
+    job_id: str,
+    include_items: bool = Query(default=True),
+) -> dict[str, Any]:
     _prune_content_browse_jobs()
     job = _content_browse_jobs.get(job_id)
     if not job:
@@ -1015,7 +1018,7 @@ def get_content_browse_status(job_id: str) -> dict[str, Any]:
         )
     result: dict[str, Any] = {"job_id": job_id, "status": job["status"]}
     result["phase"] = job["phase"]
-    if job["items"] is not None:
+    if include_items and job["items"] is not None:
         result["items"] = job["items"]
     if job["status"] == "FAILED":
         error = job["error"]

@@ -231,16 +231,19 @@ export default function ContentBrowser({
       });
       setNotice("Loading provider titles…");
       let browseStatus;
-      let providerResultsShown = false;
+      let providerResultsReceived = false;
       do {
         await new Promise((resolve) => window.setTimeout(resolve, 1200));
-        ({ data: browseStatus } = await api.get(`/content/items/browse/${started.job_id}`));
-        if (browseStatus.items) {
+        ({ data: browseStatus } = await api.get(
+          `/content/items/browse/${started.job_id}`,
+          { params: { include_items: !providerResultsReceived } },
+        ));
+        if (Array.isArray(browseStatus.items)) {
+          providerResultsReceived = true;
           setItems(browseStatus.items);
           setInventoryFilter("all");
-          if (!providerResultsShown && browseStatus.status === "RUNNING") {
+          if (browseStatus.status === "RUNNING") {
             setNotice("Provider titles loaded; checking the storage inventory…");
-            providerResultsShown = true;
           }
         }
       } while (browseStatus.status === "RUNNING");
@@ -248,6 +251,12 @@ export default function ContentBrowser({
         throw new Error(
           browseStatus.error?.detail || "Content browsing failed. Check the provider and storage connection.",
         );
+      }
+      if (!Array.isArray(browseStatus.items)) {
+        ({ data: browseStatus } = await api.get(
+          `/content/items/browse/${started.job_id}`,
+          { params: { include_items: true } },
+        ));
       }
       const items = browseStatus.items;
       setItems(items);
