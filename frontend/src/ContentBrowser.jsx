@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Check, ChevronDown, Download, Film, LayoutGrid, List, LoaderCircle, Search, Tv, X,
 } from "lucide-react";
@@ -42,6 +42,11 @@ export default function ContentBrowser({
   const [selectedCategories, setSelectedCategories] = useState(new Set());
   const [categorySearch, setCategorySearch] = useState("");
   const [items, setItems] = useState([]);
+  const [browseContext, setBrowseContext] = useState(null);
+  const [totalItems, setTotalItems] = useState(0);
+  const [hasMoreItems, setHasMoreItems] = useState(false);
+  const [pageLoading, setPageLoading] = useState(false);
+  const pageRequestId = useRef(0);
   const [selectedItems, setSelectedItems] = useState(new Set());
   const [viewMode, setViewMode] = useState("grid");
   const [itemSearch, setItemSearch] = useState("");
@@ -93,6 +98,11 @@ export default function ContentBrowser({
     setCategories([]);
     setSelectedCategories(new Set());
     setItems([]);
+    setBrowseContext(null);
+    setTotalItems(0);
+    setHasMoreItems(false);
+    setPageLoading(false);
+    pageRequestId.current += 1;
     setSelectedItems(new Set());
     setDetails(null);
     setNotice("");
@@ -112,18 +122,14 @@ export default function ContentBrowser({
   const visibleCategories = useMemo(() => categories.filter((category) =>
     category.category_name.toLocaleLowerCase().includes(categorySearch.toLocaleLowerCase())
   ), [categories, categorySearch]);
-  const visibleItems = useMemo(() => items.filter((item) =>
-    `${item.name} ${item.category_name}`.toLocaleLowerCase().includes(itemSearch.toLocaleLowerCase())
-  ), [items, itemSearch]);
+  const visibleItems = items;
   const inventoryCounts = useMemo(() => ({
     downloaded: items.filter((item) => item.download_status === "downloaded").length,
     partial: items.filter((item) => item.download_status === "partial").length,
     missing: items.filter((item) => item.download_status === "missing").length,
     unknown: items.filter((item) => item.download_status === "unknown").length,
   }), [items]);
-  const displayedItems = useMemo(() => visibleItems.filter((item) =>
-    inventoryFilter === "all" || item.download_status === inventoryFilter
-  ), [visibleItems, inventoryFilter]);
+  const displayedItems = visibleItems;
   const selectedTitles = useMemo(
     () => items.filter((item) => selectedItems.has(item.id)),
     [items, selectedItems],
@@ -140,6 +146,48 @@ export default function ContentBrowser({
   ).length;
   const nodeId = type === "series" ? routing?.series_node_id : routing?.movie_node_id;
   const nodeLabel = type === "series" ? "Series" : "Movies";
+
+  useEffect(() => {
+    if (!browseContext) return undefined;
+    let active = true;
+    const requestId = ++pageRequestId.current;
+    const timer = window.setTimeout(async () => {
+      setPageLoading(true);
+      setItems([]);
+      setSelectedItems(new Set());
+      try {
+        const { data } = await api.get("/content/items", {
+          params: {
+            type: browseContext.type,
+            category_ids: browseContext.categoryIds.join(","),
+            account_id: browseContext.accountId,
+            proxy_id: browseContext.proxyId,
+            search: itemSearch,
+            inventory_status: inventoryFilter,
+            limit: 50,
+            offset: 0,
+          },
+        });
+        if (!active || pageRequestId.current !== requestId) return;
+        setItems(data.items);
+        setTotalItems(data.total);
+        setHasMoreItems(data.has_more);
+        setNotice(
+          `Loaded ${data.items.length} of ${data.total} ${browseContext.type === "series" ? "series" : "movies"}.`
+        );
+      } catch (error) {
+        if (active && pageRequestId.current === requestId) {
+          setNotice(error.response?.data?.detail || "Could not load content.");
+        }
+      } finally {
+        if (active && pageRequestId.current === requestId) setPageLoading(false);
+      }
+    }, itemSearch ? 250 : 0);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [api, browseContext, itemSearch, inventoryFilter]);
 
   const toggleCategorySelection = (categoryId) => {
     setSelectedCategories((current) => {
@@ -206,12 +254,22 @@ export default function ContentBrowser({
 
   const browseSelected = async (forceRefresh = false) => {
     if (!selectedCategories.size) return setNotice("Select one or more categories to browse.");
+    const categoryIds = [...selectedCategories];
+    const accountId = Number(sourceAccountId);
+    const proxyId = providerProxyId ? Number(providerProxyId) : 0;
     setBusy(true);
     setNotice("");
     setItems([]);
+    setBrowseContext(null);
+    setTotalItems(0);
+    setHasMoreItems(false);
+    setPageLoading(false);
+    pageRequestId.current += 1;
+    setInventoryFilter("all");
     setSelectedItems(new Set());
     setItemSearch("");
     try {
+      let browseCategories = categories;
       if (forceRefresh) {
         const { data: refreshedCategories } = await api.get("/content/categories", {
           params: {
@@ -221,41 +279,35 @@ export default function ContentBrowser({
             refresh: true,
           },
         });
+        browseCategories = refreshedCategories;
         setCategories(refreshedCategories);
       }
       const { data: started } = await api.post("/content/items/browse", {
         type,
-        account_id: Number(sourceAccountId),
-        category_ids: [...selectedCategories],
+        account_id: accountId,
+        category_ids: categoryIds,
         category_names: Object.fromEntries(
-          categories
+          browseCategories
             .filter((category) => selectedCategories.has(category.category_id))
             .map((category) => [category.category_id, category.category_name]),
         ),
-        proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+        proxy_id: proxyId,
         refresh: forceRefresh,
+        include_items: false,
       });
       setNotice("Loading provider titles…");
+      const context = { type, categoryIds, accountId, proxyId };
+      let firstPageRequested = false;
       let browseStatus;
-      let itemsVersion = 0;
-      const providerItems = [];
       while (true) {
         ({ data: browseStatus } = await api.get(
           `/content/items/browse/${started.job_id}`,
-          { params: { items_after: itemsVersion } },
+          { params: { include_items: false } },
         ));
-        if (Array.isArray(browseStatus.items)) {
-          if (browseStatus.status === "COMPLETED") {
-            providerItems.splice(0, providerItems.length, ...browseStatus.items);
-          } else {
-            providerItems.push(...browseStatus.items);
-          }
-          itemsVersion = browseStatus.items_version ?? itemsVersion;
-          setItems([...providerItems]);
-          setInventoryFilter("all");
-          if (browseStatus.status === "RUNNING") {
-            setNotice("Provider titles loaded; checking the storage inventory…");
-          }
+        if (browseStatus.phase === "checking_storage" && !firstPageRequested) {
+          setBrowseContext(context);
+          setNotice("Catalog ready; loading titles while checking storage inventory…");
+          firstPageRequested = true;
         }
         if (browseStatus.status !== "RUNNING") break;
         await new Promise((resolve) => window.setTimeout(resolve, 350));
@@ -265,20 +317,41 @@ export default function ContentBrowser({
           browseStatus.error?.detail || "Content browsing failed. Check the provider and storage connection.",
         );
       }
-      const items = browseStatus.items;
-      setItems(items);
-      setInventoryFilter("all");
-      const missing = items.filter((item) => item.download_status === "missing").length;
-      const partial = items.filter((item) => item.download_status === "partial").length;
-      const unknown = items.filter((item) => item.download_status === "unknown").length;
-      setNotice(
-        `Loaded ${items.length} ${type === "series" ? "series" : "movies"}; `
-        + `${missing} not found · ${partial} incomplete${unknown ? ` · ${unknown} storage status${unknown === 1 ? "" : "es"} unavailable` : ""}.`
-      );
+      setBrowseContext({ ...context });
+      setNotice(firstPageRequested ? "Refreshing storage status…" : "Catalog ready; loading titles…");
     } catch (error) {
       setNotice(error.response?.data?.detail || "Could not load content.");
     } finally {
       setBusy(false);
+    }
+  };
+
+  const loadMoreItems = async () => {
+    if (!browseContext || !hasMoreItems || pageLoading) return;
+    const requestId = ++pageRequestId.current;
+    setPageLoading(true);
+    try {
+      const { data } = await api.get("/content/items", {
+        params: {
+          type: browseContext.type,
+          category_ids: browseContext.categoryIds.join(","),
+          account_id: browseContext.accountId,
+          proxy_id: browseContext.proxyId,
+          search: itemSearch,
+          inventory_status: inventoryFilter,
+          limit: 50,
+          offset: items.length,
+        },
+      });
+      if (pageRequestId.current !== requestId) return;
+      setItems((current) => [...current, ...data.items]);
+      setHasMoreItems(data.has_more);
+    } catch (error) {
+      if (pageRequestId.current === requestId) {
+        setNotice(error.response?.data?.detail || "Could not load more content.");
+      }
+    } finally {
+      if (pageRequestId.current === requestId) setPageLoading(false);
     }
   };
 
@@ -756,7 +829,7 @@ export default function ContentBrowser({
 
           <div className="min-w-0 rounded-xl border border-slate-800 bg-slate-900/40">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 p-4">
-              <div><h3 className="text-sm font-medium text-slate-200">2. Select {type === "series" ? "series" : "movies"}</h3><p className="mt-1 text-xs text-slate-500">{items.length} results · {inventoryCounts.downloaded} complete · {inventoryCounts.partial} partial · {inventoryCounts.missing} missing</p></div>
+              <div><h3 className="text-sm font-medium text-slate-200">2. Select {type === "series" ? "series" : "movies"}</h3><p className="mt-1 text-xs text-slate-500">{items.length} of {totalItems} results loaded · {inventoryCounts.downloaded} complete · {inventoryCounts.partial} partial · {inventoryCounts.missing} missing</p></div>
               <div className="flex flex-wrap items-center gap-3">
                 <div className="inline-flex rounded-lg border border-slate-700 bg-[#090d16] p-1" aria-label="Items view">
                   <button type="button" aria-pressed={viewMode === "grid"} onClick={() => setViewMode("grid")} className={`rounded-md px-2.5 py-1.5 text-xs ${viewMode === "grid" ? "bg-indigo-500 text-white" : "text-slate-400 hover:text-white"}`}><LayoutGrid size={14} className="mr-1.5 inline" />Grid</button>
@@ -771,26 +844,26 @@ export default function ContentBrowser({
             {items.length > 0 && <div role="status" aria-live="polite" className={`flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-4 py-3 ${inventoryCounts.missing ? "bg-amber-500/5" : "bg-slate-900/40"}`}>
               <p className={`text-xs ${inventoryCounts.missing ? "text-amber-200" : inventoryCounts.partial ? "text-sky-200" : inventoryCounts.unknown ? "text-slate-400" : "text-emerald-300"}`}>
                 {inventoryCounts.missing
-                  ? `${inventoryCounts.missing} provider ${type === "series" ? "series" : "titles"} were not found in the selected storage folders.`
+                  ? `${inventoryCounts.missing} loaded ${type === "series" ? "series" : "titles"} were not found in the selected storage folders.`
                   : inventoryCounts.partial
-                    ? `${inventoryCounts.partial} series are present but do not have all known episodes on storage.`
+                    ? `${inventoryCounts.partial} loaded series are present but do not have all known episodes on storage.`
                     : inventoryCounts.unknown
-                    ? "Storage inventory could not be checked; unknown items are not marked as missing."
-                    : "All listed provider content is complete in the selected storage folders."}
+                    ? "Storage inventory could not be checked for some loaded titles; unknown items are not marked as missing."
+                    : "Storage status is available for the loaded titles."}
               </p>
               <div className="flex flex-wrap gap-1.5">
                 {[
-                  ["all", `All (${items.length})`],
-                  ["missing", `Missing (${inventoryCounts.missing})`],
-                  ["partial", `Partial (${inventoryCounts.partial})`],
-                  ["downloaded", `On storage (${inventoryCounts.downloaded})`],
-                  ["unknown", `Unknown (${inventoryCounts.unknown})`],
+                  ["all", `All (${totalItems})`],
+                  ["missing", "Missing"],
+                  ["partial", "Partial"],
+                  ["downloaded", "On storage"],
+                  ["unknown", "Unknown"],
                 ].map(([filter, label]) => <button key={filter} type="button" aria-pressed={inventoryFilter === filter} onClick={() => setInventoryFilter(filter)} className={`rounded-md px-2.5 py-1.5 text-[11px] ${inventoryFilter === filter ? "bg-indigo-500/20 text-indigo-200" : "text-slate-400 hover:bg-slate-800"}`}>{label}</button>)}
               </div>
             </div>}
             {items.length > 0 && <div className="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 bg-[#101827]/95 px-4 py-3 backdrop-blur">
               <div className="flex flex-wrap items-center gap-2">
-                <button type="button" onClick={selectAllVisible} disabled={!displayedItems.length} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40">Select All ({displayedItems.length} items)</button>
+                <button type="button" onClick={selectAllVisible} disabled={!displayedItems.length} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40">Select Loaded ({displayedItems.length})</button>
                 <button type="button" onClick={() => setSelectedItems(new Set())} disabled={!selectedItems.size} className="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40">Deselect All</button>
                 <span className="text-xs text-slate-400">Selected: {selectedTitles.length} {type === "series" ? `shows · ${knownEpisodeCount} known episodes${unknownEpisodeCount ? ` · ${unknownEpisodeCount} count${unknownEpisodeCount === 1 ? "" : "s"} unavailable` : ""}` : "movies"}</span>
               </div>
@@ -799,7 +872,9 @@ export default function ContentBrowser({
                 <button type="button" disabled={busy || !selectedTitles.length} onClick={exportSelectedScript} className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-400/40 bg-indigo-500/10 px-3 py-2 text-xs font-medium text-indigo-200 hover:bg-indigo-500/20 disabled:opacity-40"><Download size={14} />Export / Run as Direct Bash Script</button>
               </div>
             </div>}
-            {!items.length ? <div className="grid min-h-64 place-items-center px-4 text-center text-sm text-slate-500">Choose categories and select <span className="text-indigo-300">Browse selected</span> to see provider content.</div> :
+            {!items.length && pageLoading ? <div className="grid min-h-64 place-items-center px-4 text-center text-sm text-slate-400"><LoaderCircle size={20} className="mr-2 animate-spin" />Loading titles…</div> :
+              !items.length && !browseContext ? <div className="grid min-h-64 place-items-center px-4 text-center text-sm text-slate-500">Choose categories and select <span className="text-indigo-300">Browse selected</span> to see provider content.</div> :
+              !items.length ? <div className="grid min-h-64 place-items-center px-4 text-center text-sm text-slate-500">No titles match this search and storage filter.</div> :
               !displayedItems.length ? <div className="grid min-h-64 place-items-center px-4 text-center text-sm text-slate-500">No titles match this search and storage filter.</div> :
                 viewMode === "list" ? <div className="max-h-[660px] overflow-auto">
                   <table className="w-full min-w-[760px] text-left text-sm">
@@ -856,6 +931,12 @@ export default function ContentBrowser({
                   })}
                 </div>
             }
+            {(hasMoreItems || pageLoading) && <div className="border-t border-slate-800 p-4 text-center">
+              <button type="button" onClick={loadMoreItems} disabled={pageLoading || !hasMoreItems} className="inline-flex items-center gap-2 rounded-lg border border-slate-700 px-4 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-50">
+                {pageLoading && items.length > 0 && <LoaderCircle size={14} className="animate-spin" />}
+                {pageLoading ? "Loading…" : `Load more (${Math.max(totalItems - items.length, 0)} remaining)`}
+              </button>
+            </div>}
           </div>
         </div>
       </div>

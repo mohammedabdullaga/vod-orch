@@ -7,6 +7,7 @@ import shlex
 import time
 import uuid
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
@@ -14,7 +15,7 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
@@ -27,6 +28,8 @@ from app.models import (
     MonitoredCategory,
     Node,
     Proxy,
+    ProviderCatalogCategory,
+    ProviderCatalogItem,
     ProviderCatalogSyncJob,
     QueueItem,
     SessionLocal,
@@ -39,6 +42,11 @@ from app.services.provider_client import (
     resolve_provider_proxy,
     resolve_provider_proxy_selection,
     stream_url,
+)
+from app.services.catalog_index import (
+    store_categories,
+    store_category_items,
+    store_inventory_status,
 )
 from app.security import decrypt_secret, encrypt_secret
 from app.services.content_paths import (
@@ -202,6 +210,7 @@ class ContentBrowseRequest(BaseModel):
     account_id: int | None = Field(default=None, ge=1)
     proxy_id: int | None = Field(default=None, ge=0)
     refresh: bool = False
+    include_items: bool = True
 
 
 def _playlist_category_id(playlist_id: int, group_title: str) -> str:
@@ -877,13 +886,36 @@ async def get_content_categories(
 ) -> list[dict[str, Any]]:
     kind, action, _ = _provider_kind(type)
     account = _provider_account(account_id)
-    proxy_url = _resolve_api_proxy(proxy_id)
-    rows = _provider_rows(
-        await _request_provider(
-            account, action, proxy_url=proxy_url, force_refresh=refresh, response=response
-        ),
-        action,
-    )
+    with SessionLocal() as db:
+        cached_categories = db.scalars(
+            select(ProviderCatalogCategory)
+            .where(
+                ProviderCatalogCategory.account_id == account.id,
+                ProviderCatalogCategory.kind == kind,
+            )
+            .order_by(ProviderCatalogCategory.category_name)
+        ).all()
+    if cached_categories and not refresh:
+        rows = [
+            {
+                "category_id": category.category_id,
+                "category_name": category.category_name,
+            }
+            for category in cached_categories
+        ]
+    else:
+        proxy_url = _resolve_api_proxy(proxy_id)
+        rows = _provider_rows(
+            await _request_provider(
+                account,
+                action,
+                proxy_url=proxy_url,
+                force_refresh=refresh,
+                response=response,
+            ),
+            action,
+        )
+        await asyncio.to_thread(store_categories, account.id, kind, rows)
     with SessionLocal() as db:
         states = {
             item.category_id: item
@@ -931,7 +963,7 @@ async def _run_content_browse_job(
 ) -> None:
     job = _content_browse_jobs[job_id]
     try:
-        job["items"] = await _load_content_items(
+        items = await _load_content_items(
             request,
             Response(),
             payload.type,
@@ -940,12 +972,19 @@ async def _run_content_browse_job(
             payload.proxy_id,
             payload.refresh,
             payload.category_names,
-            on_provider_items=lambda items: _publish_content_browse_items(job, items),
+            on_provider_items=(
+                (lambda provider_items: _publish_content_browse_items(job, provider_items))
+                if payload.include_items
+                else None
+            ),
             on_inventory_check=lambda: job.update(
                 phase="checking_storage",
                 updated_at=time.monotonic(),
             ),
         )
+        job["items"] = items if payload.include_items else None
+        if not payload.include_items:
+            job["item_batches"] = []
         job["status"] = "COMPLETED"
     except HTTPException as exc:
         job["error"] = {"status_code": exc.status_code, "detail": exc.detail}
@@ -1040,20 +1079,21 @@ def get_content_browse_status(
         )
     result: dict[str, Any] = {"job_id": job_id, "status": job["status"]}
     result["phase"] = job["phase"]
-    if job["status"] == "COMPLETED" and job["items"] is not None:
-        result["items"] = job["items"]
-        result["items_version"] = job["items_version"]
-    elif items_after is not None:
-        batches = job["item_batches"]
-        result["items"] = [
-            item
-            for version, batch in batches
-            if version > items_after
-            for item in batch
-        ]
-        result["items_version"] = job["items_version"]
-    elif include_items and job["items"] is not None:
-        result["items"] = job["items"]
+    if include_items:
+        if job["status"] == "COMPLETED" and job["items"] is not None:
+            result["items"] = job["items"]
+            result["items_version"] = job["items_version"]
+        elif items_after is not None:
+            batches = job["item_batches"]
+            result["items"] = [
+                item
+                for version, batch in batches
+                if version > items_after
+                for item in batch
+            ]
+            result["items_version"] = job["items_version"]
+        elif job["items"] is not None:
+            result["items"] = job["items"]
     if job["status"] == "FAILED":
         error = job["error"]
         result["error"] = error
@@ -1063,17 +1103,135 @@ def get_content_browse_status(
 @router.get("/items")
 async def get_content_items(
     request: Request,
-    response: Response,
     type: Literal["series", "movie"] = Query(...),
     category_ids: str = Query(..., min_length=1, max_length=5000),
     account_id: int | None = Query(default=None, ge=1),
     proxy_id: int | None = Query(default=None, ge=0),
+    search: str = Query(default="", max_length=256),
+    inventory_status: Literal["all", "downloaded", "partial", "missing", "unknown"] = Query(
+        default="all"
+    ),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
     refresh: bool = Query(default=False),
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     ids = list(dict.fromkeys(part.strip() for part in category_ids.split(",") if part.strip()))
-    return await _load_content_items(
-        request, response, type, ids, account_id, proxy_id, refresh
+    if not ids or len(ids) > 50:
+        raise HTTPException(status_code=422, detail="Select between 1 and 50 category IDs.")
+
+    account = _provider_account(account_id)
+    kind, _, _ = _provider_kind(type)
+    with SessionLocal() as db:
+        category_cache = db.scalars(
+            select(ProviderCatalogCategory).where(
+                ProviderCatalogCategory.account_id == account.id,
+                ProviderCatalogCategory.kind == kind,
+                ProviderCatalogCategory.category_id.in_(ids),
+            )
+        ).all()
+    cache_by_id = {category.category_id: category for category in category_cache}
+    cache_is_fresh = len(cache_by_id) == len(ids) and all(
+        category.items_synced_at is not None
+        and (utc_now() - _as_utc(category.items_synced_at)).total_seconds()
+        < settings.provider_catalog_ttl_seconds
+        for category in category_cache
     )
+    if refresh or not cache_is_fresh:
+        await _load_content_items(
+            request,
+            Response(),
+            type,
+            ids,
+            account.id,
+            proxy_id,
+            refresh,
+        )
+
+    filters = [
+        ProviderCatalogItem.account_id == account.id,
+        ProviderCatalogItem.kind == kind,
+        ProviderCatalogItem.category_id.in_(ids),
+    ]
+    if search.strip():
+        escaped_search = (
+            search.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        filters.append(ProviderCatalogItem.name.ilike(f"%{escaped_search}%", escape="\\"))
+    category_priority = case(
+        {category_id: priority for priority, category_id in enumerate(ids)},
+        value=ProviderCatalogItem.category_id,
+        else_=len(ids),
+    )
+    ranked_items = (
+        select(
+            ProviderCatalogItem.id.label("item_id"),
+            func.row_number()
+            .over(
+                partition_by=ProviderCatalogItem.stream_id,
+                order_by=(category_priority, ProviderCatalogItem.id),
+            )
+            .label("row_number"),
+        )
+        .where(*filters)
+        .subquery()
+    )
+    unique_items = (
+        select(ranked_items.c.item_id)
+        .where(ranked_items.c.row_number == 1)
+        .subquery()
+    )
+    page_query = select(ProviderCatalogItem).join(
+        unique_items,
+        ProviderCatalogItem.id == unique_items.c.item_id,
+    )
+    count_query = select(ProviderCatalogItem.id).join(
+        unique_items,
+        ProviderCatalogItem.id == unique_items.c.item_id,
+    )
+    if inventory_status != "all":
+        page_query = page_query.where(
+            ProviderCatalogItem.download_status == inventory_status
+        )
+        count_query = count_query.where(
+            ProviderCatalogItem.download_status == inventory_status
+        )
+    with SessionLocal() as db:
+        total = db.scalar(select(func.count()).select_from(count_query.subquery())) or 0
+        records = db.scalars(
+            page_query
+            .order_by(func.lower(ProviderCatalogItem.name), ProviderCatalogItem.stream_id)
+            .offset(offset)
+            .limit(limit)
+        ).all()
+
+    items = [
+        {
+            "id": item.stream_id,
+            "name": item.name,
+            "category_id": item.category_id,
+            "category_name": item.category_name,
+            "kind": item.kind,
+            "cover": item.cover,
+            "total_seasons": item.total_seasons,
+            "total_episodes": item.total_episodes,
+            "year": item.year,
+            "container_ext": item.container_ext,
+            "download_status": item.download_status,
+            "storage_match": item.storage_match,
+        }
+        for item in records
+    ]
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(items) < total,
+    }
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
 
 async def _load_content_items(
@@ -1092,7 +1250,7 @@ async def _load_content_items(
     if not ids or len(ids) > 50:
         raise HTTPException(status_code=422, detail="Select between 1 and 50 category IDs.")
     account = _provider_account(account_id)
-    proxy_url = _resolve_api_proxy(proxy_id)
+    proxy_url = None
     category_names = {}
     if category_names_hint and all(
         isinstance(category_names_hint.get(category_id), str)
@@ -1104,97 +1262,174 @@ async def _load_content_items(
             for category_id in ids
         }
     else:
-        categories_response = await _request_provider(
-            account,
-            "get_series_categories" if kind == "series" else "get_vod_categories",
-            proxy_url=proxy_url,
-            response=response,
-        )
-        category_rows = _provider_rows(
-            categories_response,
-            "get_series_categories" if kind == "series" else "get_vod_categories",
-        )
-        category_names = {
-            str(row.get("category_id", row.get("id"))): str(
-                row.get("category_name", row.get("name", "Unknown"))
+        with SessionLocal() as db:
+            category_names = {
+                category.category_id: category.category_name
+                for category in db.scalars(
+                    select(ProviderCatalogCategory).where(
+                        ProviderCatalogCategory.account_id == account.id,
+                        ProviderCatalogCategory.kind == kind,
+                        ProviderCatalogCategory.category_id.in_(ids),
+                    )
+                ).all()
+            }
+        if len(category_names) != len(ids):
+            proxy_url = _resolve_api_proxy(proxy_id)
+            categories_response = await _request_provider(
+                account,
+                "get_series_categories" if kind == "series" else "get_vod_categories",
+                proxy_url=proxy_url,
+                response=response,
             )
-            for row in category_rows
-            if row.get("category_id", row.get("id")) is not None
-        }
+            category_rows = _provider_rows(
+                categories_response,
+                "get_series_categories" if kind == "series" else "get_vod_categories",
+            )
+            await asyncio.to_thread(store_categories, account.id, kind, category_rows)
+            category_names = {
+                str(row.get("category_id", row.get("id"))): str(
+                    row.get("category_name", row.get("name", "Unknown"))
+                )
+                for row in category_rows
+                if row.get("category_id", row.get("id")) is not None
+            }
         unknown_ids = [category_id for category_id in ids if category_id not in category_names]
         if unknown_ids:
             raise HTTPException(status_code=404, detail=f"Unknown provider category IDs: {', '.join(unknown_ids)}")
 
-    semaphore = asyncio.Semaphore(_CONTENT_BROWSE_REQUEST_CONCURRENCY)
     result: list[dict[str, Any]] = []
     seen_item_ids: set[str] = set()
+    with SessionLocal() as db:
+        category_cache = db.scalars(
+            select(ProviderCatalogCategory).where(
+                ProviderCatalogCategory.account_id == account.id,
+                ProviderCatalogCategory.kind == kind,
+                ProviderCatalogCategory.category_id.in_(ids),
+            )
+        ).all()
+    cached_categories = {category.category_id: category for category in category_cache}
+    cache_is_fresh = len(cached_categories) == len(ids) and all(
+        category.items_synced_at is not None
+        and (utc_now() - _as_utc(category.items_synced_at)).total_seconds()
+        < settings.provider_catalog_ttl_seconds
+        for category in category_cache
+    )
 
-    async def fetch_category_items(category_id: str) -> list[dict[str, Any]]:
-        async with semaphore:
-            response_rows = await _request_provider(
-                account,
-                items_action,
-                proxy_url=proxy_url,
-                force_refresh=refresh,
-                response=response,
-                category_id=category_id,
-            )
-        rows = _provider_rows(response_rows, items_action)
-        category_items: list[dict[str, Any]] = []
-        for row in rows:
-            item_id = _provider_item_id(row, kind)
-            if item_id is None:
+    if cache_is_fresh and not refresh:
+        with SessionLocal() as db:
+            cached_items = db.scalars(
+                select(ProviderCatalogItem)
+                .where(
+                    ProviderCatalogItem.account_id == account.id,
+                    ProviderCatalogItem.kind == kind,
+                    ProviderCatalogItem.category_id.in_(ids),
+                )
+                .order_by(ProviderCatalogItem.id)
+            ).all()
+        for cached in cached_items:
+            if cached.stream_id in seen_item_ids:
                 continue
-            item_id = str(item_id)
-            if item_id in seen_item_ids:
-                continue
-            seen_item_ids.add(item_id)
-            seasons = row.get("seasons")
-            if isinstance(seasons, dict):
-                season_count = len(seasons)
-            elif isinstance(seasons, list):
-                season_count = len(seasons)
-            else:
-                season_count = _integer_or_none(row.get("season_count"))
-            episode_count = _integer_or_none(
-                row.get("episode_count", row.get("episodes_count"))
+            seen_item_ids.add(cached.stream_id)
+            result.append(
+                {
+                    "id": cached.stream_id,
+                    "name": cached.name,
+                    "category_id": cached.category_id,
+                    "category_name": cached.category_name,
+                    "kind": kind,
+                    "cover": cached.cover,
+                    "total_seasons": cached.total_seasons,
+                    "total_episodes": cached.total_episodes,
+                    "year": cached.year,
+                    "container_ext": cached.container_ext,
+                    "download_status": cached.download_status,
+                    "storage_match": cached.storage_match,
+                }
             )
-            if episode_count is None:
-                episode_rows = row.get("episodes")
-                if isinstance(episode_rows, list):
-                    episode_count = len(episode_rows)
-                elif isinstance(episode_rows, dict):
-                    episode_count = sum(
-                        len(episodes) for episodes in episode_rows.values()
-                        if isinstance(episodes, list)
-                    )
-            category_items.append({
-                "id": item_id,
-                "name": str(row.get("name") or row.get("title") or f"Media {item_id}"),
-                "category_id": category_id,
-                "category_name": category_names[category_id],
-                "kind": kind,
-                "cover": row.get("cover") or row.get("stream_icon"),
-                "total_seasons": season_count if kind == "series" else None,
-                "total_episodes": episode_count if kind == "series" else None,
-                "year": _media_year(row),
-                "container_ext": safe_extension(str(row.get("container_extension") or "mkv")),
-            })
-        result.extend(category_items)
         if on_provider_items is not None:
-            on_provider_items(category_items)
-        return rows
+            for category_id in ids:
+                on_provider_items(
+                    [item for item in result if item["category_id"] == category_id]
+                )
+    else:
+        if proxy_url is None:
+            proxy_url = _resolve_api_proxy(proxy_id)
+        semaphore = asyncio.Semaphore(_CONTENT_BROWSE_REQUEST_CONCURRENCY)
 
-    category_results = await asyncio.gather(
-        *(fetch_category_items(category_id) for category_id in ids),
-        return_exceptions=True,
-    )
-    category_error = next(
-        (value for value in category_results if isinstance(value, BaseException)),
-        None,
-    )
-    if category_error:
-        raise category_error
+        async def fetch_category_items(category_id: str) -> list[dict[str, Any]]:
+            async with semaphore:
+                response_rows = await _request_provider(
+                    account,
+                    items_action,
+                    proxy_url=proxy_url,
+                    force_refresh=refresh,
+                    response=response,
+                    category_id=category_id,
+                )
+            rows = _provider_rows(response_rows, items_action)
+            await asyncio.to_thread(
+                store_category_items,
+                account.id,
+                kind,
+                category_id,
+                category_names[category_id],
+                rows,
+            )
+            category_items: list[dict[str, Any]] = []
+            for row in rows:
+                item_id = _provider_item_id(row, kind)
+                if item_id is None:
+                    continue
+                item_id = str(item_id)
+                if item_id in seen_item_ids:
+                    continue
+                seen_item_ids.add(item_id)
+                seasons = row.get("seasons")
+                if isinstance(seasons, dict):
+                    season_count = len(seasons)
+                elif isinstance(seasons, list):
+                    season_count = len(seasons)
+                else:
+                    season_count = _integer_or_none(row.get("season_count"))
+                episode_count = _integer_or_none(
+                    row.get("episode_count", row.get("episodes_count"))
+                )
+                if episode_count is None:
+                    episode_rows = row.get("episodes")
+                    if isinstance(episode_rows, list):
+                        episode_count = len(episode_rows)
+                    elif isinstance(episode_rows, dict):
+                        episode_count = sum(
+                            len(episodes) for episodes in episode_rows.values()
+                            if isinstance(episodes, list)
+                        )
+                category_items.append({
+                    "id": item_id,
+                    "name": str(row.get("name") or row.get("title") or f"Media {item_id}"),
+                    "category_id": category_id,
+                    "category_name": category_names[category_id],
+                    "kind": kind,
+                    "cover": row.get("cover") or row.get("stream_icon"),
+                    "total_seasons": season_count if kind == "series" else None,
+                    "total_episodes": episode_count if kind == "series" else None,
+                    "year": _media_year(row),
+                    "container_ext": safe_extension(str(row.get("container_extension") or "mkv")),
+                })
+            result.extend(category_items)
+            if on_provider_items is not None:
+                on_provider_items(category_items)
+            return rows
+
+        category_results = await asyncio.gather(
+            *(fetch_category_items(category_id) for category_id in ids),
+            return_exceptions=True,
+        )
+        category_error = next(
+            (value for value in category_results if isinstance(value, BaseException)),
+            None,
+        )
+        if category_error:
+            raise category_error
 
     if on_inventory_check is not None:
         on_inventory_check()
@@ -1306,6 +1541,7 @@ async def _load_content_items(
         if len(matches) > 1:
             item["inventory_warning"] = "Multiple matching movie files were found."
         item["storage_match"] = match
+    await asyncio.to_thread(store_inventory_status, account.id, kind, result)
     return result
 
 

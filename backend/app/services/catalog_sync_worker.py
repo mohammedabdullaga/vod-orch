@@ -14,6 +14,7 @@ from app.models import (
     SessionLocal,
     utc_now,
 )
+from app.services.catalog_index import store_categories, store_category_items
 from app.services.provider_client import (
     begin_catalog_cache_clear,
     cached_provider_action,
@@ -308,7 +309,7 @@ class ProviderCatalogSyncWorker:
             account_id = account.id
 
         proxy_url = resolve_provider_proxy(proxy_id)
-        category_records: list[tuple[str, str, str]] = []
+        category_records: list[tuple[str, str, str, str]] = []
         series_ids: list[str] = []
         seen_series_ids: set[str] = set()
         category_results = await asyncio.gather(
@@ -340,10 +341,23 @@ class ProviderCatalogSyncWorker:
                 stale_delta=int(cache_state == "stale"),
                 cache_hits_delta=int(cache_state == "hit"),
             )
+            await asyncio.to_thread(store_categories, account_id, kind, categories)
             for category in categories:
                 category_id = category.get("category_id", category.get("id"))
                 if category_id is not None:
-                    category_records.append((kind, str(category_id), list_action))
+                    category_records.append(
+                        (
+                            kind,
+                            str(category_id),
+                            list_action,
+                            str(
+                                category.get(
+                                    "category_name",
+                                    category.get("name", "Unknown"),
+                                )
+                            ),
+                        )
+                    )
 
         semaphore = asyncio.Semaphore(CATALOG_REQUEST_CONCURRENCY)
 
@@ -351,6 +365,7 @@ class ProviderCatalogSyncWorker:
             kind: str,
             category_id: str,
             list_action: str,
+            category_name: str,
         ) -> None:
             async with semaphore:
                 rows, cache_state = await self._fetch_action(
@@ -366,6 +381,14 @@ class ProviderCatalogSyncWorker:
                 raise ValueError(
                     f"Provider returned invalid {list_action} data for category {category_id}."
                 )
+            await asyncio.to_thread(
+                store_category_items,
+                account_id,
+                kind,
+                category_id,
+                category_name,
+                rows,
+            )
             if kind == "series":
                 for row in rows:
                     series_id = row.get("series_id", row.get("id"))
@@ -385,8 +408,8 @@ class ProviderCatalogSyncWorker:
 
         list_results = await asyncio.gather(
             *(
-                fetch_category_list(kind, category_id, list_action)
-                for kind, category_id, list_action in category_records
+                fetch_category_list(kind, category_id, list_action, category_name)
+                for kind, category_id, list_action, category_name in category_records
             ),
             return_exceptions=True,
         )

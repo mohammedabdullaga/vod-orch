@@ -6,6 +6,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -85,6 +86,72 @@ class ProviderProfileCatalogCache(Base):
     params_key: Mapped[str] = mapped_column(Text)
     payload: Mapped[str] = mapped_column(Text)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ProviderCatalogCategory(Base):
+    __tablename__ = "provider_catalog_categories"
+    __table_args__ = (
+        UniqueConstraint("account_id", "kind", "category_id"),
+        Index("ix_provider_catalog_categories_account_kind", "account_id", "kind"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16))
+    category_id: Mapped[str] = mapped_column(String(255), index=True)
+    category_name: Mapped[str] = mapped_column(String(512))
+    item_count: Mapped[int] = mapped_column(Integer, default=0)
+    items_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class ProviderCatalogItem(Base):
+    __tablename__ = "provider_catalog_items"
+    __table_args__ = (
+        UniqueConstraint("account_id", "kind", "category_id", "stream_id"),
+        Index(
+            "ix_provider_catalog_items_lookup",
+            "account_id",
+            "kind",
+            "category_id",
+            "name",
+        ),
+        Index(
+            "ix_provider_catalog_items_account_stream",
+            "account_id",
+            "kind",
+            "stream_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16))
+    category_id: Mapped[str] = mapped_column(String(255), index=True)
+    category_name: Mapped[str] = mapped_column(String(512))
+    stream_id: Mapped[str] = mapped_column(String(512), index=True)
+    name: Mapped[str] = mapped_column(String(1024), index=True)
+    cover: Mapped[str | None] = mapped_column(Text, nullable=True)
+    total_seasons: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_episodes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    year: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    container_ext: Mapped[str] = mapped_column(String(16), default="mkv")
+    download_status: Mapped[str] = mapped_column(String(16), default="unknown")
+    storage_match: Mapped[str | None] = mapped_column(Text, nullable=True)
+    inventory_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
 
 
 class ProviderCatalogSyncJob(Base):
