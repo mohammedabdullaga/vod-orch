@@ -227,6 +227,11 @@ export default function ContentBrowser({
         type,
         account_id: Number(sourceAccountId),
         category_ids: [...selectedCategories],
+        category_names: Object.fromEntries(
+          categories
+            .filter((category) => selectedCategories.has(category.category_id))
+            .map((category) => [category.category_id, category.category_name]),
+        ),
         proxy_id: providerProxyId ? Number(providerProxyId) : 0,
         refresh: forceRefresh,
       });

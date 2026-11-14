@@ -198,6 +198,7 @@ class CatalogSyncRetryRequest(BaseModel):
 class ContentBrowseRequest(BaseModel):
     type: Literal["series", "movie"]
     category_ids: list[str] = Field(min_length=1, max_length=50)
+    category_names: dict[str, str] = Field(default_factory=dict, max_length=50)
     account_id: int | None = Field(default=None, ge=1)
     proxy_id: int | None = Field(default=None, ge=0)
     refresh: bool = False
@@ -938,6 +939,7 @@ async def _run_content_browse_job(
             payload.account_id,
             payload.proxy_id,
             payload.refresh,
+            payload.category_names,
             on_provider_items=lambda items: _publish_content_browse_items(job, items),
             on_inventory_check=lambda: job.update(
                 phase="checking_storage",
@@ -1082,6 +1084,7 @@ async def _load_content_items(
     account_id: int | None,
     proxy_id: int | None,
     refresh: bool,
+    category_names_hint: dict[str, str] | None = None,
     on_provider_items: Callable[[list[dict[str, Any]]], None] | None = None,
     on_inventory_check: Callable[[], None] | None = None,
 ) -> list[dict[str, Any]]:
@@ -1090,26 +1093,37 @@ async def _load_content_items(
         raise HTTPException(status_code=422, detail="Select between 1 and 50 category IDs.")
     account = _provider_account(account_id)
     proxy_url = _resolve_api_proxy(proxy_id)
-    categories_response = await _request_provider(
-        account,
-        "get_series_categories" if kind == "series" else "get_vod_categories",
-        proxy_url=proxy_url,
-        response=response,
-    )
-    category_rows = _provider_rows(
-        categories_response,
-        "get_series_categories" if kind == "series" else "get_vod_categories",
-    )
-    category_names = {
-        str(row.get("category_id", row.get("id"))): str(
-            row.get("category_name", row.get("name", "Unknown"))
+    category_names = {}
+    if category_names_hint and all(
+        isinstance(category_names_hint.get(category_id), str)
+        and category_names_hint[category_id].strip()
+        for category_id in ids
+    ):
+        category_names = {
+            category_id: category_names_hint[category_id].strip()[:512]
+            for category_id in ids
+        }
+    else:
+        categories_response = await _request_provider(
+            account,
+            "get_series_categories" if kind == "series" else "get_vod_categories",
+            proxy_url=proxy_url,
+            response=response,
         )
-        for row in category_rows
-        if row.get("category_id", row.get("id")) is not None
-    }
-    unknown_ids = [category_id for category_id in ids if category_id not in category_names]
-    if unknown_ids:
-        raise HTTPException(status_code=404, detail=f"Unknown provider category IDs: {', '.join(unknown_ids)}")
+        category_rows = _provider_rows(
+            categories_response,
+            "get_series_categories" if kind == "series" else "get_vod_categories",
+        )
+        category_names = {
+            str(row.get("category_id", row.get("id"))): str(
+                row.get("category_name", row.get("name", "Unknown"))
+            )
+            for row in category_rows
+            if row.get("category_id", row.get("id")) is not None
+        }
+        unknown_ids = [category_id for category_id in ids if category_id not in category_names]
+        if unknown_ids:
+            raise HTTPException(status_code=404, detail=f"Unknown provider category IDs: {', '.join(unknown_ids)}")
 
     semaphore = asyncio.Semaphore(_CONTENT_BROWSE_REQUEST_CONCURRENCY)
     result: list[dict[str, Any]] = []
