@@ -938,9 +938,10 @@ async def _run_content_browse_job(
             payload.account_id,
             payload.proxy_id,
             payload.refresh,
-            on_provider_items=lambda items: job.update(
-                items=[dict(item) for item in items],
+            on_provider_items=lambda items: _publish_content_browse_items(job, items),
+            on_inventory_check=lambda: job.update(
                 phase="checking_storage",
+                updated_at=time.monotonic(),
             ),
         )
         job["status"] = "COMPLETED"
@@ -965,6 +966,22 @@ async def _run_content_browse_job(
         job["updated_at"] = time.monotonic()
 
 
+def _publish_content_browse_items(
+    job: dict[str, Any],
+    items: list[dict[str, Any]],
+) -> None:
+    if not items:
+        return
+    job["items_version"] += 1
+    batch = [dict(item) for item in items]
+    job["item_batches"].append((job["items_version"], batch))
+    if job["items"] is None:
+        job["items"] = []
+    job["items"].extend(batch)
+    job["phase"] = "loading_provider"
+    job["updated_at"] = time.monotonic()
+
+
 @router.post("/items/browse", status_code=202)
 async def start_content_browse(
     payload: ContentBrowseRequest,
@@ -987,6 +1004,8 @@ async def start_content_browse(
         "status": "RUNNING",
         "phase": "loading_provider",
         "items": None,
+        "item_batches": [],
+        "items_version": 0,
         "error": None,
         "created_at": time.monotonic(),
         "updated_at": time.monotonic(),
@@ -1008,6 +1027,7 @@ async def start_content_browse(
 def get_content_browse_status(
     job_id: str,
     include_items: bool = Query(default=True),
+    items_after: int | None = Query(default=None, ge=0),
 ) -> dict[str, Any]:
     _prune_content_browse_jobs()
     job = _content_browse_jobs.get(job_id)
@@ -1018,7 +1038,19 @@ def get_content_browse_status(
         )
     result: dict[str, Any] = {"job_id": job_id, "status": job["status"]}
     result["phase"] = job["phase"]
-    if include_items and job["items"] is not None:
+    if job["status"] == "COMPLETED" and job["items"] is not None:
+        result["items"] = job["items"]
+        result["items_version"] = job["items_version"]
+    elif items_after is not None:
+        batches = job["item_batches"]
+        result["items"] = [
+            item
+            for version, batch in batches
+            if version > items_after
+            for item in batch
+        ]
+        result["items_version"] = job["items_version"]
+    elif include_items and job["items"] is not None:
         result["items"] = job["items"]
     if job["status"] == "FAILED":
         error = job["error"]
@@ -1051,6 +1083,7 @@ async def _load_content_items(
     proxy_id: int | None,
     refresh: bool,
     on_provider_items: Callable[[list[dict[str, Any]]], None] | None = None,
+    on_inventory_check: Callable[[], None] | None = None,
 ) -> list[dict[str, Any]]:
     kind, _, items_action = _provider_kind(type)
     if not ids or len(ids) > 50:
@@ -1079,6 +1112,8 @@ async def _load_content_items(
         raise HTTPException(status_code=404, detail=f"Unknown provider category IDs: {', '.join(unknown_ids)}")
 
     semaphore = asyncio.Semaphore(_CONTENT_BROWSE_REQUEST_CONCURRENCY)
+    result: list[dict[str, Any]] = []
+    seen_item_ids: set[str] = set()
 
     async def fetch_category_items(category_id: str) -> list[dict[str, Any]]:
         async with semaphore:
@@ -1090,22 +1125,8 @@ async def _load_content_items(
                 response=response,
                 category_id=category_id,
             )
-        return _provider_rows(response_rows, items_action)
-
-    category_results = await asyncio.gather(
-        *(fetch_category_items(category_id) for category_id in ids),
-        return_exceptions=True,
-    )
-    category_error = next(
-        (value for value in category_results if isinstance(value, BaseException)),
-        None,
-    )
-    if category_error:
-        raise category_error
-
-    result: list[dict[str, Any]] = []
-    seen_item_ids: set[str] = set()
-    for category_id, rows in zip(ids, category_results):
+        rows = _provider_rows(response_rows, items_action)
+        category_items: list[dict[str, Any]] = []
         for row in rows:
             item_id = _provider_item_id(row, kind)
             if item_id is None:
@@ -1133,7 +1154,7 @@ async def _load_content_items(
                         len(episodes) for episodes in episode_rows.values()
                         if isinstance(episodes, list)
                     )
-            result.append({
+            category_items.append({
                 "id": item_id,
                 "name": str(row.get("name") or row.get("title") or f"Media {item_id}"),
                 "category_id": category_id,
@@ -1145,9 +1166,24 @@ async def _load_content_items(
                 "year": _media_year(row),
                 "container_ext": safe_extension(str(row.get("container_extension") or "mkv")),
             })
+        result.extend(category_items)
+        if on_provider_items is not None:
+            on_provider_items(category_items)
+        return rows
 
-    if on_provider_items is not None:
-        on_provider_items(result)
+    category_results = await asyncio.gather(
+        *(fetch_category_items(category_id) for category_id in ids),
+        return_exceptions=True,
+    )
+    category_error = next(
+        (value for value in category_results if isinstance(value, BaseException)),
+        None,
+    )
+    if category_error:
+        raise category_error
+
+    if on_inventory_check is not None:
+        on_inventory_check()
 
     with SessionLocal() as db:
         states = {

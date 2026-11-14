@@ -208,6 +208,7 @@ export default function ContentBrowser({
     if (!selectedCategories.size) return setNotice("Select one or more categories to browse.");
     setBusy(true);
     setNotice("");
+    setItems([]);
     setSelectedItems(new Set());
     setItemSearch("");
     try {
@@ -231,32 +232,33 @@ export default function ContentBrowser({
       });
       setNotice("Loading provider titles…");
       let browseStatus;
-      let providerResultsReceived = false;
-      do {
-        await new Promise((resolve) => window.setTimeout(resolve, 1200));
+      let itemsVersion = 0;
+      const providerItems = [];
+      while (true) {
         ({ data: browseStatus } = await api.get(
           `/content/items/browse/${started.job_id}`,
-          { params: { include_items: !providerResultsReceived } },
+          { params: { items_after: itemsVersion } },
         ));
         if (Array.isArray(browseStatus.items)) {
-          providerResultsReceived = true;
-          setItems(browseStatus.items);
+          if (browseStatus.status === "COMPLETED") {
+            providerItems.splice(0, providerItems.length, ...browseStatus.items);
+          } else {
+            providerItems.push(...browseStatus.items);
+          }
+          itemsVersion = browseStatus.items_version ?? itemsVersion;
+          setItems([...providerItems]);
           setInventoryFilter("all");
           if (browseStatus.status === "RUNNING") {
             setNotice("Provider titles loaded; checking the storage inventory…");
           }
         }
-      } while (browseStatus.status === "RUNNING");
+        if (browseStatus.status !== "RUNNING") break;
+        await new Promise((resolve) => window.setTimeout(resolve, 350));
+      }
       if (browseStatus.status !== "COMPLETED") {
         throw new Error(
           browseStatus.error?.detail || "Content browsing failed. Check the provider and storage connection.",
         );
-      }
-      if (!Array.isArray(browseStatus.items)) {
-        ({ data: browseStatus } = await api.get(
-          `/content/items/browse/${started.job_id}`,
-          { params: { include_items: true } },
-        ));
       }
       const items = browseStatus.items;
       setItems(items);
