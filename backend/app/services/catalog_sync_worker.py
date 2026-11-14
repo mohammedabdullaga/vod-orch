@@ -19,6 +19,7 @@ from app.services.provider_client import (
     cached_provider_action,
     end_catalog_cache_clear,
     invalidate_provider_action_cache,
+    parse_series_episodes,
     resolve_provider_proxy,
 )
 
@@ -308,6 +309,8 @@ class ProviderCatalogSyncWorker:
 
         proxy_url = resolve_provider_proxy(proxy_id)
         category_records: list[tuple[str, str, str]] = []
+        series_ids: list[str] = []
+        seen_series_ids: set[str] = set()
         category_results = await asyncio.gather(
             *(
                 self._fetch_action(account, category_action, proxy_url)
@@ -363,6 +366,14 @@ class ProviderCatalogSyncWorker:
                 raise ValueError(
                     f"Provider returned invalid {list_action} data for category {category_id}."
                 )
+            if kind == "series":
+                for row in rows:
+                    series_id = row.get("series_id", row.get("id"))
+                    if series_id is not None and str(series_id).strip():
+                        normalized_id = str(series_id)
+                        if normalized_id not in seen_series_ids:
+                            seen_series_ids.add(normalized_id)
+                            series_ids.append(normalized_id)
             self._progress(
                 job_id,
                 phase=f"{kind}_lists",
@@ -386,6 +397,55 @@ class ProviderCatalogSyncWorker:
         if list_error:
             raise list_error
 
+        if series_ids:
+            self._progress(
+                job_id,
+                phase="series_details",
+                total_series=len(series_ids),
+            )
+        for series_id in series_ids:
+            invalid_details = False
+            cache_state = "refreshed"
+            try:
+                details, cache_state = await self._fetch_action(
+                    account,
+                    "get_series_info",
+                    proxy_url,
+                    series_id=series_id,
+                )
+                parse_series_episodes(details)
+            except asyncio.CancelledError:
+                raise
+            except ValueError:
+                invalid_details = True
+                invalidate_provider_action_cache(
+                    account,
+                    "get_series_info",
+                    series_id=series_id,
+                )
+                logger.warning(
+                    "Provider returned invalid episode details for series %s "
+                    "in sync job %s.",
+                    series_id,
+                    job_id,
+                )
+            except Exception:
+                invalid_details = True
+                logger.warning(
+                    "Could not cache episode details for series %s in sync job %s.",
+                    series_id,
+                    job_id,
+                    exc_info=True,
+                )
+            self._progress(
+                job_id,
+                phase="series_details",
+                series_details_delta=1,
+                invalid_series_details_delta=int(invalid_details),
+                stale_delta=int(cache_state == "stale"),
+                cache_hits_delta=int(cache_state == "hit"),
+            )
+
         with SessionLocal() as db:
             job = db.get(ProviderCatalogSyncJob, job_id)
             if job and job.status == "RUNNING":
@@ -396,10 +456,11 @@ class ProviderCatalogSyncWorker:
                 db.commit()
         logger.info(
             "Provider catalog sync job %s completed catalog lists for account %s "
-            "(%s categories, up to %s concurrent requests); series details remain lazy-loaded",
+            "(%s categories, %s series details, up to %s concurrent list requests)",
             job_id,
             account_id,
             len(category_records),
+            len(series_ids),
             CATALOG_REQUEST_CONCURRENCY,
         )
 

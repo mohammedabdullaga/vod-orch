@@ -223,17 +223,26 @@ export default function ContentBrowser({
         setCategories(refreshedCategories);
       }
       const { data: started } = await api.post("/content/items/browse", {
-          type,
-          account_id: Number(sourceAccountId),
-          category_ids: [...selectedCategories],
-          proxy_id: providerProxyId ? Number(providerProxyId) : 0,
-          refresh: forceRefresh,
+        type,
+        account_id: Number(sourceAccountId),
+        category_ids: [...selectedCategories],
+        proxy_id: providerProxyId ? Number(providerProxyId) : 0,
+        refresh: forceRefresh,
       });
-      setNotice("Loading provider titles and checking the storage inventory…");
+      setNotice("Loading provider titles…");
       let browseStatus;
+      let providerResultsShown = false;
       do {
         await new Promise((resolve) => window.setTimeout(resolve, 1200));
         ({ data: browseStatus } = await api.get(`/content/items/browse/${started.job_id}`));
+        if (browseStatus.items) {
+          setItems(browseStatus.items);
+          setInventoryFilter("all");
+          if (!providerResultsShown && browseStatus.status === "RUNNING") {
+            setNotice("Provider titles loaded; checking the storage inventory…");
+            providerResultsShown = true;
+          }
+        }
       } while (browseStatus.status === "RUNNING");
       if (browseStatus.status !== "COMPLETED") {
         throw new Error(

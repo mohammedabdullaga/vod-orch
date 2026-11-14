@@ -152,6 +152,7 @@ async def cached_provider_action(
     *,
     proxy_url: str | None = None,
     force_refresh: bool = False,
+    respect_series_details_rate_limit: bool = True,
     **params: Any,
 ) -> tuple[Any, str]:
     provider_url = account.provider_url.rstrip("/")
@@ -193,7 +194,7 @@ async def cached_provider_action(
             return cached_payload, "hit"
 
     try:
-        if action == "get_series_info":
+        if action == "get_series_info" and respect_series_details_rate_limit:
             global _last_series_details_request_at
             async with _series_details_lock:
                 loop = asyncio.get_running_loop()

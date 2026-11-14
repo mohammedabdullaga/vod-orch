@@ -8,7 +8,7 @@ import time
 import uuid
 from collections import defaultdict
 from pathlib import PurePosixPath
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -108,6 +108,7 @@ async def _request_provider(
     *,
     proxy_url: str | None = None,
     force_refresh: bool = False,
+    respect_series_details_rate_limit: bool = True,
     response: Response | None = None,
     **params: Any,
 ) -> Any:
@@ -117,6 +118,7 @@ async def _request_provider(
             action,
             proxy_url=proxy_url,
             force_refresh=force_refresh,
+            respect_series_details_rate_limit=respect_series_details_rate_limit,
             **params,
         )
         if response is not None and (
@@ -936,6 +938,10 @@ async def _run_content_browse_job(
             payload.account_id,
             payload.proxy_id,
             payload.refresh,
+            on_provider_items=lambda items: job.update(
+                items=[dict(item) for item in items],
+                phase="checking_storage",
+            ),
         )
         job["status"] = "COMPLETED"
     except HTTPException as exc:
@@ -979,6 +985,7 @@ async def start_content_browse(
     job_id = uuid.uuid4().hex
     job = {
         "status": "RUNNING",
+        "phase": "loading_provider",
         "items": None,
         "error": None,
         "created_at": time.monotonic(),
@@ -1007,9 +1014,10 @@ def get_content_browse_status(job_id: str) -> dict[str, Any]:
             detail="Browse request expired or is no longer available. Start browsing again.",
         )
     result: dict[str, Any] = {"job_id": job_id, "status": job["status"]}
-    if job["status"] == "COMPLETED":
+    result["phase"] = job["phase"]
+    if job["items"] is not None:
         result["items"] = job["items"]
-    elif job["status"] == "FAILED":
+    if job["status"] == "FAILED":
         error = job["error"]
         result["error"] = error
     return result
@@ -1039,6 +1047,7 @@ async def _load_content_items(
     account_id: int | None,
     proxy_id: int | None,
     refresh: bool,
+    on_provider_items: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> list[dict[str, Any]]:
     kind, _, items_action = _provider_kind(type)
     if not ids or len(ids) > 50:
@@ -1133,6 +1142,9 @@ async def _load_content_items(
                 "year": _media_year(row),
                 "container_ext": safe_extension(str(row.get("container_extension") or "mkv")),
             })
+
+    if on_provider_items is not None:
+        on_provider_items(result)
 
     with SessionLocal() as db:
         states = {
@@ -1265,6 +1277,7 @@ async def get_series_details(
         "get_series_info",
         proxy_url=proxy_url,
         force_refresh=refresh,
+        respect_series_details_rate_limit=False,
         response=response,
         series_id=series_id,
     )

@@ -750,7 +750,13 @@ function App() {
                     <span>Connection: {job.proxy_id ? `Proxy #${job.proxy_id}` : "Direct"}</span>
                     <span>{job.categories_processed} categories</span>
                     <span>{job.lists_processed} lists · {job.cached_items} titles</span>
-                    <span>Series episode details load when browsed</span>
+                    <span>
+                      Episodes cached: {job.series_details_processed || 0}
+                      {job.total_series_details ? ` / ${job.total_series_details}` : ""}
+                    </span>
+                    {job.invalid_series_details > 0 && <span className="text-amber-300">
+                      {job.invalid_series_details} series detail request(s) failed
+                    </span>}
                     <span>Sync worker: {job.worker_running ? "running" : "starting"}</span>
                     {job.active_job_id && <span>
                       {job.status === "PENDING" && job.active_job_id !== job.job_id
@@ -795,7 +801,7 @@ function App() {
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320] lg:col-span-2">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-5 py-4"><div className="flex items-center gap-2"><Clapperboard size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Xtream catalog cache</h2><p className="text-xs text-slate-500">Catalog syncs run on the VPS and persist provider categories, titles, and episode mappings in SQLite.</p></div></div><button type="button" onClick={clearCatalogSyncData} disabled={busy} className="inline-flex items-center gap-1.5 rounded-lg border border-rose-400/30 px-3 py-2 text-xs font-medium text-rose-200 hover:bg-rose-500/10 disabled:opacity-40"><Trash2 size={13} />Clear all sync data</button></div>
-            <p className="p-5 text-xs leading-5 text-slate-400">Profiles group credentials by provider host and coordinate one sync at a time, but cached catalogs are isolated by username so account-specific IDs are not reused across credentials. Choose direct or an enabled proxy for each sync. A sync attempt uses one account; retrying a failed sync selects the next enabled, not-yet-tried credential in that profile and keeps the selected connection route. Category and title lists are fetched concurrently (up to four requests); series episode details load on demand when you browse a series, rather than delaying the catalog sync. Stop cancels the active provider request before reporting completion. Clear all sync data stops active syncs, then removes provider catalog caches and sync history across all profiles; accounts, monitored categories, queued downloads, and media files are preserved. The next sync or browse requests fresh provider data.</p>
+            <p className="p-5 text-xs leading-5 text-slate-400">Profiles group credentials by provider host and coordinate one sync at a time, but cached catalogs are isolated by username so account-specific IDs are not reused across credentials. Choose direct or an enabled proxy for each sync. A sync attempt uses one account; retrying a failed sync selects the next enabled, not-yet-tried credential in that profile and keeps the selected connection route. Category and title lists are fetched concurrently (up to four requests), then sync caches each series' episode details and reports progress. This background sync is not required for browsing; interactive series details bypass the background-sync throttle. Stop cancels the active provider request before reporting completion. Clear all sync data stops active syncs, then removes provider catalog caches and sync history across all profiles; accounts, monitored categories, queued downloads, and media files are preserved. The next sync or browse requests fresh provider data.</p>
           </section>
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
             <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Gauge size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Proxy pool</h2><p className="text-xs text-slate-500">Proxy URLs are encrypted at rest</p></div></div>
