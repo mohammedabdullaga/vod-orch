@@ -189,39 +189,50 @@ class ProviderCatalogSyncWorker:
 
     async def _run(self) -> None:
         while not self._stopping.is_set():
-            if self._clearing_data:
-                self._wake_event.clear()
-                if self._clearing_data:
-                    await self._wake_event.wait()
-                continue
-            job_id = self._claim_next()
-            if job_id is not None:
-                process_task = asyncio.create_task(
-                    self._process(job_id),
-                    name=f"provider-catalog-sync-{job_id}",
-                )
-                self._active_job_id = job_id
-                self._active_job_task = process_task
-                try:
-                    await process_task
-                except asyncio.CancelledError:
-                    if asyncio.current_task() and asyncio.current_task().cancelling():
-                        raise
-                    self._finish_cancelled(job_id)
-                except Exception as exc:
-                    logger.exception("Provider catalog sync job %s crashed", job_id)
-                    self._finish_failed(job_id, self._safe_error(exc))
-                finally:
-                    self._active_job_id = None
-                    self._active_job_task = None
-                continue
-            self._wake_event.clear()
-            if self._stopping.is_set():
-                break
             try:
-                await asyncio.wait_for(self._wake_event.wait(), timeout=1)
-            except asyncio.TimeoutError:
-                pass
+                if self._clearing_data:
+                    self._wake_event.clear()
+                    if self._clearing_data:
+                        await self._wake_event.wait()
+                    continue
+                job_id = self._claim_next()
+                if job_id is not None:
+                    process_task = asyncio.create_task(
+                        self._process(job_id),
+                        name=f"provider-catalog-sync-{job_id}",
+                    )
+                    self._active_job_id = job_id
+                    self._active_job_task = process_task
+                    try:
+                        await process_task
+                    except asyncio.CancelledError:
+                        if asyncio.current_task() and asyncio.current_task().cancelling():
+                            raise
+                        self._finish_cancelled(job_id)
+                    except Exception as exc:
+                        logger.exception("Provider catalog sync job %s crashed", job_id)
+                        self._finish_failed(job_id, self._safe_error(exc))
+                    finally:
+                        self._active_job_id = None
+                        self._active_job_task = None
+                    continue
+                self._wake_event.clear()
+                if self._stopping.is_set():
+                    break
+                try:
+                    await asyncio.wait_for(self._wake_event.wait(), timeout=1)
+                except asyncio.TimeoutError:
+                    pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Provider catalog sync worker loop failed; retrying shortly."
+                )
+                try:
+                    await asyncio.wait_for(self._wake_event.wait(), timeout=1)
+                except asyncio.TimeoutError:
+                    pass
 
     @staticmethod
     def _claim_next() -> int | None:
