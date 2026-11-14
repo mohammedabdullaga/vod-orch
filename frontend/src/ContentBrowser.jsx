@@ -222,22 +222,32 @@ export default function ContentBrowser({
         });
         setCategories(refreshedCategories);
       }
-      const { data } = await api.get("/content/items", {
-        params: {
+      const { data: started } = await api.post("/content/items/browse", {
           type,
-          account_id: sourceAccountId,
-          category_ids: [...selectedCategories].join(","),
+          account_id: Number(sourceAccountId),
+          category_ids: [...selectedCategories],
           proxy_id: providerProxyId ? Number(providerProxyId) : 0,
           refresh: forceRefresh,
-        },
       });
-      setItems(data);
+      setNotice("Loading provider titles and checking the storage inventory…");
+      let browseStatus;
+      do {
+        await new Promise((resolve) => window.setTimeout(resolve, 1200));
+        ({ data: browseStatus } = await api.get(`/content/items/browse/${started.job_id}`));
+      } while (browseStatus.status === "RUNNING");
+      if (browseStatus.status !== "COMPLETED") {
+        throw new Error(
+          browseStatus.error?.detail || "Content browsing failed. Check the provider and storage connection.",
+        );
+      }
+      const items = browseStatus.items;
+      setItems(items);
       setInventoryFilter("all");
-      const missing = data.filter((item) => item.download_status === "missing").length;
-      const partial = data.filter((item) => item.download_status === "partial").length;
-      const unknown = data.filter((item) => item.download_status === "unknown").length;
+      const missing = items.filter((item) => item.download_status === "missing").length;
+      const partial = items.filter((item) => item.download_status === "partial").length;
+      const unknown = items.filter((item) => item.download_status === "unknown").length;
       setNotice(
-        `Loaded ${data.length} ${type === "series" ? "series" : "movies"}; `
+        `Loaded ${items.length} ${type === "series" ? "series" : "movies"}; `
         + `${missing} not found · ${partial} incomplete${unknown ? ` · ${unknown} storage status${unknown === 1 ? "" : "es"} unavailable` : ""}.`
       );
     } catch (error) {

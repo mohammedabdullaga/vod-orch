@@ -4,6 +4,8 @@ import json
 import logging
 import re
 import shlex
+import time
+import uuid
 from collections import defaultdict
 from pathlib import PurePosixPath
 from typing import Any, Literal
@@ -55,6 +57,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/content", tags=["content"])
 queue_router = APIRouter(prefix="/api/queue", tags=["queue"])
 playlist_router = APIRouter(prefix="/api/playlists", tags=["playlists"])
+
+_CONTENT_BROWSE_JOB_TTL_SECONDS = 900
+_CONTENT_BROWSE_JOB_LIMIT = 4
+_CONTENT_BROWSE_REQUEST_CONCURRENCY = 8
+_content_browse_jobs: dict[str, dict[str, Any]] = {}
 
 
 def _provider_account(account_id: int | None) -> Account:
@@ -184,6 +191,14 @@ class CatalogSyncRequest(BaseModel):
 
 class CatalogSyncRetryRequest(BaseModel):
     proxy_id: int | None = Field(default=None, ge=0)
+
+
+class ContentBrowseRequest(BaseModel):
+    type: Literal["series", "movie"]
+    category_ids: list[str] = Field(min_length=1, max_length=50)
+    account_id: int | None = Field(default=None, ge=1)
+    proxy_id: int | None = Field(default=None, ge=0)
+    refresh: bool = False
 
 
 def _playlist_category_id(playlist_id: int, group_title: str) -> str:
@@ -875,6 +890,112 @@ async def get_content_categories(
     return result
 
 
+def _prune_content_browse_jobs() -> None:
+    now = time.monotonic()
+    expired = [
+        job_id
+        for job_id, job in _content_browse_jobs.items()
+        if job["status"] != "RUNNING"
+        and now - job["created_at"] > _CONTENT_BROWSE_JOB_TTL_SECONDS
+    ]
+    for job_id in expired:
+        del _content_browse_jobs[job_id]
+
+
+async def _run_content_browse_job(
+    job_id: str,
+    request: Request,
+    payload: ContentBrowseRequest,
+) -> None:
+    job = _content_browse_jobs[job_id]
+    try:
+        job["items"] = await _load_content_items(
+            request,
+            Response(),
+            payload.type,
+            payload.category_ids,
+            payload.account_id,
+            payload.proxy_id,
+            payload.refresh,
+        )
+        job["status"] = "COMPLETED"
+    except HTTPException as exc:
+        job["error"] = {"status_code": exc.status_code, "detail": exc.detail}
+        job["status"] = "FAILED"
+    except asyncio.CancelledError:
+        job["error"] = {
+            "status_code": 503,
+            "detail": "Content browse was interrupted by a backend restart. Start browsing again.",
+        }
+        job["status"] = "FAILED"
+        raise
+    except Exception as exc:
+        logger.exception("Content browse job %s failed", job_id)
+        job["error"] = {
+            "status_code": 500,
+            "detail": f"Content browse failed ({type(exc).__name__}). Check backend logs.",
+        }
+        job["status"] = "FAILED"
+    finally:
+        job["updated_at"] = time.monotonic()
+
+
+@router.post("/items/browse", status_code=202)
+async def start_content_browse(
+    payload: ContentBrowseRequest,
+    request: Request,
+) -> dict[str, str]:
+    ids = list(dict.fromkeys(category_id.strip() for category_id in payload.category_ids if category_id.strip()))
+    if not ids:
+        raise HTTPException(status_code=422, detail="Select at least one category to browse.")
+    _prune_content_browse_jobs()
+    active_jobs = sum(
+        job["status"] == "RUNNING" for job in _content_browse_jobs.values()
+    )
+    if active_jobs >= _CONTENT_BROWSE_JOB_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail="The content browser is busy with other requests. Wait briefly and try again.",
+        )
+    job_id = uuid.uuid4().hex
+    job = {
+        "status": "RUNNING",
+        "items": None,
+        "error": None,
+        "created_at": time.monotonic(),
+        "updated_at": time.monotonic(),
+    }
+    _content_browse_jobs[job_id] = job
+    task = asyncio.create_task(
+        _run_content_browse_job(
+            job_id,
+            request,
+            payload.model_copy(update={"category_ids": ids}),
+        ),
+        name=f"content-browse-{job_id}",
+    )
+    job["task"] = task
+    return {"job_id": job_id, "status": "RUNNING"}
+
+
+@router.get("/items/browse/{job_id}")
+def get_content_browse_status(job_id: str) -> dict[str, Any]:
+    _prune_content_browse_jobs()
+    job = _content_browse_jobs.get(job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail="Browse request expired or is no longer available. Start browsing again.",
+        )
+    result: dict[str, Any] = {"job_id": job_id, "status": job["status"]}
+    if job["status"] == "COMPLETED":
+        result["items"] = job["items"]
+    elif job["status"] == "FAILED":
+        error = job["error"]
+        result["error"] = error
+    return result
+
+
 @router.get("/items")
 async def get_content_items(
     request: Request,
@@ -885,8 +1006,22 @@ async def get_content_items(
     proxy_id: int | None = Query(default=None, ge=0),
     refresh: bool = Query(default=False),
 ) -> list[dict[str, Any]]:
-    kind, _, items_action = _provider_kind(type)
     ids = list(dict.fromkeys(part.strip() for part in category_ids.split(",") if part.strip()))
+    return await _load_content_items(
+        request, response, type, ids, account_id, proxy_id, refresh
+    )
+
+
+async def _load_content_items(
+    request: Request,
+    response: Response,
+    type: Literal["series", "movie"],
+    ids: list[str],
+    account_id: int | None,
+    proxy_id: int | None,
+    refresh: bool,
+) -> list[dict[str, Any]]:
+    kind, _, items_action = _provider_kind(type)
     if not ids or len(ids) > 50:
         raise HTTPException(status_code=422, detail="Select between 1 and 50 category IDs.")
     account = _provider_account(account_id)
@@ -912,20 +1047,34 @@ async def get_content_items(
     if unknown_ids:
         raise HTTPException(status_code=404, detail=f"Unknown provider category IDs: {', '.join(unknown_ids)}")
 
-    result: list[dict[str, Any]] = []
-    seen_item_ids: set[str] = set()
-    for category_id in ids:
-        rows = _provider_rows(
-            await _request_provider(
+    semaphore = asyncio.Semaphore(_CONTENT_BROWSE_REQUEST_CONCURRENCY)
+
+    async def fetch_category_items(category_id: str) -> list[dict[str, Any]]:
+        async with semaphore:
+            response_rows = await _request_provider(
                 account,
                 items_action,
                 proxy_url=proxy_url,
                 force_refresh=refresh,
                 response=response,
                 category_id=category_id,
-            ),
-            items_action,
-        )
+            )
+        return _provider_rows(response_rows, items_action)
+
+    category_results = await asyncio.gather(
+        *(fetch_category_items(category_id) for category_id in ids),
+        return_exceptions=True,
+    )
+    category_error = next(
+        (value for value in category_results if isinstance(value, BaseException)),
+        None,
+    )
+    if category_error:
+        raise category_error
+
+    result: list[dict[str, Any]] = []
+    seen_item_ids: set[str] = set()
+    for category_id, rows in zip(ids, category_results):
         for row in rows:
             item_id = _provider_item_id(row, kind)
             if item_id is None:
