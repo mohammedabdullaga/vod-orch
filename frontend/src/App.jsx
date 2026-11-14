@@ -435,6 +435,15 @@ function App() {
     () => api.post(`/content/catalog-sync/${jobId}/stop`),
     "Catalog sync stopped.",
   );
+  const forceStopCatalogSync = (jobId) => {
+    if (!window.confirm(
+      "Force-stop this catalog sync task? The API service stays online; only this sync task is cancelled.",
+    )) return;
+    act(
+      () => api.post(`/content/catalog-sync/${jobId}/force-stop`),
+      "Catalog sync task force-stopped.",
+    );
+  };
   const clearCatalogSyncData = () => {
     if (!window.confirm(
       "Stop any running catalog syncs and clear all provider catalog caches and sync history? Accounts, monitored categories, queued downloads, and saved media will not be deleted. The next sync or browse will fetch provider data again.",
@@ -717,6 +726,12 @@ function App() {
                       {syncing ? <XCircle size={13} /> : <RefreshCw size={13} />}
                       {stopping ? "Stopping…" : syncing ? "Stop sync" : syncAccount ? "Sync profile catalog" : "No enabled account"}
                     </button>
+                    {syncing && <button type="button" disabled={busy} onClick={() => forceStopCatalogSync(job.job_id)} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-rose-800/70 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-950/40 disabled:opacity-40">
+                      <XCircle size={13} />Force stop
+                    </button>}
+                    {job?.active_job_id && job.active_job_id !== job.job_id && <button type="button" disabled={busy} onClick={() => forceStopCatalogSync(job.active_job_id)} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-rose-800/70 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-950/40 disabled:opacity-40">
+                      <XCircle size={13} />Stop active #{job.active_job_id}
+                    </button>}
                     {job?.status === "FAILED" && <button type="button" disabled={busy} onClick={() => retryCatalogSync(job.job_id, profile.provider_url)} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-400/30 px-2.5 py-1.5 text-xs text-amber-200 hover:bg-amber-500/10 disabled:opacity-40">
                       <RefreshCw size={13} />Retry with next account
                     </button>}
@@ -736,8 +751,15 @@ function App() {
                     <span>{job.categories_processed} categories</span>
                     <span>{job.lists_processed} lists · {job.cached_items} titles</span>
                     <span>Series episode details load when browsed</span>
+                    <span>Sync worker: {job.worker_running ? "running" : "starting"}</span>
+                    {job.active_job_id && <span>
+                      {job.status === "PENDING" && job.active_job_id !== job.job_id
+                        ? `Queued behind sync #${job.active_job_id}`
+                        : `Active sync #${job.active_job_id}`}
+                    </span>}
                     {job.cache_hits > 0 && <span>{job.cache_hits} cached responses reused</span>}
                   </div>
+                  {job.last_worker_error && <p className="mt-1 text-amber-300">Last sync worker error: {job.last_worker_error}. The worker will retry automatically.</p>}
                   {job.stale_responses > 0 && <p className="mt-1 text-amber-300">{job.stale_responses} refresh requests used stale cached data after provider/proxy errors.</p>}
                   {job.error && <p className="mt-1 text-rose-300">{job.error}</p>}
                 </div>}

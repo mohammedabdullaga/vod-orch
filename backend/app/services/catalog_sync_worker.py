@@ -40,6 +40,7 @@ class ProviderCatalogSyncWorker:
         self._stopping = asyncio.Event()
         self._wake_event = asyncio.Event()
         self._clearing_data = False
+        self._last_worker_error: str | None = None
 
     @property
     def clearing_data(self) -> bool:
@@ -85,9 +86,31 @@ class ProviderCatalogSyncWorker:
                 pass
 
     def wake(self) -> None:
+        self.ensure_running()
         self._wake_event.set()
 
-    async def stop_job(self, job_id: int) -> str:
+    def ensure_running(self) -> bool:
+        if self._stopping.is_set():
+            return False
+        if self._task is None or self._task.done():
+            if self._task and not self._task.cancelled():
+                error = self._task.exception()
+                if error:
+                    logger.error("Catalog sync worker stopped unexpectedly: %s", error)
+            self._task = asyncio.create_task(
+                self._run(), name="provider-catalog-sync-worker"
+            )
+            logger.warning("Started or restarted the provider catalog sync worker.")
+        return True
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "worker_running": self._task is not None and not self._task.done(),
+            "active_job_id": self._active_job_id,
+            "last_worker_error": self._last_worker_error,
+        }
+
+    async def stop_job(self, job_id: int, *, force: bool = False) -> str:
         task = None
         with SessionLocal() as db:
             job = db.get(ProviderCatalogSyncJob, job_id)
@@ -122,14 +145,26 @@ class ProviderCatalogSyncWorker:
                 return job.status
 
         if task and not task.done():
-            try:
-                await asyncio.wait_for(task, timeout=15)
-            except asyncio.CancelledError:
-                pass
-            except asyncio.TimeoutError as exc:
-                raise RuntimeError(
-                    "Catalog sync did not stop within 15 seconds; clear was not performed."
-                ) from exc
+            if force:
+                done, _ = await asyncio.wait({task}, timeout=3)
+                if not done:
+                    task.cancel()
+                    done, _ = await asyncio.wait({task}, timeout=2)
+                    if not done:
+                        raise RuntimeError(
+                            "Catalog sync task did not stop after repeated cancellation. "
+                            "The API service was left running; inspect backend logs."
+                        )
+            else:
+                try:
+                    await asyncio.wait_for(task, timeout=15)
+                except asyncio.CancelledError:
+                    pass
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError(
+                        "Catalog sync did not stop within 15 seconds; "
+                        "the API service was left running."
+                    ) from exc
         self._finish_cancelled(job_id)
         with SessionLocal() as db:
             job = db.get(ProviderCatalogSyncJob, job_id)
@@ -225,7 +260,8 @@ class ProviderCatalogSyncWorker:
                     pass
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                self._last_worker_error = type(exc).__name__
                 logger.exception(
                     "Provider catalog sync worker loop failed; retrying shortly."
                 )

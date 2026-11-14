@@ -286,7 +286,10 @@ def _catalog_sync_job_json(
 
 
 @router.get("/catalog-sync")
-def get_latest_catalog_sync_status() -> list[dict[str, Any]]:
+async def get_latest_catalog_sync_status(request: Request) -> list[dict[str, Any]]:
+    worker = request.app.state.catalog_sync_worker
+    worker.ensure_running()
+    worker_health = worker.health()
     with SessionLocal() as db:
         latest_job_ids = (
             select(func.max(ProviderCatalogSyncJob.id).label("job_id"))
@@ -301,7 +304,10 @@ def get_latest_catalog_sync_status() -> list[dict[str, Any]]:
             .order_by(ProviderCatalogSyncJob.account_id)
         ).all()
         return [
-            _catalog_sync_job_json(job, provider_url)
+            {
+                **_catalog_sync_job_json(job, provider_url),
+                **worker_health,
+            }
             for job, provider_url in jobs
         ]
 
@@ -321,6 +327,19 @@ def get_catalog_sync_status(job_id: int) -> dict[str, Any]:
 async def stop_catalog_sync(job_id: int, request: Request) -> dict[str, Any]:
     try:
         status = await request.app.state.catalog_sync_worker.stop_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    return {"job_id": job_id, "status": status}
+
+
+@router.post("/catalog-sync/{job_id}/force-stop")
+async def force_stop_catalog_sync(job_id: int, request: Request) -> dict[str, Any]:
+    try:
+        status = await request.app.state.catalog_sync_worker.stop_job(
+            job_id, force=True
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RuntimeError as exc:
