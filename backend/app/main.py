@@ -4,14 +4,13 @@ import json
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import PurePosixPath
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from pydantic import BaseModel, Field, HttpUrl
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from starlette.responses import JSONResponse, StreamingResponse
 
@@ -31,19 +30,17 @@ from app.models import (
     Account,
     AppSettings,
     M3UPlaylist,
-    MonitoredCategory,
     Node,
     Proxy,
+    ProviderProfileCatalogCache,
+    ProviderProfileCatalogCategory,
+    ProviderProfileCatalogItem,
+    ProviderProfileMonitoredCategory,
     QueueItem,
     SessionLocal,
     StorageRoute,
     init_db,
     utc_now,
-)
-from app.services.provider_client import (
-    cached_provider_action,
-    resolve_provider_proxy,
-    resolve_provider_proxy_selection,
 )
 from app.services.content_paths import validate_remote_path
 from app.security import decrypt_secret, encrypt_secret, mask_secret
@@ -217,6 +214,11 @@ class AccountCreate(BaseModel):
     user_agent: str = Field(default="Mozilla", max_length=1024)
 
 
+class ProviderProfileDelete(BaseModel):
+    provider_url: str = Field(min_length=8, max_length=2048)
+    clear_catalog: Literal[True]
+
+
 class ProxyCreate(BaseModel):
     url: str = Field(min_length=8, max_length=2048)
 
@@ -230,6 +232,7 @@ class ProviderProxyUpdate(BaseModel):
 
 
 class CategoryToggle(BaseModel):
+    provider_url: str = Field(min_length=8, max_length=2048)
     category_id: str = Field(min_length=1, max_length=255)
     name: str = Field(min_length=1, max_length=512)
     kind: Literal["series", "vod"]
@@ -339,60 +342,88 @@ def get_status():
 @app.get("/api/categories")
 async def get_categories(
     response: Response,
+    provider_url: str | None = Query(default=None, min_length=8, max_length=2048),
     proxy_id: int | None = Query(default=None, ge=0),
     refresh: bool = Query(default=False),
 ):
+    normalized_provider_url = provider_url.rstrip("/") if provider_url else None
     with SessionLocal() as db:
-        account = db.scalar(select(Account).where(Account.enabled.is_(True)).order_by(Account.id).limit(1))
-        states = {
-            (item.kind, item.category_id): item
-            for item in db.scalars(select(MonitoredCategory)).all()
-        }
+        account_query = select(Account).where(Account.enabled.is_(True))
+        if normalized_provider_url:
+            account_query = account_query.where(
+                Account.provider_url == normalized_provider_url
+            )
+        account = db.scalar(account_query.order_by(Account.id).limit(1))
     if not account:
         raise HTTPException(status_code=409, detail="Add an enabled provider account first.")
-    try:
-        proxy_url = resolve_provider_proxy_selection(proxy_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    try:
-        result = []
-        for kind, action in (("series", "get_series_categories"), ("vod", "get_vod_categories")):
-            rows, cache_state = await cached_provider_action(
-                account,
-                action,
-                proxy_url=proxy_url,
-                force_refresh=refresh,
+    with SessionLocal() as db:
+        catalog_rows = db.scalars(
+            select(ProviderProfileCatalogCategory).where(
+                ProviderProfileCatalogCategory.provider_url == account.provider_url
             )
-            if (
-                response.headers.get("X-Provider-Catalog-Cache") != "stale"
-                or cache_state == "stale"
-            ):
-                response.headers["X-Provider-Catalog-Cache"] = cache_state
-            for row in rows:
-                category_id = str(row.get("category_id", row.get("id", "")))
-                state = states.get((kind, category_id))
-                result.append({
-                    "category_id": category_id, "name": row.get("category_name", row.get("name", "Unknown")),
-                    "kind": kind, "monitored": bool(state.monitored) if state else False,
-                    "destination_path": state.destination_path if state else None,
-                    "match_existing_series": bool(state.match_existing_series) if state else False,
-                    "strip_prefixes": state.strip_prefixes if state else "",
-                })
-        return result
-    except Exception as exc:
-        logger.error("Could not fetch provider categories (%s)", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Provider category request failed.") from exc
+            .order_by(
+                ProviderProfileCatalogCategory.kind,
+                ProviderProfileCatalogCategory.category_name,
+            )
+        ).all()
+        states = {
+            (item.kind, item.category_id): item
+            for item in db.scalars(
+                select(ProviderProfileMonitoredCategory).where(
+                    ProviderProfileMonitoredCategory.provider_url == account.provider_url
+                )
+            ).all()
+        }
+    if not catalog_rows:
+        raise HTTPException(
+            status_code=409,
+            detail="This profile has no local catalog yet. Run Sync catalog from Settings first.",
+        )
+    result = []
+    for row in catalog_rows:
+        state = states.get((row.kind, row.category_id))
+        result.append({
+            "provider_url": account.provider_url,
+            "category_id": row.category_id,
+            "name": row.category_name,
+            "kind": row.kind,
+            "monitored": bool(state.monitored) if state else False,
+            "destination_path": state.destination_path if state else None,
+            "match_existing_series": bool(state.match_existing_series) if state else False,
+            "strip_prefixes": state.strip_prefixes if state else "",
+        })
+    return result
 
 
 @app.post("/api/categories/toggle")
 def toggle_category(payload: CategoryToggle):
+    provider_url = payload.provider_url.rstrip("/")
     with SessionLocal() as db:
-        item = db.scalar(select(MonitoredCategory).where(
-            MonitoredCategory.category_id == payload.category_id,
-            MonitoredCategory.kind == payload.kind,
+        if not db.scalar(select(Account.id).where(Account.provider_url == provider_url).limit(1)):
+            raise HTTPException(status_code=404, detail="Provider profile not found.")
+        if not db.scalar(
+            select(ProviderProfileCatalogCategory.id).where(
+                ProviderProfileCatalogCategory.provider_url == provider_url,
+                ProviderProfileCatalogCategory.category_id == payload.category_id,
+                ProviderProfileCatalogCategory.kind == payload.kind,
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Category is not in the profile's local catalog. Sync the profile and try again.",
+            )
+        item = db.scalar(select(ProviderProfileMonitoredCategory).where(
+            ProviderProfileMonitoredCategory.provider_url == provider_url,
+            ProviderProfileMonitoredCategory.category_id == payload.category_id,
+            ProviderProfileMonitoredCategory.kind == payload.kind,
         ))
         if not item:
-            item = MonitoredCategory(category_id=payload.category_id, name=payload.name, kind=payload.kind)
+            item = ProviderProfileMonitoredCategory(
+                provider_url=provider_url,
+                category_id=payload.category_id,
+                name=payload.name,
+                kind=payload.kind,
+            )
             db.add(item)
         item.name = payload.name
         item.kind = payload.kind
@@ -829,9 +860,11 @@ def cleanup_failed_queue_item(item_id: int):
             )
         category = (
             db.scalar(
-                select(MonitoredCategory).where(
-                    MonitoredCategory.kind == item.kind,
-                    MonitoredCategory.category_id == item.category_id,
+                select(ProviderProfileMonitoredCategory).where(
+                    ProviderProfileMonitoredCategory.provider_url
+                    == item.source_provider_url,
+                    ProviderProfileMonitoredCategory.kind == item.kind,
+                    ProviderProfileMonitoredCategory.category_id == item.category_id,
                 )
             )
             if item.category_id and not (item.source_provider_url or "").startswith("m3u:")
@@ -932,7 +965,7 @@ def get_account_availability(
         accounts_query = select(Account).order_by(Account.id)
         if source_account:
             accounts_query = accounts_query.where(
-                Account.id == source_account.id
+                Account.provider_url == source_account.provider_url
             )
         accounts = db.scalars(accounts_query).all()
         account_ids = [account.id for account in accounts]
@@ -1027,6 +1060,16 @@ async def delete_account(account_id: int, request: Request):
         account = db.get(Account, account_id)
         if not account:
             raise HTTPException(status_code=404, detail="Account not found.")
+        profile_account_count = db.scalar(
+            select(func.count(Account.id)).where(
+                Account.provider_url == account.provider_url
+            )
+        ) or 0
+        if profile_account_count <= 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Delete the provider profile to remove its last credential and clear the catalog.",
+            )
         active = db.scalar(select(func.count(QueueItem.id)).where(
             QueueItem.account_id == account_id,
             QueueItem.status.in_(("DOWNLOADING", "VERIFYING", "CANCELLING")),
@@ -1037,6 +1080,43 @@ async def delete_account(account_id: int, request: Request):
                 detail="This account has an active download. Stop or wait for it to finish before deleting the account.",
             )
         provider_url = account.provider_url
+        remaining_account_ids = set(
+            db.scalars(
+                select(Account.id).where(
+                    Account.provider_url == provider_url,
+                    Account.id != account_id,
+                    Account.enabled.is_(True),
+                )
+            ).all()
+        )
+        pending_items = db.scalars(
+            select(QueueItem).where(
+                func.rtrim(QueueItem.source_provider_url, "/") == provider_url,
+                QueueItem.status.in_(("PENDING", "FAILED")),
+            )
+        ).all()
+        for item in pending_items:
+            try:
+                eligible_ids = {
+                    int(value)
+                    for value in json.loads(item.eligible_account_ids or "[]")
+                }
+            except (json.JSONDecodeError, TypeError, ValueError):
+                logger.error(
+                    "Could not update eligible accounts for queue item %s while deleting account %s.",
+                    item.id,
+                    account_id,
+                )
+                continue
+            if account_id not in eligible_ids:
+                continue
+            eligible_ids.discard(account_id)
+            if not eligible_ids:
+                eligible_ids = remaining_account_ids
+            item.eligible_account_ids = json.dumps(sorted(eligible_ids))
+            if item.account_id == account_id and item.status == "PENDING":
+                item.account_id = None
+        db.commit()
 
     await request.app.state.catalog_sync_worker.stop_profile(provider_url)
     with SessionLocal() as db:
@@ -1054,6 +1134,110 @@ async def delete_account(account_id: int, request: Request):
                 detail="Account could not be deleted because related records are still in use.",
             ) from exc
     return {"ok": True}
+
+
+@app.delete("/api/provider-profiles")
+async def delete_provider_profile(
+    payload: ProviderProfileDelete,
+    request: Request,
+):
+    provider_url = payload.provider_url.rstrip("/")
+    with SessionLocal() as db:
+        account_ids = list(
+            db.scalars(
+                select(Account.id).where(Account.provider_url == provider_url)
+            ).all()
+        )
+        if not account_ids:
+            raise HTTPException(status_code=404, detail="Provider profile not found.")
+        active = db.scalar(
+            select(func.count(QueueItem.id)).where(
+                QueueItem.status.in_(
+                    ("DOWNLOADING", "VERIFYING", "CANCELLING", "CLEANING")
+                ),
+                or_(
+                    func.rtrim(QueueItem.source_provider_url, "/") == provider_url,
+                    QueueItem.account_id.in_(account_ids),
+                    QueueItem.source_account_id.in_(account_ids),
+                ),
+            )
+        )
+        if active:
+            raise HTTPException(
+                status_code=409,
+                detail="This profile has active downloads. Stop or wait for them before deleting the profile.",
+            )
+        db.execute(
+            update(Account)
+            .where(Account.id.in_(account_ids))
+            .values(enabled=False)
+        )
+        db.commit()
+
+    await request.app.state.catalog_sync_worker.stop_profile(provider_url)
+    with SessionLocal() as db:
+        account_ids = list(
+            db.scalars(
+                select(Account.id).where(Account.provider_url == provider_url)
+            ).all()
+        )
+        if not account_ids:
+            raise HTTPException(status_code=404, detail="Provider profile not found.")
+        db.execute(
+            delete(QueueItem).where(
+                or_(
+                    func.rtrim(QueueItem.source_provider_url, "/") == provider_url,
+                    and_(
+                        QueueItem.source_provider_url.is_(None),
+                        or_(
+                            QueueItem.source_account_id.in_(account_ids),
+                            and_(
+                                QueueItem.source_account_id.is_(None),
+                                QueueItem.provider_stream_id.is_not(None),
+                                QueueItem.account_id.in_(account_ids),
+                            ),
+                        ),
+                    ),
+                )
+            )
+        )
+        db.execute(
+            delete(ProviderProfileCatalogCategory).where(
+                ProviderProfileCatalogCategory.provider_url == provider_url
+            )
+        )
+        db.execute(
+            delete(ProviderProfileCatalogItem).where(
+                ProviderProfileCatalogItem.provider_url == provider_url
+            )
+        )
+        db.execute(
+            delete(ProviderProfileCatalogCache).where(
+                ProviderProfileCatalogCache.provider_url == provider_url
+            )
+        )
+        db.execute(
+            delete(ProviderProfileMonitoredCategory).where(
+                ProviderProfileMonitoredCategory.provider_url == provider_url
+            )
+        )
+        db.execute(
+            delete(Account).where(Account.id.in_(account_ids))
+        )
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            logger.exception("Could not delete provider profile %s", provider_url)
+            raise HTTPException(
+                status_code=409,
+                detail="Profile data could not be cleared because related records are still in use.",
+            ) from exc
+    return {
+        "ok": True,
+        "deleted_accounts": len(account_ids),
+        "catalog_cleared": True,
+    }
 
 
 @app.get("/api/proxies")

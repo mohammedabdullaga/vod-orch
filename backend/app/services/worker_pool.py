@@ -13,6 +13,7 @@ from app.config import settings
 from app.models import (
     Account,
     MonitoredCategory,
+    ProviderProfileMonitoredCategory,
     Node,
     Proxy,
     QueueItem,
@@ -50,6 +51,16 @@ def _source_account_for_item(
         or (item.source_provider_url or "").startswith("m3u:")
     ):
         return None
+    if item.source_provider_url:
+        return next(
+            (
+                account
+                for account in accounts.values()
+                if account.provider_url.rstrip("/")
+                == item.source_provider_url.rstrip("/")
+            ),
+            None,
+        )
     try:
         stored_url = decrypt_secret(item.stream_url_encrypted)
     except RuntimeError as exc:
@@ -76,6 +87,21 @@ def _source_account_for_item(
                 account.id,
             )
     return None
+
+
+def _configured_eligible_account_ids(item: QueueItem) -> set[int] | None:
+    try:
+        values = json.loads(item.eligible_account_ids or "[]")
+        if not isinstance(values, list):
+            raise ValueError("eligible account IDs must be a list")
+        if not values:
+            return None
+        account_ids = {int(value) for value in values}
+        if any(account_id < 1 for account_id in account_ids):
+            raise ValueError("eligible account IDs must be positive")
+        return account_ids
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError("Queue item has invalid eligible-account configuration.") from exc
 
 
 class WorkerPool:
@@ -324,6 +350,16 @@ class WorkerPool:
             requeued = 0
             diagnosed = 0
             for item in pending:
+                try:
+                    configured_account_ids = _configured_eligible_account_ids(item)
+                except ValueError as exc:
+                    logger.error("%s Queue item %s.", exc, item.id)
+                    item.status = "FAILED"
+                    item.error = str(exc)
+                    item.retry_after = None
+                    item.updated_at = utc_now()
+                    diagnosed += 1
+                    continue
                 has_destination = (
                     item.kind in routed_kinds or item.destination_node_id is not None
                 )
@@ -344,11 +380,24 @@ class WorkerPool:
                     )
                     eligible_ids: set[int] = set()
                 elif item.source_account_id is not None:
-                    eligible_ids = (
-                        {item.source_account_id}
-                        if item.source_account_id in all_accounts
-                        else set()
-                    )
+                    source_account = all_accounts.get(item.source_account_id)
+                    if (
+                        item.provider_stream_id
+                        and item.source_provider_url
+                        and not item.source_provider_url.startswith("m3u:")
+                    ):
+                        eligible_ids = {
+                            account_id
+                            for account_id, candidate in all_accounts.items()
+                            if candidate.provider_url.rstrip("/")
+                            == item.source_provider_url.rstrip("/")
+                        }
+                    else:
+                        eligible_ids = (
+                            {item.source_account_id}
+                            if source_account is not None
+                            else set()
+                        )
                     reason = ""
                 elif item.source_provider_url and item.source_provider_url.startswith("m3u:"):
                     eligible_ids = set(all_accounts)
@@ -384,6 +433,8 @@ class WorkerPool:
                     }
                     reason = ""
 
+                if configured_account_ids is not None:
+                    eligible_ids &= configured_account_ids
                 if has_destination and not eligible_ids:
                     reason = (
                         "No enabled provider account matches this pending task; "
@@ -521,6 +572,21 @@ class WorkerPool:
             }
             candidate = None
             for item in candidates:
+                try:
+                    configured_account_ids = _configured_eligible_account_ids(item)
+                except ValueError as exc:
+                    logger.error("%s Queue item %s.", exc, item.id)
+                    item.status = "FAILED"
+                    item.error = str(exc)
+                    item.retry_after = None
+                    item.updated_at = now
+                    db.flush()
+                    continue
+                if (
+                    configured_account_ids is not None
+                    and account_id not in configured_account_ids
+                ):
+                    continue
                 if (
                     item.source_account_id is None
                     and item.provider_stream_id
@@ -538,31 +604,47 @@ class WorkerPool:
                     item.attempted_account_ids = "[]"
                     db.flush()
                 if item.source_account_id is not None:
-                    if item.account_id != item.source_account_id:
+                    same_provider_profile = (
+                        item.provider_stream_id is not None
+                        and item.source_provider_url is not None
+                        and not item.source_provider_url.startswith("m3u:")
+                        and account.provider_url.rstrip("/")
+                        == item.source_provider_url.rstrip("/")
+                    )
+                    if not same_provider_profile and account_id != item.source_account_id:
+                        continue
+                    if not same_provider_profile and item.account_id != item.source_account_id:
                         item.account_id = item.source_account_id
                         db.flush()
-                    if item.source_account_id != account_id:
+                    if not same_provider_profile and item.source_account_id != account_id:
                         continue
                 if item.account_id not in (None, account_id):
-                    assigned_account = db.get(Account, item.account_id)
-                    assigned_worker = self._workers.get(item.account_id)
-                    assigned_worker_available = (
-                        assigned_account is not None
-                        and assigned_account.enabled
-                        and assigned_worker is not None
-                        and not assigned_worker.done()
-                        and item.account_id not in self._busy_accounts
-                    )
-                    if assigned_worker_available:
-                        continue
-                    logger.warning(
-                        "Queue item %s was assigned to unavailable or busy account %s; "
-                        "releasing it for an eligible worker.",
-                        item.id,
-                        item.account_id,
-                    )
-                    item.account_id = None
-                    db.flush()
+                    if (
+                        configured_account_ids is not None
+                        and item.account_id not in configured_account_ids
+                    ):
+                        item.account_id = None
+                        db.flush()
+                    else:
+                        assigned_account = db.get(Account, item.account_id)
+                        assigned_worker = self._workers.get(item.account_id)
+                        assigned_worker_available = (
+                            assigned_account is not None
+                            and assigned_account.enabled
+                            and assigned_worker is not None
+                            and not assigned_worker.done()
+                            and item.account_id not in self._busy_accounts
+                        )
+                        if assigned_worker_available:
+                            continue
+                        logger.warning(
+                            "Queue item %s was assigned to unavailable or busy account %s; "
+                            "releasing it for an eligible worker.",
+                            item.id,
+                            item.account_id,
+                        )
+                        item.account_id = None
+                        db.flush()
                 if item.source_provider_url is None:
                     if item.provider_stream_id:
                         item.source_provider_url = account.provider_url
@@ -612,14 +694,29 @@ class WorkerPool:
                     continue
                 if account_id in attempted_account_ids:
                     if item.source_account_id is not None:
-                        eligible_account_ids = {
-                            item.source_account_id
-                        } if db.scalar(
-                            select(Account.id).where(
-                                Account.id == item.source_account_id,
-                                Account.enabled.is_(True),
+                        if (
+                            item.provider_stream_id
+                            and item.source_provider_url
+                            and not item.source_provider_url.startswith("m3u:")
+                        ):
+                            eligible_account_ids = set(
+                                db.scalars(
+                                    select(Account.id).where(
+                                        Account.enabled.is_(True),
+                                        Account.provider_url
+                                        == item.source_provider_url,
+                                    )
+                                ).all()
                             )
-                        ) is not None else set()
+                        else:
+                            eligible_account_ids = {
+                                item.source_account_id
+                            } if db.scalar(
+                                select(Account.id).where(
+                                    Account.id == item.source_account_id,
+                                    Account.enabled.is_(True),
+                                )
+                            ) is not None else set()
                     else:
                         eligible_query = select(Account.id).where(
                             Account.enabled.is_(True)
@@ -632,6 +729,8 @@ class WorkerPool:
                                 Account.provider_url == item.source_provider_url
                             )
                         eligible_account_ids = set(db.scalars(eligible_query).all())
+                    if configured_account_ids is not None:
+                        eligible_account_ids &= configured_account_ids
                     if eligible_account_ids - attempted_account_ids:
                         continue
                     attempted_account_ids.clear()
@@ -925,6 +1024,7 @@ class WorkerPool:
         released = 0
         for item in due:
             try:
+                configured_account_ids = _configured_eligible_account_ids(item)
                 attempted_account_ids = {
                     int(value)
                     for value in json.loads(item.attempted_account_ids or "[]")
@@ -937,7 +1037,16 @@ class WorkerPool:
                 item.updated_at = utc_now()
                 continue
             accounts_query = select(Account.id).where(Account.enabled.is_(True))
-            if item.source_account_id is not None:
+            if (
+                item.provider_stream_id
+                and item.source_provider_url
+                and not item.source_provider_url.startswith("m3u:")
+            ):
+                accounts_query = select(Account.id).where(
+                    Account.enabled.is_(True),
+                    Account.provider_url == item.source_provider_url,
+                )
+            elif item.source_account_id is not None:
                 accounts_query = select(Account.id).where(
                     Account.enabled.is_(True),
                     Account.id == item.source_account_id,
@@ -952,6 +1061,8 @@ class WorkerPool:
                 )
             eligible_accounts = list(db.scalars(accounts_query).all())
             available_account_ids = set(eligible_accounts)
+            if configured_account_ids is not None:
+                available_account_ids &= configured_account_ids
             if not available_account_ids - attempted_account_ids:
                 attempted_account_ids = set()
             retry_message = (
@@ -1007,12 +1118,24 @@ class WorkerPool:
                     if item.destination_node_id is not None
                     else db.get(Node, route.node_id) if route else None
                 )
-                category = db.scalar(
-                    select(MonitoredCategory).where(
-                        MonitoredCategory.kind == item.kind,
-                        MonitoredCategory.category_id == item.category_id,
+                category = None
+                if item.category_id:
+                    category_model = (
+                        MonitoredCategory
+                        if (item.source_provider_url or "").startswith("m3u:")
+                        else ProviderProfileMonitoredCategory
                     )
-                ) if item.category_id else None
+                    category_filters = [
+                        category_model.kind == item.kind,
+                        category_model.category_id == item.category_id,
+                    ]
+                    if category_model is ProviderProfileMonitoredCategory:
+                        category_filters.append(
+                            category_model.provider_url == item.source_provider_url
+                        )
+                    category = db.scalar(
+                        select(category_model).where(*category_filters)
+                    )
                 if not account or not node:
                     content_type = "series" if item.kind == "series" else "movie"
                     self._fail(

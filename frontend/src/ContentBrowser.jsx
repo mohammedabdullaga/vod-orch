@@ -38,6 +38,17 @@ export default function ContentBrowser({
   const [type, setType] = useState("series");
   const [providerAccounts, setProviderAccounts] = useState([]);
   const [sourceAccountId, setSourceAccountId] = useState("");
+  const providerProfiles = useMemo(() => {
+    const profiles = new Map();
+    for (const account of providerAccounts) {
+      const providerUrl = account.provider_url.replace(/\/+$/, "");
+      if (!profiles.has(providerUrl)) {
+        profiles.set(providerUrl, { provider_url: providerUrl, accounts: [] });
+      }
+      profiles.get(providerUrl).accounts.push(account);
+    }
+    return [...profiles.values()];
+  }, [providerAccounts]);
   const [categories, setCategories] = useState([]);
   const [selectedCategories, setSelectedCategories] = useState(new Set());
   const [categorySearch, setCategorySearch] = useState("");
@@ -81,11 +92,16 @@ export default function ContentBrowser({
         if (!current) return;
         const enabled = data.filter((account) => account.enabled);
         setProviderAccounts(enabled);
-        setSourceAccountId((selected) =>
-          enabled.some((account) => String(account.id) === selected)
-            ? selected
-            : String(enabled[0]?.id || "")
-        );
+        setSourceAccountId((selected) => {
+          const currentAccount = enabled.find(
+            (account) => String(account.id) === selected,
+          );
+          const profileUrl = currentAccount?.provider_url.replace(/\/+$/, "");
+          const primaryAccount = enabled.find(
+            (account) => account.provider_url.replace(/\/+$/, "") === profileUrl,
+          ) || enabled[0];
+          return String(primaryAccount?.id || "");
+        });
       })
       .catch((error) => {
         if (current) setNotice(error.response?.data?.detail || "Could not load Xtream accounts.");
@@ -115,7 +131,7 @@ export default function ContentBrowser({
       },
     })
       .then(({ data }) => { if (current) setCategories(data); })
-      .catch((error) => { if (current) setNotice(error.response?.data?.detail || "Could not load provider categories."); });
+      .catch((error) => { if (current) setNotice(error.response?.data?.detail || "Could not load the local profile categories."); });
     return () => { current = false; };
   }, [api, type, sourceAccountId, providerProxyId, providerProxyReady]);
 
@@ -221,6 +237,7 @@ export default function ContentBrowser({
     try {
       for (const category of selected) {
         await api.post("/categories/toggle", {
+          provider_url: category.provider_url,
           category_id: category.category_id,
           name: category.category_name,
           kind: kindFor(type),
@@ -252,7 +269,7 @@ export default function ContentBrowser({
     }
   };
 
-  const browseSelected = async (forceRefresh = false) => {
+  const browseSelected = async () => {
     if (!selectedCategories.size) return setNotice("Select one or more categories to browse.");
     const categoryIds = [...selectedCategories];
     const accountId = Number(sourceAccountId);
@@ -269,33 +286,20 @@ export default function ContentBrowser({
     setSelectedItems(new Set());
     setItemSearch("");
     try {
-      let browseCategories = categories;
-      if (forceRefresh) {
-        const { data: refreshedCategories } = await api.get("/content/categories", {
-          params: {
-            type,
-            account_id: sourceAccountId,
-            proxy_id: providerProxyId ? Number(providerProxyId) : 0,
-            refresh: true,
-          },
-        });
-        browseCategories = refreshedCategories;
-        setCategories(refreshedCategories);
-      }
       const { data: started } = await api.post("/content/items/browse", {
         type,
         account_id: accountId,
         category_ids: categoryIds,
         category_names: Object.fromEntries(
-          browseCategories
+          categories
             .filter((category) => selectedCategories.has(category.category_id))
             .map((category) => [category.category_id, category.category_name]),
         ),
         proxy_id: proxyId,
-        refresh: forceRefresh,
+        refresh: false,
         include_items: false,
       });
-      setNotice("Loading provider titles…");
+      setNotice("Loading titles from the local catalog…");
       const context = { type, categoryIds, accountId, proxyId };
       let firstPageRequested = false;
       let browseStatus;
@@ -314,7 +318,7 @@ export default function ContentBrowser({
       }
       if (browseStatus.status !== "COMPLETED") {
         throw new Error(
-          browseStatus.error?.detail || "Content browsing failed. Check the provider and storage connection.",
+          browseStatus.error?.detail || "Content browsing failed. Check the local catalog and storage connection.",
         );
       }
       setBrowseContext({ ...context });
@@ -764,20 +768,21 @@ export default function ContentBrowser({
               </select>
             </label>
             <label className="text-xs text-slate-400">
-              Browse using Xtream account
+              Browse profile catalog
               <select
-                aria-label="Browse using Xtream account"
+                aria-label="Browse profile catalog"
                 value={sourceAccountId}
                 onChange={(event) => setSourceAccountId(event.target.value)}
                 disabled={!providerAccounts.length || busy || Boolean(pendingQueue)}
                 className="ml-2 max-w-64 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
               >
                 {!providerAccounts.length && <option value="">No enabled Xtream accounts</option>}
-                {providerAccounts.map((account) => (
-                  <option key={account.id} value={account.id}>
-                    #{account.id} · {account.username} · {account.provider_url}
+                {providerProfiles.map((profile) => {
+                  const syncAccount = profile.accounts[0];
+                  return <option key={profile.provider_url} value={syncAccount.id}>
+                    {profile.provider_url} · {profile.accounts.length} account{profile.accounts.length === 1 ? "" : "s"}
                   </option>
-                ))}
+                })}
               </select>
             </label>
             <div className="inline-flex rounded-lg border border-slate-700 bg-slate-900 p-1">
@@ -789,7 +794,7 @@ export default function ContentBrowser({
             </div>
           </div>
         </div>
-        <p className="mt-3 text-xs text-slate-500">Choose the account used to browse categories and titles, and whether provider API requests should use a proxy. This proxy is for category, title, and series-detail API requests; download proxy settings are chosen separately at queue time. At download time, the selected idle worker account supplies its own Xtream username and password for the same stream ID.</p>
+        <p className="mt-3 text-xs text-slate-500">Browsing uses the selected profile’s local catalog. Sync it from Settings to refresh provider data. Any enabled credential under that same provider URL can be selected as a download worker; each credential runs at most one active job.</p>
 
         <div className="mt-5 grid gap-5 lg:grid-cols-[minmax(260px,0.8fr)_minmax(0,1.6fr)]">
           <div className="rounded-xl border border-slate-800 bg-slate-900/40">
@@ -823,7 +828,6 @@ export default function ContentBrowser({
               <button disabled={busy || !selectedCategories.size} onClick={() => setSelectedMonitoring(true)} className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 disabled:opacity-40">Monitor selected</button>
               {selectedMonitoredCategories.length > 0 && <button disabled={busy} onClick={() => setSelectedMonitoring(false)} className="rounded-lg border border-amber-800/70 px-3 py-2 text-xs font-medium text-amber-300 hover:bg-amber-950/40 disabled:opacity-40">Stop monitoring selected ({selectedMonitoredCategories.length})</button>}
               <button disabled={busy || !selectedCategories.size} onClick={() => browseSelected()} className="rounded-lg bg-indigo-500 px-3 py-2 text-xs font-semibold text-white hover:bg-indigo-400 disabled:opacity-40">Browse selected</button>
-              <button disabled={busy || !selectedCategories.size} onClick={() => browseSelected(true)} title="Fetch fresh categories and titles from the provider instead of using cached data." className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-semibold text-slate-300 hover:border-slate-500 hover:text-white disabled:opacity-40">Refresh from provider</button>
             </div>
           </div>
 
@@ -1000,14 +1004,14 @@ export default function ContentBrowser({
         <div className="flex min-h-full items-center justify-center">
         <section className="flex max-h-[calc(100vh-1.5rem)] w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-slate-700 bg-[#0d1320] shadow-2xl sm:max-h-[calc(100vh-2rem)]">
           <header className="flex items-start justify-between gap-4 border-b border-slate-800 px-5 py-4">
-            <div><h2 id="queue-confirm-title" className="font-semibold text-white">Confirm download assignment</h2><p className="mt-1 text-xs text-slate-400">{pendingSeries ? `${pendingCount} series will be prepared and queued as each finishes.` : `${pendingCount} item${pendingCount === 1 ? "" : "s"} will be queued for the browsing account.`}</p><p className="mt-1 text-[11px] text-indigo-300">Browsing with {providerAccounts.find((account) => String(account.id) === sourceAccountId)?.username || "the selected account"}; downloads use this same account so provider stream IDs stay consistent.</p></div>
+            <div><h2 id="queue-confirm-title" className="font-semibold text-white">Confirm download assignment</h2><p className="mt-1 text-xs text-slate-400">{pendingSeries ? `${pendingCount} series will be prepared and queued as each finishes.` : `${pendingCount} item${pendingCount === 1 ? "" : "s"} will be queued from the selected profile.`}</p><p className="mt-1 text-[11px] text-indigo-300">Catalog stream IDs are shared across credentials with the same provider URL; downloads use only enabled credentials in this profile.</p></div>
             <button type="button" onClick={cancelQueueConfirmation} disabled={busy} aria-label="Cancel queue confirmation" className="rounded-lg p-2 text-slate-400 hover:bg-slate-800"><X size={16} /></button>
           </header>
           <div className="min-h-0 space-y-5 overflow-y-auto p-5">
             {pendingSeries && <p className="rounded-lg border border-indigo-900/70 bg-indigo-950/30 px-3 py-2 text-xs text-indigo-200">Series details are requested at least 3 seconds apart. Each series is added to the download queue as soon as its details are ready.</p>}
             <div>
               <div className="mb-2 flex items-center justify-between"><h3 className="text-sm font-medium text-slate-200">Download accounts</h3><span className="text-xs text-slate-500">{selectedWorkerIds.size} selected</span></div>
-              <p className="mb-3 text-xs text-slate-500">Xtream downloads stay bound to the account that supplied the catalog IDs. That account runs at most one active download; additional work waits for it to become available.</p>
+              <p className="mb-3 text-xs text-slate-500">Only credentials in the selected provider profile are eligible. Each credential runs at most one active download.</p>
               {!selectedWorkerIds.size && <p className="mb-3 rounded-lg border border-amber-800/60 bg-amber-950/30 px-3 py-2 text-xs text-amber-200">No accounts are currently eligible. Review the reason shown beside each account below.</p>}
               <div className="max-h-48 space-y-2 overflow-y-auto">
                 {availableAccounts.map((account) => {

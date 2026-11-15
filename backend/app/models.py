@@ -154,6 +154,68 @@ class ProviderCatalogItem(Base):
     )
 
 
+class ProviderProfileCatalogCategory(Base):
+    __tablename__ = "provider_profile_catalog_categories"
+    __table_args__ = (
+        UniqueConstraint("provider_url", "kind", "category_id"),
+        Index("ix_profile_catalog_categories_profile_kind", "provider_url", "kind"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider_url: Mapped[str] = mapped_column(String(2048), index=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    category_id: Mapped[str] = mapped_column(String(255), index=True)
+    category_name: Mapped[str] = mapped_column(String(512))
+    item_count: Mapped[int] = mapped_column(Integer, default=0)
+    items_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class ProviderProfileCatalogItem(Base):
+    __tablename__ = "provider_profile_catalog_items"
+    __table_args__ = (
+        UniqueConstraint("provider_url", "kind", "category_id", "stream_id"),
+        Index(
+            "ix_profile_catalog_items_lookup",
+            "provider_url",
+            "kind",
+            "category_id",
+            "name",
+        ),
+        Index(
+            "ix_profile_catalog_items_stream",
+            "provider_url",
+            "kind",
+            "stream_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider_url: Mapped[str] = mapped_column(String(2048), index=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    category_id: Mapped[str] = mapped_column(String(255), index=True)
+    category_name: Mapped[str] = mapped_column(String(512))
+    stream_id: Mapped[str] = mapped_column(String(512), index=True)
+    name: Mapped[str] = mapped_column(String(1024), index=True)
+    cover: Mapped[str | None] = mapped_column(Text, nullable=True)
+    total_seasons: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_episodes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    year: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    container_ext: Mapped[str] = mapped_column(String(16), default="mkv")
+    download_status: Mapped[str] = mapped_column(String(16), default="unknown")
+    storage_match: Mapped[str | None] = mapped_column(Text, nullable=True)
+    inventory_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
 class ProviderCatalogSyncJob(Base):
     __tablename__ = "provider_catalog_sync_jobs"
 
@@ -275,6 +337,32 @@ class MonitoredCategory(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 
+class ProviderProfileMonitoredCategory(Base):
+    __tablename__ = "provider_profile_monitored_categories"
+    __table_args__ = (
+        UniqueConstraint("provider_url", "category_id", "kind"),
+        Index(
+            "ix_profile_monitored_categories_lookup",
+            "provider_url",
+            "kind",
+            "category_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider_url: Mapped[str] = mapped_column(String(2048), index=True)
+    category_id: Mapped[str] = mapped_column(String(255), index=True)
+    name: Mapped[str] = mapped_column(String(512))
+    kind: Mapped[str] = mapped_column(String(16))
+    monitored: Mapped[bool] = mapped_column(Boolean, default=False)
+    destination_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    match_existing_series: Mapped[bool] = mapped_column(Boolean, default=False)
+    strip_prefixes: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
 class QueueItem(Base):
     __tablename__ = "queue"
 
@@ -320,6 +408,7 @@ class QueueItem(Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     retries: Mapped[int] = mapped_column(Integer, default=0)
     attempted_account_ids: Mapped[str] = mapped_column(Text, default="[]")
+    eligible_account_ids: Mapped[str] = mapped_column(Text, default="[]")
     retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
@@ -472,6 +561,7 @@ def init_db() -> None:
                 "file_size_bytes": "INTEGER",
                 "speed_bytes_per_second": "FLOAT",
                 "attempted_account_ids": "TEXT NOT NULL DEFAULT '[]'",
+                "eligible_account_ids": "TEXT NOT NULL DEFAULT '[]'",
                 "source_account_id": "INTEGER",
                 "remote_node_id": "INTEGER",
                 "destination_node_id": "INTEGER",
@@ -535,3 +625,48 @@ def init_db() -> None:
                     "VALUES (?, ?, CURRENT_TIMESTAMP)",
                     (kind, legacy_node[0]),
                 )
+        profile_catalog_migration = "provider-profile-catalog-and-watchlist-v1"
+        profile_migration_applied = connection.exec_driver_sql(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            (profile_catalog_migration,),
+        ).first()
+        if not profile_migration_applied:
+            connection.exec_driver_sql(
+                "INSERT OR IGNORE INTO provider_profile_catalog_categories "
+                "(provider_url, kind, category_id, category_name, item_count, "
+                "items_synced_at, updated_at) "
+                "SELECT RTRIM(accounts.provider_url, '/'), categories.kind, "
+                "categories.category_id, categories.category_name, categories.item_count, "
+                "categories.items_synced_at, categories.updated_at "
+                "FROM provider_catalog_categories AS categories "
+                "JOIN accounts ON accounts.id = categories.account_id "
+                "ORDER BY accounts.id"
+            )
+            connection.exec_driver_sql(
+                "INSERT OR IGNORE INTO provider_profile_catalog_items "
+                "(provider_url, kind, category_id, category_name, stream_id, name, cover, "
+                "total_seasons, total_episodes, year, container_ext, download_status, "
+                "storage_match, inventory_checked_at, updated_at) "
+                "SELECT RTRIM(accounts.provider_url, '/'), items.kind, items.category_id, "
+                "items.category_name, items.stream_id, items.name, items.cover, "
+                "items.total_seasons, items.total_episodes, items.year, items.container_ext, "
+                "items.download_status, items.storage_match, items.inventory_checked_at, "
+                "items.updated_at FROM provider_catalog_items AS items "
+                "JOIN accounts ON accounts.id = items.account_id "
+                "ORDER BY accounts.id"
+            )
+            connection.exec_driver_sql(
+                "INSERT OR IGNORE INTO provider_profile_monitored_categories "
+                "(provider_url, category_id, name, kind, monitored, destination_path, "
+                "match_existing_series, strip_prefixes, updated_at) "
+                "SELECT RTRIM((SELECT provider_url FROM accounts ORDER BY id LIMIT 1), '/'), "
+                "categories.category_id, categories.name, categories.kind, "
+                "categories.monitored, categories.destination_path, "
+                "categories.match_existing_series, categories.strip_prefixes, "
+                "categories.updated_at FROM monitored_categories AS categories "
+                "WHERE EXISTS (SELECT 1 FROM accounts)"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO schema_migrations (version) VALUES (?)",
+                (profile_catalog_migration,),
+            )

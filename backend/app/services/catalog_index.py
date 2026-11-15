@@ -4,8 +4,9 @@ from typing import Any
 from sqlalchemy import delete, select
 
 from app.models import (
-    ProviderCatalogCategory,
-    ProviderCatalogItem,
+    ProviderProfileCatalogCategory,
+    ProviderProfileCatalogItem,
+    ProviderProfileMonitoredCategory,
     SessionLocal,
     utc_now,
 )
@@ -38,19 +39,28 @@ def _year(row: dict[str, Any]) -> str | None:
 
 
 def store_categories(
-    account_id: int,
+    provider_url: str,
     kind: str,
     rows: list[dict[str, Any]],
 ) -> None:
     now = utc_now()
     with SessionLocal() as db:
         existing = db.scalars(
-            select(ProviderCatalogCategory).where(
-                ProviderCatalogCategory.account_id == account_id,
-                ProviderCatalogCategory.kind == kind,
+            select(ProviderProfileCatalogCategory).where(
+                ProviderProfileCatalogCategory.provider_url == provider_url,
+                ProviderProfileCatalogCategory.kind == kind,
             )
         ).all()
         by_id = {category.category_id: category for category in existing}
+        monitored_by_id = {
+            category.category_id: category
+            for category in db.scalars(
+                select(ProviderProfileMonitoredCategory).where(
+                    ProviderProfileMonitoredCategory.provider_url == provider_url,
+                    ProviderProfileMonitoredCategory.kind == kind,
+                )
+            ).all()
+        }
         seen: set[str] = set()
         for row in rows:
             category_id = row.get("category_id", row.get("id"))
@@ -64,8 +74,8 @@ def store_categories(
             name = str(row.get("category_name", row.get("name", "Unknown")))[:512]
             if category is None:
                 db.add(
-                    ProviderCatalogCategory(
-                        account_id=account_id,
+                    ProviderProfileCatalogCategory(
+                        provider_url=provider_url,
                         kind=kind,
                         category_id=category_id,
                         category_name=name,
@@ -75,34 +85,38 @@ def store_categories(
             else:
                 category.category_name = name
                 category.updated_at = now
+            monitored = monitored_by_id.get(category_id)
+            if monitored is not None:
+                monitored.name = name
+                monitored.updated_at = now
         removed = set(by_id) - seen
         if removed:
             db.execute(
-                delete(ProviderCatalogItem).where(
-                    ProviderCatalogItem.account_id == account_id,
-                    ProviderCatalogItem.kind == kind,
-                    ProviderCatalogItem.category_id.in_(removed),
+                delete(ProviderProfileCatalogItem).where(
+                    ProviderProfileCatalogItem.provider_url == provider_url,
+                    ProviderProfileCatalogItem.kind == kind,
+                    ProviderProfileCatalogItem.category_id.in_(removed),
                 )
             )
             db.execute(
-                delete(ProviderCatalogCategory).where(
-                    ProviderCatalogCategory.account_id == account_id,
-                    ProviderCatalogCategory.kind == kind,
-                    ProviderCatalogCategory.category_id.in_(removed),
+                delete(ProviderProfileCatalogCategory).where(
+                    ProviderProfileCatalogCategory.provider_url == provider_url,
+                    ProviderProfileCatalogCategory.kind == kind,
+                    ProviderProfileCatalogCategory.category_id.in_(removed),
                 )
             )
         db.commit()
 
 
 def store_category_items(
-    account_id: int,
+    provider_url: str,
     kind: str,
     category_id: str,
     category_name: str,
     rows: list[dict[str, Any]],
 ) -> None:
     now = utc_now()
-    indexed: list[ProviderCatalogItem] = []
+    indexed: list[ProviderProfileCatalogItem] = []
     seen: set[str] = set()
     for row in rows:
         item_id = _item_id(row, kind)
@@ -129,8 +143,8 @@ def store_category_items(
                     if isinstance(episodes, list)
                 )
         indexed.append(
-            ProviderCatalogItem(
-                account_id=account_id,
+            ProviderProfileCatalogItem(
+                provider_url=provider_url,
                 kind=kind,
                 category_id=category_id,
                 category_name=category_name[:512],
@@ -150,15 +164,15 @@ def store_category_items(
 
     with SessionLocal() as db:
         category = db.scalar(
-            select(ProviderCatalogCategory).where(
-                ProviderCatalogCategory.account_id == account_id,
-                ProviderCatalogCategory.kind == kind,
-                ProviderCatalogCategory.category_id == category_id,
+            select(ProviderProfileCatalogCategory).where(
+                ProviderProfileCatalogCategory.provider_url == provider_url,
+                ProviderProfileCatalogCategory.kind == kind,
+                ProviderProfileCatalogCategory.category_id == category_id,
             )
         )
         if category is None:
-            category = ProviderCatalogCategory(
-                account_id=account_id,
+            category = ProviderProfileCatalogCategory(
+                provider_url=provider_url,
                 kind=kind,
                 category_id=category_id,
                 category_name=category_name[:512],
@@ -169,10 +183,10 @@ def store_category_items(
         category.items_synced_at = now
         category.updated_at = now
         db.execute(
-            delete(ProviderCatalogItem).where(
-                ProviderCatalogItem.account_id == account_id,
-                ProviderCatalogItem.kind == kind,
-                ProviderCatalogItem.category_id == category_id,
+            delete(ProviderProfileCatalogItem).where(
+                ProviderProfileCatalogItem.provider_url == provider_url,
+                ProviderProfileCatalogItem.kind == kind,
+                ProviderProfileCatalogItem.category_id == category_id,
             )
         )
         db.add_all(indexed)
@@ -180,7 +194,7 @@ def store_category_items(
 
 
 def store_inventory_status(
-    account_id: int,
+    provider_url: str,
     kind: str,
     items: list[dict[str, Any]],
 ) -> None:
@@ -196,11 +210,11 @@ def store_inventory_status(
     now = utc_now()
     with SessionLocal() as db:
         records = db.scalars(
-            select(ProviderCatalogItem).where(
-                ProviderCatalogItem.account_id == account_id,
-                ProviderCatalogItem.kind == kind,
-                ProviderCatalogItem.category_id.in_(category_ids),
-                ProviderCatalogItem.stream_id.in_(stream_ids),
+            select(ProviderProfileCatalogItem).where(
+                ProviderProfileCatalogItem.provider_url == provider_url,
+                ProviderProfileCatalogItem.kind == kind,
+                ProviderProfileCatalogItem.category_id.in_(category_ids),
+                ProviderProfileCatalogItem.stream_id.in_(stream_ids),
             )
         ).all()
         for record in records:

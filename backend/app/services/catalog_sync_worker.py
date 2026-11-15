@@ -306,7 +306,7 @@ class ProviderCatalogSyncWorker:
             if not account or not account.enabled:
                 raise ValueError("The selected Xtream account is no longer enabled.")
             proxy_id = job.proxy_id
-            account_id = account.id
+            provider_url = account.provider_url
 
         proxy_url = resolve_provider_proxy(proxy_id)
         category_records: list[tuple[str, str, str, str]] = []
@@ -341,7 +341,7 @@ class ProviderCatalogSyncWorker:
                 stale_delta=int(cache_state == "stale"),
                 cache_hits_delta=int(cache_state == "hit"),
             )
-            await asyncio.to_thread(store_categories, account_id, kind, categories)
+            await asyncio.to_thread(store_categories, provider_url, kind, categories)
             for category in categories:
                 category_id = category.get("category_id", category.get("id"))
                 if category_id is not None:
@@ -383,7 +383,7 @@ class ProviderCatalogSyncWorker:
                 )
             await asyncio.to_thread(
                 store_category_items,
-                account_id,
+                provider_url,
                 kind,
                 category_id,
                 category_name,
@@ -478,10 +478,10 @@ class ProviderCatalogSyncWorker:
                 job.updated_at = utc_now()
                 db.commit()
         logger.info(
-            "Provider catalog sync job %s completed catalog lists for account %s "
+            "Provider catalog sync job %s completed catalog lists for profile %s "
             "(%s categories, %s series details, up to %s concurrent list requests)",
             job_id,
-            account_id,
+            provider_url,
             len(category_records),
             len(series_ids),
             CATALOG_REQUEST_CONCURRENCY,
@@ -498,7 +498,7 @@ class ProviderCatalogSyncWorker:
             account,
             action,
             proxy_url=proxy_url,
-            force_refresh=False,
+            force_refresh=True,
             **params,
         )
         return payload, cache_state

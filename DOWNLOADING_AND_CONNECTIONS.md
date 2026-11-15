@@ -60,19 +60,20 @@ The Vite development server uses `localhost:5173` and forwards `/api` to the bac
 ## Download lifecycle
 
 1. **Discover or select content**
-   - The poller on the VPS checks enabled provider accounts and only requests categories marked as monitored.
-   - A browser user can instead browse provider categories and queue episodes immediately.
+   - Catalog sync on the VPS fetches categories, titles, and episode metadata using the profile's first enabled Xtream credential and indexes them locally.
+   - The category poller checks monitored categories per provider profile. The browser reads the local profile catalog and does not request provider category/title lists while browsing.
    - The provider stream ID and provider endpoint form the stable deduplication identity. Already queued/completed IDs are not automatically queued a second time.
 
-2. **Claim an account-bound job**
+2. **Claim a profile-bound job**
    - The worker pool reconciles enabled accounts dynamically.
-   - An idle worker claims one eligible `PENDING` item for its storage route. Provider-ID Xtream jobs are rebuilt using the assigned worker account's host and credentials; legacy URL-only jobs retain their provider-host restriction. One account cannot run two active downloads at once; multiple accounts allow different files to download concurrently.
-   - Manual batches can select free accounts, downloader, and direct/proxy mode before enqueueing.
+   - An idle worker claims one eligible `PENDING` item for its storage route. Xtream stream IDs are rebuilt with an enabled credential in the same provider profile; manual batches persist the selected worker IDs. One account cannot run two active downloads at once; multiple profile credentials can download different files concurrently.
+   - Accounts grouped under one normalized provider URL are assumed to share compatible catalog IDs and entitlements. Only group credentials that satisfy that provider-specific assumption.
+   - Manual batches can select free profile accounts, downloader, and direct/proxy mode before enqueueing.
 
 3. **Open the SSH control connection**
    - The VPS uses Paramiko with the storage node's host, port, SSH username, and private-key path.
    - SSH host-key verification is strict. The storage host key must already be trusted by the daemon via system known-hosts or the configured `SSH_KNOWN_HOSTS` file.
-   - The daemon sends safely quoted shell commands over SSH. Provider credentials in the stream URL are not placed in the dashboard URL; stream URLs are encrypted in SQLite and constructed for the assigned worker account when needed.
+   - The daemon sends safely quoted shell commands over SSH. Provider credentials in the stream URL are not placed in the dashboard URL; stream URLs are encrypted in SQLite and constructed for the assigned profile worker account when needed.
 
 4. **Prepare remote staging**
    - A unique per-job partial file and PID/state files are created in `<staging root>/.vod-orch-jobs/<task id>/`. This isolates concurrent tasks so cleanup cannot remove another task's active staging directory.

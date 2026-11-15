@@ -3,7 +3,14 @@ import logging
 from sqlalchemy import or_, select
 
 from app.config import settings
-from app.models import Account, AppSettings, MonitoredCategory, QueueItem, SessionLocal, utc_now
+from app.models import (
+    Account,
+    AppSettings,
+    ProviderProfileMonitoredCategory,
+    QueueItem,
+    SessionLocal,
+    utc_now,
+)
 from app.services.provider_client import (
     cached_provider_action,
     parse_series_episodes,
@@ -47,10 +54,24 @@ class CategoryPoller:
 
     async def poll_once(self) -> None:
         with SessionLocal() as db:
-            accounts = db.scalars(select(Account).where(Account.enabled.is_(True))).all()
-            monitored = db.scalars(
-                select(MonitoredCategory).where(MonitoredCategory.monitored.is_(True))
+            all_accounts = db.scalars(
+                select(Account)
+                .where(Account.enabled.is_(True))
+                .order_by(Account.id)
             ).all()
+            accounts_by_profile: dict[str, Account] = {}
+            for account in all_accounts:
+                accounts_by_profile.setdefault(account.provider_url.rstrip("/"), account)
+            accounts = list(accounts_by_profile.values())
+            monitored_by_profile = {
+                provider_url: db.scalars(
+                    select(ProviderProfileMonitoredCategory).where(
+                        ProviderProfileMonitoredCategory.provider_url == provider_url,
+                        ProviderProfileMonitoredCategory.monitored.is_(True),
+                    )
+                ).all()
+                for provider_url in accounts_by_profile
+            }
             setting = db.get(AppSettings, 1)
             provider_proxy_id = setting.provider_proxy_id if setting else None
         if not accounts:
@@ -58,7 +79,11 @@ class CategoryPoller:
         proxy_url = resolve_provider_proxy(provider_proxy_id)
         for account in accounts:
             try:
-                await self._poll_account(account, monitored, proxy_url)
+                await self._poll_account(
+                    account,
+                    monitored_by_profile.get(account.provider_url.rstrip("/"), []),
+                    proxy_url,
+                )
             except Exception as exc:
                 logger.error(
                     "Provider poll failed for account %s (%s)",
@@ -69,7 +94,7 @@ class CategoryPoller:
     async def _poll_account(
         self,
         account: Account,
-        monitored: list[MonitoredCategory],
+        monitored: list[ProviderProfileMonitoredCategory],
         proxy_url: str | None,
     ) -> None:
         source_categories = {
@@ -115,7 +140,7 @@ class CategoryPoller:
     async def _enqueue_series(
         self,
         account: Account,
-        category: MonitoredCategory,
+        category: ProviderProfileMonitoredCategory,
         series: dict,
         proxy_url: str | None,
     ) -> None:
@@ -168,7 +193,7 @@ class CategoryPoller:
             )
 
     async def _enqueue_vod(
-        self, account: Account, category: MonitoredCategory, stream: dict
+        self, account: Account, category: ProviderProfileMonitoredCategory, stream: dict
     ) -> None:
         stream_id = stream.get("stream_id", stream.get("id"))
         if stream_id is None:

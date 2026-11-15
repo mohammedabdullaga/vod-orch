@@ -69,6 +69,7 @@ function App() {
     resetAccountBusyStates: false,
   });
   const [categories, setCategories] = useState([]);
+  const [categoryProfileUrl, setCategoryProfileUrl] = useState("");
   const [accounts, setAccounts] = useState([]);
   const [catalogSyncJobs, setCatalogSyncJobs] = useState({});
   const [catalogSyncProxyByProfile, setCatalogSyncProxyByProfile] = useState({});
@@ -147,6 +148,13 @@ function App() {
         api.get("/content/catalog-sync"),
       ]);
       setAccounts(a.data);
+      setCategoryProfileUrl((selected) => {
+        const enabledProfiles = a.data.filter((account) => account.enabled);
+        const existingProfile = enabledProfiles.find(
+          (account) => account.provider_url.replace(/\/+$/, "") === selected,
+        );
+        return (existingProfile || enabledProfiles[0])?.provider_url.replace(/\/+$/, "") || "";
+      });
       setCatalogSyncJobs(Object.fromEntries(syncJobs.data.map((job) => [job.provider_url.replace(/\/+$/, ""), job])));
       setProxies(p.data);
       setProviderProxyId((selected) =>
@@ -156,18 +164,24 @@ function App() {
       );
       setNodes(n.data); setRouting(r.data);
       setProviderProxyReady(true);
-      return p.data.some((proxy) =>
-        proxy.enabled && String(proxy.id) === String(providerProxy.data.proxy_id)
-      ) ? String(providerProxy.data.proxy_id) : "";
+      return {
+        proxyId: p.data.some((proxy) =>
+          proxy.enabled && String(proxy.id) === String(providerProxy.data.proxy_id)
+        ) ? String(providerProxy.data.proxy_id) : "",
+        accounts: a.data,
+      };
     } catch (error) {
       setNotice(error.response?.data?.detail || "Unable to load settings.");
       return null;
     }
   };
-  const loadCategories = async (proxyId = providerProxyId) => {
+  const loadCategories = async (proxyId = providerProxyId, profileUrl = categoryProfileUrl) => {
     try {
       const categoryResponse = await api.get("/categories", {
-        params: { proxy_id: proxyId ? Number(proxyId) : 0 },
+        params: {
+          provider_url: profileUrl || undefined,
+          proxy_id: proxyId ? Number(proxyId) : 0,
+        },
       });
       setCategories(categoryResponse.data);
     }
@@ -177,8 +191,13 @@ function App() {
     if (!authenticated) return;
     if (tab === tabs[1]) loadSettings();
     if (tab === tabs[2]) {
-      loadSettings().then((proxyId) => {
-        if (proxyId !== null) loadCategories(proxyId);
+      loadSettings().then((result) => {
+        if (result !== null) {
+          const account = result.accounts.find((item) => item.enabled);
+          const profileUrl = account?.provider_url.replace(/\/+$/, "") || "";
+          setCategoryProfileUrl(profileUrl);
+          loadCategories(result.proxyId, profileUrl);
+        }
       });
     }
     if (tab === tabs[3]) loadSettings();
@@ -215,6 +234,7 @@ function App() {
     const next = !category.monitored;
     await act(async () => {
       await api.post("/categories/toggle", {
+        provider_url: category.provider_url,
         category_id: category.category_id, name: category.name, kind: category.kind,
         monitored: next, destination_path: category.destination_path || null,
         match_existing_series: category.match_existing_series || false,
@@ -230,6 +250,7 @@ function App() {
   const saveCategoryPath = (category) => act(
     async () => {
       const response = await api.post("/categories/toggle", {
+        provider_url: category.provider_url,
         category_id: category.category_id,
         name: category.name,
         kind: category.kind,
@@ -518,6 +539,17 @@ function App() {
     if (!window.confirm(`Delete credential "${account.username}" from ${account.provider_url}? Active downloads must finish first. Shared profile catalog data will be preserved.`)) return;
     remove("/accounts", account.id);
   };
+  const removeProfile = (profile) => {
+    if (!window.confirm(
+      `Delete the entire provider profile ${profile.provider_url} and all ${profile.accounts.length} credential(s)? This permanently clears its local catalog, category settings, and queued/history tasks. Active downloads must finish first.`,
+    )) return;
+    act(
+      () => api.delete("/provider-profiles", {
+        data: { provider_url: profile.provider_url, clear_catalog: true },
+      }),
+      `Deleted provider profile and cleared its local catalog (${profile.accounts.length} credentials).`,
+    ).then(loadSettings);
+  };
   const testProxy = (id) => act(
     async () => (await api.post(`/proxies/${id}/test`)).data,
     (result) => `Proxy reachable: ${result.ip || "IP unavailable"} · ${result.latency_ms} ms`,
@@ -661,12 +693,29 @@ function App() {
         {tab === tabs[2] && <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
           <div className="border-b border-slate-800 px-5 py-4"><h2 className="font-semibold text-white">Category watcher</h2><p className="mt-1 text-xs text-slate-500">Watched items inherit the storage root unless this category has its own remote path. Series can optionally match existing folders beneath a custom path; ambiguous matches are skipped. Configure leading labels to remove from downloaded names.</p>
             <label className="mt-4 flex flex-wrap items-center gap-3 text-xs text-slate-400">
-              Fetch categories using
+              Provider profile
+              <select
+                value={categoryProfileUrl}
+                onChange={(event) => {
+                  const profileUrl = event.target.value;
+                  setCategoryProfileUrl(profileUrl);
+                  loadCategories(providerProxyId, profileUrl);
+                }}
+                disabled={busy || !accountProfiles.length}
+                className="max-w-72 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
+              >
+                {accountProfiles.filter((profile) => profile.accounts.some((account) => account.enabled)).map((profile) => (
+                  <option key={profile.provider_url} value={profile.provider_url}>
+                    {profile.provider_url}
+                  </option>
+                ))}
+              </select>
+              Sync proxy
               <select value={providerProxyId} onChange={(event) => setProviderProxyId(event.target.value)} disabled={busy} className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 disabled:opacity-50">
                 <option value="">Direct connection</option>
                 {proxies.filter((proxy) => proxy.enabled).map((proxy) => <option key={proxy.id} value={proxy.id}>Proxy #{proxy.id} · {proxy.url}</option>)}
               </select>
-              <span className="text-slate-500">This also applies to provider lists and series details in Browse &amp; Ingest.</span>
+              <span className="text-slate-500">Browsing uses this profile’s local catalog; sync it from Settings to refresh.</span>
             </label>
             <p className="mt-2 text-xs text-slate-400">Series storage: <code className="text-indigo-300">{nodes.find((node) => node.id === routing.series_node_id)?.watch_path || "Unassigned"}</code> · Movies storage: <code className="text-indigo-300">{nodes.find((node) => node.id === routing.movie_node_id)?.watch_path || "Unassigned"}</code></p>
           </div>
@@ -704,7 +753,7 @@ function App() {
 
         {tab === tabs[3] && <div className="grid gap-6 lg:grid-cols-2">
           <section className="rounded-2xl border border-slate-800 bg-[#0d1320]">
-            <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Radio size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Provider accounts</h2><p className="text-xs text-slate-500">One active download per enabled account</p></div></div>
+            <div className="flex items-center gap-2 border-b border-slate-800 px-5 py-4"><Radio size={17} className="text-indigo-300" /><div><h2 className="font-semibold text-white">Provider profiles &amp; accounts</h2><p className="text-xs text-slate-500">First enabled credential syncs the profile catalog; each enabled credential can run one download at a time.</p></div></div>
             <div className="space-y-3 p-5">{accountProfiles.map((profile) => {
               const job = catalogSyncJobs[profile.provider_url];
               const syncing = job && ["PENDING", "RUNNING", "CANCELLING"].includes(job.status);
@@ -735,12 +784,17 @@ function App() {
                     {job?.status === "FAILED" && <button type="button" disabled={busy} onClick={() => retryCatalogSync(job.job_id, profile.provider_url)} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-400/30 px-2.5 py-1.5 text-xs text-amber-200 hover:bg-amber-500/10 disabled:opacity-40">
                       <RefreshCw size={13} />Retry with next account
                     </button>}
+                    <button type="button" disabled={busy || syncing} onClick={() => removeProfile(profile)} className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-rose-800/70 px-2.5 py-1.5 text-xs text-rose-300 hover:bg-rose-950/40 disabled:opacity-40">
+                      <Trash2 size={13} />Delete profile &amp; catalog
+                    </button>
                   </div>
                 </div>
                 <div className="mt-3 space-y-1.5 border-t border-slate-800 pt-2">
                   {profile.accounts.map((account) => <div key={account.id} className="flex items-center justify-between gap-3 text-xs">
                     <div className="min-w-0"><span className="text-slate-200">{account.username}</span><span className={`ml-2 ${account.enabled ? "text-emerald-300" : "text-slate-500"}`}>{account.enabled ? "Enabled" : "Disabled"}</span></div>
-                    <button type="button" disabled={busy} onClick={() => removeAccount(account)} className="p-1.5 text-slate-500 hover:text-rose-300 disabled:opacity-40" aria-label={`Remove ${account.username}`}><Trash2 size={14} /></button>
+                    {profile.accounts.length > 1
+                      ? <button type="button" disabled={busy} onClick={() => removeAccount(account)} className="p-1.5 text-slate-500 hover:text-rose-300 disabled:opacity-40" aria-label={`Remove ${account.username}`}><Trash2 size={14} /></button>
+                      : <span className="text-[10px] text-slate-500">Delete profile to clear catalog</span>}
                   </div>)}
                 </div>
                 {job && <div className="mt-2 border-t border-slate-800 pt-2 text-[11px]">
