@@ -153,6 +153,7 @@ async def cached_provider_action(
     proxy_url: str | None = None,
     force_refresh: bool = False,
     respect_series_details_rate_limit: bool = True,
+    use_stale_on_error: bool = True,
     **params: Any,
 ) -> tuple[Any, str]:
     provider_url = account.provider_url.rstrip("/")
@@ -223,6 +224,7 @@ async def cached_provider_action(
     except Exception as exc:
         if (
             cached_payload is None
+            or not use_stale_on_error
             or _catalog_cache_clear_in_progress
             or cache_generation != _catalog_cache_generation
         ):

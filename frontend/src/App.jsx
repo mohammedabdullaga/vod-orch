@@ -816,7 +816,7 @@ function App() {
                     <span>Connection: {job.proxy_id ? `Proxy #${job.proxy_id}` : "Direct"}</span>
                     <span>{job.categories_processed} categories</span>
                     <span>{job.lists_processed} lists · {job.cached_items} titles</span>
-                    <span>{job.seasons_cached || 0} seasons · {job.episodes_cached || 0} episodes · {job.episode_ids_cached || 0} IDs cached</span>
+                    <span>Series details: fetched on demand when opened</span>
                     {job.invalid_series_details > 0 && <span className="text-amber-300">
                       {job.invalid_series_details} series detail request(s) failed
                     </span>}
@@ -854,6 +854,7 @@ function App() {
                   </div>
                   {job.last_worker_error && <p className="mt-1 text-amber-300">Last sync worker error: {job.last_worker_error}. The worker will retry automatically.</p>}
                   {job.stale_responses > 0 && <p className="mt-1 text-amber-300">{job.stale_responses} refresh requests used stale cached data after provider/proxy errors.</p>}
+                  {job.warning && <p className="mt-1 text-amber-300">{job.warning}</p>}
                   {job.error && <p className="mt-1 text-rose-300">{job.error}</p>}
                 </div>}
               </div>;

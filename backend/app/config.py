@@ -1,3 +1,4 @@
+import math
 import os
 from dataclasses import dataclass
 
@@ -19,6 +20,15 @@ class Settings:
     )
     provider_series_details_interval_seconds: float = float(
         os.getenv("PROVIDER_SERIES_DETAILS_INTERVAL_SECONDS", "3")
+    )
+    provider_sync_max_attempts: int = int(
+        os.getenv("PROVIDER_SYNC_MAX_ATTEMPTS", "3")
+    )
+    provider_sync_retry_base_seconds: float = float(
+        os.getenv("PROVIDER_SYNC_RETRY_BASE_SECONDS", "1")
+    )
+    provider_sync_retry_max_seconds: float = float(
+        os.getenv("PROVIDER_SYNC_RETRY_MAX_SECONDS", "15")
     )
     worker_poll_seconds: int = int(os.getenv("WORKER_POLL_SECONDS", "2"))
     max_retries: int = int(os.getenv("MAX_RETRIES", "20"))
@@ -52,6 +62,19 @@ class Settings:
             raise ValueError("MASTER_USER_AGENT cannot be empty.")
         if self.provider_series_details_interval_seconds < 0:
             raise ValueError("PROVIDER_SERIES_DETAILS_INTERVAL_SECONDS cannot be negative.")
+        if not 1 <= self.provider_sync_max_attempts <= 10:
+            raise ValueError("PROVIDER_SYNC_MAX_ATTEMPTS must be between 1 and 10.")
+        if self.provider_sync_retry_base_seconds <= 0:
+            raise ValueError("PROVIDER_SYNC_RETRY_BASE_SECONDS must be positive.")
+        if not math.isfinite(self.provider_sync_retry_base_seconds):
+            raise ValueError("PROVIDER_SYNC_RETRY_BASE_SECONDS must be finite.")
+        if self.provider_sync_retry_max_seconds < self.provider_sync_retry_base_seconds:
+            raise ValueError(
+                "PROVIDER_SYNC_RETRY_MAX_SECONDS must be at least "
+                "PROVIDER_SYNC_RETRY_BASE_SECONDS."
+            )
+        if not math.isfinite(self.provider_sync_retry_max_seconds):
+            raise ValueError("PROVIDER_SYNC_RETRY_MAX_SECONDS must be finite.")
         if self.remote_download_idle_timeout_seconds < 1:
             raise ValueError("REMOTE_DOWNLOAD_IDLE_TIMEOUT_SECONDS must be positive.")
 

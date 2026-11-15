@@ -1,11 +1,13 @@
 import asyncio
 import json
 import logging
+import random
 from typing import Any
 
 import httpx
 from sqlalchemy import delete, select, update
 
+from app.config import settings
 from app.models import (
     Account,
     ProviderCatalogCache,
@@ -20,7 +22,6 @@ from app.services.provider_client import (
     cached_provider_action,
     end_catalog_cache_clear,
     invalidate_provider_action_cache,
-    parse_series_episodes,
     resolve_provider_proxy,
 )
 
@@ -32,10 +33,10 @@ CATALOG_ACTIONS = (
 )
 PROGRESS_RANGES = {
     "categories": (0, 15),
-    "movie_ids": (15, 35),
-    "series_ids": (35, 55),
-    "series_details": (55, 100),
+    "movie_ids": (15, 55),
+    "series_ids": (55, 100),
 }
+RETRYABLE_PROVIDER_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 
 
 class ProviderCatalogSyncWorker:
@@ -77,6 +78,7 @@ class ProviderCatalogSyncWorker:
                     cache_hits=0,
                     invalid_series_details=0,
                     error=None,
+                    warning=None,
                     updated_at=utc_now(),
                 )
             )
@@ -324,8 +326,7 @@ class ProviderCatalogSyncWorker:
             "series": [],
             "vod": [],
         }
-        series_ids: list[str] = []
-        seen_series_ids: set[str] = set()
+        failed_category_total = 0
         self._progress(
             job_id,
             phase="categories",
@@ -343,7 +344,7 @@ class ProviderCatalogSyncWorker:
                 raise ValueError(f"Provider returned invalid {category_action} data.")
             await asyncio.to_thread(store_categories, provider_url, kind, categories)
             for category in categories:
-                category_id = category.get("category_id", category.get("id"))
+                category_id = category.get("category_id") or category.get("id")
                 if category_id is not None:
                     category_records[kind].append(
                         (
@@ -364,73 +365,106 @@ class ProviderCatalogSyncWorker:
 
         for kind, phase in (("vod", "movie_ids"), ("series", "series_ids")):
             records = category_records[kind]
-            category_names = {
-                category_id: category_name
-                for category_id, _list_action, category_name in records
-            }
             self._progress(
                 job_id,
                 phase=phase,
                 progress_current=0,
                 progress_total=len(records),
             )
-            list_action = "get_vod_streams" if kind == "vod" else "get_series"
-            rows, cache_state = await self._fetch_action(
-                account,
-                list_action,
-                proxy_url,
-            )
-            if not isinstance(rows, list) or any(
-                not isinstance(row, dict) for row in rows
-            ):
-                invalidate_provider_action_cache(account, list_action)
-                raise ValueError(f"Provider returned invalid {list_action} data.")
-
-            rows_by_category: dict[str, list[dict[str, Any]]] = {
-                category_id: [] for category_id in category_names
-            }
-            uncategorized_count = 0
-            for row in rows:
-                category_id = row.get("category_id")
-                if category_id is None or str(category_id) not in rows_by_category:
-                    uncategorized_count += 1
-                    continue
-                rows_by_category[str(category_id)].append(row)
-            if uncategorized_count:
-                invalidate_provider_action_cache(account, list_action)
-                raise ValueError(
-                    f"Provider returned {uncategorized_count} {kind} items with "
-                    "category IDs missing from the category list. Catalog was not "
-                    "marked complete; check the provider response and selected account."
-                )
-
+            failed_categories = 0
             for index, (category_id, _action, category_name) in enumerate(records, 1):
-                category_rows = rows_by_category[category_id]
-                await asyncio.to_thread(
-                    store_category_items,
-                    provider_url,
-                    kind,
-                    category_id,
-                    category_name,
-                    category_rows,
-                )
-                if kind == "series":
-                    for row in category_rows:
-                        series_id = row.get("series_id", row.get("id"))
-                        if series_id is not None and str(series_id).strip():
-                            normalized_id = str(series_id)
-                            if normalized_id not in seen_series_ids:
-                                seen_series_ids.add(normalized_id)
-                                series_ids.append(normalized_id)
+                category_rows: list[dict[str, Any]] | None = None
+                cache_state = "refreshed"
+                try:
+                    rows, cache_state = await self._fetch_action(
+                        account,
+                        _action,
+                        proxy_url,
+                        category_id=category_id,
+                    )
+                    if not isinstance(rows, list) or any(
+                        not isinstance(row, dict) for row in rows
+                    ):
+                        invalidate_provider_action_cache(
+                            account, _action, category_id=category_id
+                        )
+                        raise ValueError(
+                            f"Provider returned invalid {_action} data for category "
+                            f"{category_id}."
+                        )
+
+                    category_rows = []
+                    mismatched_rows = 0
+                    invalid_id_rows = 0
+                    for row in rows:
+                        row_category_id = row.get("category_id")
+                        if (
+                            row_category_id is not None
+                            and str(row_category_id) != category_id
+                        ):
+                            mismatched_rows += 1
+                            continue
+                        item_id = (
+                            row.get("series_id") or row.get("id")
+                            if kind == "series"
+                            else row.get("stream_id") or row.get("id")
+                        )
+                        if item_id is None or not str(item_id).strip():
+                            invalid_id_rows += 1
+                            continue
+                        normalized_row = dict(row)
+                        normalized_row["category_id"] = category_id
+                        category_rows.append(normalized_row)
+                    if mismatched_rows:
+                        logger.warning(
+                            "Ignoring %s %s item(s) returned outside requested "
+                            "category %s during sync job %s.",
+                            mismatched_rows,
+                            kind,
+                            category_id,
+                            job_id,
+                        )
+                    if invalid_id_rows:
+                        logger.warning(
+                            "Ignoring %s %s item(s) without a stream ID in category "
+                            "%s during sync job %s.",
+                            invalid_id_rows,
+                            kind,
+                            category_id,
+                            job_id,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failed_categories += 1
+                    failed_category_total += 1
+                    logger.warning(
+                        "Could not sync %s category %s in job %s (%s); continuing "
+                        "with the next category.",
+                        kind,
+                        category_id,
+                        job_id,
+                        self._safe_error(exc),
+                    )
+
+                if category_rows is not None:
+                    await asyncio.to_thread(
+                        store_category_items,
+                        provider_url,
+                        kind,
+                        category_id,
+                        category_name,
+                        category_rows,
+                    )
                 self._progress(
                     job_id,
                     phase=phase,
                     lists_delta=1,
-                    cached_items_delta=len(category_rows),
+                    cached_items_delta=len(category_rows) if category_rows is not None else 0,
                     progress_current=index,
                     progress_total=len(records),
-                    stale_delta=int(cache_state == "stale" and index == 1),
-                    cache_hits_delta=int(cache_state == "hit" and index == 1),
+                    stale_delta=int(cache_state == "stale"),
+                    cache_hits_delta=int(cache_state == "hit"),
                 )
             if not records:
                 self._progress(
@@ -438,81 +472,16 @@ class ProviderCatalogSyncWorker:
                     phase=phase,
                     progress_current=1,
                     progress_total=1,
-                    stale_delta=int(cache_state == "stale"),
-                    cache_hits_delta=int(cache_state == "hit"),
                 )
-
-        self._progress(
-            job_id,
-            phase="series_details",
-            total_series=len(series_ids),
-            progress_current=0,
-            progress_total=len(series_ids),
-        )
-        for index, series_id in enumerate(series_ids, 1):
-            invalid_details = False
-            cache_state = "refreshed"
-            seasons_count = 0
-            episodes_count = 0
-            episode_ids_count = 0
-            try:
-                details, cache_state = await self._fetch_action(
-                    account,
-                    "get_series_info",
-                    proxy_url,
-                    series_id=series_id,
-                )
-                parsed_episodes = parse_series_episodes(details)
-                seasons = details.get("seasons")
-                if isinstance(seasons, (dict, list)):
-                    seasons_count = len(seasons)
-                else:
-                    episodes_by_season = details.get("episodes")
-                    seasons_count = (
-                        len(episodes_by_season)
-                        if isinstance(episodes_by_season, dict)
-                        else 0
-                    )
-                episodes_count = len(parsed_episodes)
-                episode_ids_count = len(
-                    {episode["stream_id"] for episode in parsed_episodes}
-                )
-            except asyncio.CancelledError:
-                raise
-            except ValueError:
-                invalid_details = True
-                invalidate_provider_action_cache(
-                    account,
-                    "get_series_info",
-                    series_id=series_id,
-                )
+            if failed_categories:
                 logger.warning(
-                    "Provider returned invalid episode details for series %s "
-                    "in sync job %s.",
-                    series_id,
+                    "Catalog sync job %s skipped %s of %s %s categories after "
+                    "request failures.",
                     job_id,
+                    failed_categories,
+                    len(records),
+                    kind,
                 )
-            except Exception:
-                invalid_details = True
-                logger.warning(
-                    "Could not cache episode details for series %s in sync job %s.",
-                    series_id,
-                    job_id,
-                    exc_info=True,
-                )
-            self._progress(
-                job_id,
-                phase="series_details",
-                series_details_delta=1,
-                invalid_series_details_delta=int(invalid_details),
-                progress_current=index,
-                progress_total=len(series_ids),
-                seasons_delta=seasons_count,
-                episodes_delta=episodes_count,
-                episode_ids_delta=episode_ids_count,
-                stale_delta=int(cache_state == "stale"),
-                cache_hits_delta=int(cache_state == "hit"),
-            )
 
         with SessionLocal() as db:
             job = db.get(ProviderCatalogSyncJob, job_id)
@@ -522,15 +491,20 @@ class ProviderCatalogSyncWorker:
                 job.progress_percent = 100
                 job.progress_current = job.progress_total
                 job.error = None
+                job.warning = (
+                    f"Skipped {failed_category_total} category list(s) after "
+                    "provider request failures; those categories may be incomplete."
+                    if failed_category_total
+                    else None
+                )
                 job.updated_at = utc_now()
                 db.commit()
         logger.info(
-            "Provider catalog sync job %s completed catalog lists for profile %s "
-            "(%s categories, %s series details)",
+            "Provider catalog sync job %s completed category-driven catalog sync "
+            "for profile %s (%s categories, series details deferred until browse)",
             job_id,
             provider_url,
             sum(len(records) for records in category_records.values()),
-            len(series_ids),
         )
 
     @staticmethod
@@ -540,14 +514,61 @@ class ProviderCatalogSyncWorker:
         proxy_url: str | None,
         **params: str,
     ) -> tuple[Any, str]:
-        payload, cache_state = await cached_provider_action(
-            account,
-            action,
-            proxy_url=proxy_url,
-            force_refresh=True,
-            **params,
+        for attempt in range(1, settings.provider_sync_max_attempts + 1):
+            try:
+                return await cached_provider_action(
+                    account,
+                    action,
+                    proxy_url=proxy_url,
+                    force_refresh=True,
+                    use_stale_on_error=False,
+                    **params,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                delay = ProviderCatalogSyncWorker._retry_delay(exc, attempt)
+                if delay is None or attempt == settings.provider_sync_max_attempts:
+                    raise
+                logger.warning(
+                    "Xtream action %s failed on attempt %s/%s (%s); retrying in "
+                    "%.1fs.",
+                    action,
+                    attempt,
+                    settings.provider_sync_max_attempts,
+                    ProviderCatalogSyncWorker._safe_error(exc),
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        raise RuntimeError(f"Xtream action {action} exhausted its retry attempts.")
+
+    @staticmethod
+    def _retry_delay(exc: Exception, attempt: int) -> float | None:
+        retry_after: float | None = None
+        if isinstance(exc, httpx.HTTPStatusError):
+            if exc.response.status_code not in RETRYABLE_PROVIDER_STATUSES:
+                return None
+            header_value = exc.response.headers.get("Retry-After")
+            if header_value:
+                try:
+                    retry_after = max(0.0, float(header_value))
+                except ValueError:
+                    retry_after = None
+        elif not isinstance(
+            exc,
+            (httpx.TimeoutException, httpx.NetworkError, json.JSONDecodeError),
+        ):
+            return None
+
+        backoff = min(
+            settings.provider_sync_retry_base_seconds * (2 ** (attempt - 1)),
+            settings.provider_sync_retry_max_seconds,
         )
-        return payload, cache_state
+        delay = retry_after if retry_after is not None else backoff
+        return min(
+            delay + random.uniform(0, min(0.25, backoff / 4)),
+            settings.provider_sync_retry_max_seconds,
+        )
 
     @staticmethod
     def _progress(

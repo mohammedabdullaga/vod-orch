@@ -276,6 +276,7 @@ def _catalog_sync_job_json(
         "cache_hits": job.cache_hits,
         "invalid_series_details": job.invalid_series_details,
         "error": job.error,
+        "warning": job.warning,
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
     }

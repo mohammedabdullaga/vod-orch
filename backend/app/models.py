@@ -242,6 +242,7 @@ class ProviderCatalogSyncJob(Base):
     cache_hits: Mapped[int] = mapped_column(Integer, default=0)
     invalid_series_details: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    warning: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
@@ -598,6 +599,7 @@ def init_db() -> None:
                 "seasons_cached": "INTEGER NOT NULL DEFAULT 0",
                 "episodes_cached": "INTEGER NOT NULL DEFAULT 0",
                 "episode_ids_cached": "INTEGER NOT NULL DEFAULT 0",
+                "warning": "TEXT",
             },
         }
         inspector = inspect(connection)
