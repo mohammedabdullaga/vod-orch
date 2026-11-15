@@ -364,38 +364,58 @@ class ProviderCatalogSyncWorker:
 
         for kind, phase in (("vod", "movie_ids"), ("series", "series_ids")):
             records = category_records[kind]
+            category_names = {
+                category_id: category_name
+                for category_id, _list_action, category_name in records
+            }
             self._progress(
                 job_id,
                 phase=phase,
                 progress_current=0,
                 progress_total=len(records),
             )
-            for index, (category_id, list_action, category_name) in enumerate(records, 1):
-                rows, cache_state = await self._fetch_action(
-                    account,
-                    list_action,
-                    proxy_url,
-                    category_id=category_id,
+            list_action = "get_vod_streams" if kind == "vod" else "get_series"
+            rows, cache_state = await self._fetch_action(
+                account,
+                list_action,
+                proxy_url,
+            )
+            if not isinstance(rows, list) or any(
+                not isinstance(row, dict) for row in rows
+            ):
+                invalidate_provider_action_cache(account, list_action)
+                raise ValueError(f"Provider returned invalid {list_action} data.")
+
+            rows_by_category: dict[str, list[dict[str, Any]]] = {
+                category_id: [] for category_id in category_names
+            }
+            uncategorized_count = 0
+            for row in rows:
+                category_id = row.get("category_id")
+                if category_id is None or str(category_id) not in rows_by_category:
+                    uncategorized_count += 1
+                    continue
+                rows_by_category[str(category_id)].append(row)
+            if uncategorized_count:
+                invalidate_provider_action_cache(account, list_action)
+                raise ValueError(
+                    f"Provider returned {uncategorized_count} {kind} items with "
+                    "category IDs missing from the category list. Catalog was not "
+                    "marked complete; check the provider response and selected account."
                 )
-                if not isinstance(rows, list) or any(
-                    not isinstance(row, dict) for row in rows
-                ):
-                    invalidate_provider_action_cache(
-                        account, list_action, category_id=category_id
-                    )
-                    raise ValueError(
-                        f"Provider returned invalid {list_action} data for category {category_id}."
-                    )
+
+            for index, (category_id, _action, category_name) in enumerate(records, 1):
+                category_rows = rows_by_category[category_id]
                 await asyncio.to_thread(
                     store_category_items,
                     provider_url,
                     kind,
                     category_id,
                     category_name,
-                    rows,
+                    category_rows,
                 )
                 if kind == "series":
-                    for row in rows:
+                    for row in category_rows:
                         series_id = row.get("series_id", row.get("id"))
                         if series_id is not None and str(series_id).strip():
                             normalized_id = str(series_id)
@@ -406,9 +426,18 @@ class ProviderCatalogSyncWorker:
                     job_id,
                     phase=phase,
                     lists_delta=1,
-                    cached_items_delta=len(rows),
+                    cached_items_delta=len(category_rows),
                     progress_current=index,
                     progress_total=len(records),
+                    stale_delta=int(cache_state == "stale" and index == 1),
+                    cache_hits_delta=int(cache_state == "hit" and index == 1),
+                )
+            if not records:
+                self._progress(
+                    job_id,
+                    phase=phase,
+                    progress_current=1,
+                    progress_total=1,
                     stale_delta=int(cache_state == "stale"),
                     cache_hits_delta=int(cache_state == "hit"),
                 )
@@ -598,7 +627,12 @@ class ProviderCatalogSyncWorker:
         if isinstance(exc, ValueError):
             return str(exc)
         if isinstance(exc, httpx.HTTPStatusError):
-            return f"Provider returned HTTP {exc.response.status_code}. Check provider and proxy."
+            action = exc.request.url.params.get("action")
+            action_detail = f" for {action}" if action else ""
+            return (
+                f"Provider returned HTTP {exc.response.status_code}{action_detail}. "
+                "Check the selected proxy and provider response."
+            )
         if isinstance(exc, httpx.TimeoutException):
             return "Provider request timed out. Check provider and proxy."
         if isinstance(exc, httpx.RequestError):
