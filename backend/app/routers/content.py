@@ -1572,7 +1572,7 @@ class ManualBatchRequest(BaseModel):
     account_ids: list[int] | None = Field(default=None, min_length=1, max_length=100)
     proxy_mode: Literal["node", "selected", "direct"] | None = None
     proxy_id: int | None = Field(default=None, ge=1)
-    downloader: Literal["axel", "wget", "curl"] = "curl"
+    downloader: Literal["axel", "wget", "curl"] = "axel"
     account_offset: int = Field(default=0, ge=0)
     items: list[ManualQueueItem] = Field(min_length=1, max_length=5000)
 
@@ -1593,7 +1593,7 @@ class SeriesQueueBatchRequest(BaseModel):
     account_ids: list[int] = Field(min_length=1, max_length=100)
     proxy_mode: Literal["selected", "direct"] = "direct"
     proxy_id: int | None = Field(default=None, ge=1)
-    downloader: Literal["axel", "wget", "curl"] = "curl"
+    downloader: Literal["axel", "wget", "curl"] = "axel"
     missing_only: bool = False
     series: list[SeriesQueueSelection] = Field(min_length=1, max_length=500)
 
@@ -2387,6 +2387,8 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
         "",
         f"command -v {required_downloader} >/dev/null 2>&1 || "
         f"{{ echo '{required_downloader} is required' >&2; exit 127; }}",
+        "command -v curl >/dev/null 2>&1 || "
+        "{ echo 'curl is required to resolve provider stream redirects' >&2; exit 127; }",
         "",
     ]
     added: set[str] = set()
@@ -2451,6 +2453,21 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
         q_master_user_agent = shlex.quote(settings.master_user_agent.strip())
         account_lines = commands_by_account[assigned_account.id]
         account_lines.append(f"mkdir -p {q_parent} && chmod 0755 {q_parent}")
+        resolver_user_agent = (
+            q_user_agent if proxy_scheme == "socks5" else q_master_user_agent
+        )
+        curl_proxy_option = f"--proxy {quoted_proxy} " if quoted_proxy else ""
+        account_lines.append(
+            "resolved_url=$(curl --fail --location --proto-redir '=http,https' "
+            "--max-redirs 20 --range 0-0 --max-filesize 1 --silent --show-error "
+            f"--user-agent {resolver_user_agent} --output /dev/null "
+            f"--write-out '%{{url_effective}}' {curl_proxy_option}{q_url}) "
+            "|| { echo 'Unable to resolve the stream redirect for the parallel downloader.' >&2; exit 1; }"
+        )
+        account_lines.append(
+            'case "$resolved_url" in http://*|https://*) ;; '
+            '*) echo "Stream redirect did not resolve to HTTP or HTTPS." >&2; exit 1;; esac'
+        )
         if proxy_scheme == "socks5" and quoted_proxy:
             account_lines.append(
                 f"aria2c --split={axel_connections} "
@@ -2458,19 +2475,20 @@ def generate_bash_script(payload: GenerateScriptRequest) -> Response:
                 f"--allow-overwrite=true --auto-file-renaming=false "
                 f"--file-allocation=none --summary-interval=1 "
                 f"--all-proxy={quoted_proxy} --user-agent={q_user_agent} "
-                f"--dir={shlex.quote(parent)} --out={shlex.quote(destination.rsplit('/', 1)[-1])} {q_url}"
+                f"--dir={shlex.quote(parent)} --out={shlex.quote(destination.rsplit('/', 1)[-1])} "
+                '"$resolved_url"'
             )
         elif quoted_proxy:
             account_lines.append(
                 f"http_proxy={quoted_proxy} https_proxy={quoted_proxy} "
                 f"HTTP_PROXY={quoted_proxy} HTTPS_PROXY={quoted_proxy} "
-                f"axel -n {axel_connections} "
-                f"--user-agent={q_master_user_agent} -o {q_destination} {q_url}"
+                f"axel -n {axel_connections} --max-redirect=20 "
+                f"--user-agent={q_master_user_agent} -o {q_destination} \"$resolved_url\""
             )
         else:
             account_lines.append(
-                f"axel -n {axel_connections} "
-                f"--user-agent={q_master_user_agent} -o {q_destination} {q_url}"
+                f"axel -n {axel_connections} --max-redirect=20 "
+                f"--user-agent={q_master_user_agent} -o {q_destination} \"$resolved_url\""
             )
     process_ids = []
     for index, script_account in enumerate(script_accounts, start=1):

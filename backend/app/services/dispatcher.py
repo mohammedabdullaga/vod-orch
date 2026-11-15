@@ -73,6 +73,22 @@ def _rmdir_if_present(path: str) -> str:
     )
 
 
+def _resolve_stream_url_command(
+    stream_url: str, user_agent: str, proxy_url: str | None
+) -> str:
+    proxy_option = f"--proxy {shlex.quote(proxy_url)} " if proxy_url else ""
+    resolve = (
+        "resolved_url=$(curl --fail --location --proto-redir '=http,https' "
+        "--max-redirs 20 --range 0-0 --max-filesize 1 --silent --show-error "
+        f"--user-agent {shlex.quote(user_agent)} --output /dev/null "
+        f"--write-out '%{{url_effective}}' {proxy_option}{shlex.quote(stream_url)}) "
+        "|| { echo 'Unable to resolve the stream redirect for the parallel downloader.' >&2; exit 1; }; "
+        'case "$resolved_url" in http://*|https://*) ;; '
+        '*) echo "Stream redirect did not resolve to HTTP or HTTPS." >&2; exit 1;; esac; '
+    )
+    return resolve
+
+
 class RemoteDispatcher:
     def __init__(self, known_hosts_path: str = "", command_timeout_seconds: int = 86400) -> None:
         self.known_hosts_path = known_hosts_path
@@ -800,28 +816,38 @@ class RemoteDispatcher:
                     f"{proxy_option}{q_url}"
                 )
             elif proxy_scheme == "socks5":
-                download = (
+                resolve_url = _resolve_stream_url_command(
+                    stream_url, user_agent, proxy_url
+                )
+                download = resolve_url + (
                     f"aria2c --quiet=true --split={axel_connections} "
                     f"--max-connection-per-server={axel_connections} --allow-overwrite=true "
                     f"--auto-file-renaming=false --file-allocation=none "
                     f"--all-proxy={shlex.quote(proxy_url)} --user-agent={q_ua} "
                     f"--dir={shlex.quote(staging_job_dir)} "
-                    f"--out={shlex.quote(PurePosixPath(staging_file).name)} {q_url}"
+                    f"--out={shlex.quote(PurePosixPath(staging_file).name)} "
+                    '"$resolved_url"'
                 )
             elif proxy_url and proxy_scheme in ("http", "https"):
                 safe_proxy = shlex.quote(proxy_url)
-                download = (
+                resolve_url = _resolve_stream_url_command(
+                    stream_url, settings.master_user_agent.strip(), proxy_url
+                )
+                download = resolve_url + (
                     f"http_proxy={safe_proxy} https_proxy={safe_proxy} "
                     f"HTTP_PROXY={safe_proxy} HTTPS_PROXY={safe_proxy} "
-                    f"axel -q -n {axel_connections} "
-                    f"--user-agent={q_master_ua} -o {q_stage} {q_url}"
+                    f"axel -q -n {axel_connections} --max-redirect=20 "
+                    f"--user-agent={q_master_ua} -o {q_stage} \"$resolved_url\""
                 )
             elif proxy_url:
                 raise RuntimeError("Proxy URL scheme must be http, https, or socks5.")
             else:
-                download = (
-                    f"axel -q -n {axel_connections} "
-                    f"--user-agent={q_master_ua} -o {q_stage} {q_url}"
+                resolve_url = _resolve_stream_url_command(
+                    stream_url, settings.master_user_agent.strip(), None
+                )
+                download = resolve_url + (
+                    f"axel -q -n {axel_connections} --max-redirect=20 "
+                    f"--user-agent={q_master_ua} -o {q_stage} \"$resolved_url\""
                 )
             remote_download = (
                 "unset http_proxy https_proxy ftp_proxy all_proxy "
