@@ -30,7 +30,12 @@ CATALOG_ACTIONS = (
     ("series", "get_series_categories", "get_series"),
     ("vod", "get_vod_categories", "get_vod_streams"),
 )
-CATALOG_REQUEST_CONCURRENCY = 4
+PROGRESS_RANGES = {
+    "categories": (0, 15),
+    "movie_ids": (15, 35),
+    "series_ids": (35, 55),
+    "series_details": (55, 100),
+}
 
 
 class ProviderCatalogSyncWorker:
@@ -62,6 +67,12 @@ class ProviderCatalogSyncWorker:
                     cached_items=0,
                     series_details_processed=0,
                     total_series_details=0,
+                    progress_current=0,
+                    progress_total=0,
+                    progress_percent=0,
+                    seasons_cached=0,
+                    episodes_cached=0,
+                    episode_ids_cached=0,
                     stale_responses=0,
                     cache_hits=0,
                     invalid_series_details=0,
@@ -309,126 +320,112 @@ class ProviderCatalogSyncWorker:
             provider_url = account.provider_url
 
         proxy_url = resolve_provider_proxy(proxy_id)
-        category_records: list[tuple[str, str, str, str]] = []
+        category_records: dict[str, list[tuple[str, str, str]]] = {
+            "series": [],
+            "vod": [],
+        }
         series_ids: list[str] = []
         seen_series_ids: set[str] = set()
-        category_results = await asyncio.gather(
-            *(
-                self._fetch_action(account, category_action, proxy_url)
-                for _, category_action, _ in CATALOG_ACTIONS
-            ),
-            return_exceptions=True,
+        self._progress(
+            job_id,
+            phase="categories",
+            progress_current=0,
+            progress_total=len(CATALOG_ACTIONS),
         )
-        category_error = next(
-            (result for result in category_results if isinstance(result, BaseException)),
-            None,
-        )
-        if category_error:
-            raise category_error
-        for (kind, category_action, list_action), (categories, cache_state) in zip(
-            CATALOG_ACTIONS,
-            category_results,
-        ):
+        for index, (kind, category_action, list_action) in enumerate(CATALOG_ACTIONS, 1):
+            categories, cache_state = await self._fetch_action(
+                account, category_action, proxy_url
+            )
             if not isinstance(categories, list) or any(
                 not isinstance(row, dict) for row in categories
             ):
                 invalidate_provider_action_cache(account, category_action)
                 raise ValueError(f"Provider returned invalid {category_action} data.")
-            self._progress(
-                job_id,
-                phase=f"{kind}_categories",
-                categories_delta=len(categories),
-                stale_delta=int(cache_state == "stale"),
-                cache_hits_delta=int(cache_state == "hit"),
-            )
             await asyncio.to_thread(store_categories, provider_url, kind, categories)
             for category in categories:
                 category_id = category.get("category_id", category.get("id"))
                 if category_id is not None:
-                    category_records.append(
+                    category_records[kind].append(
                         (
-                            kind,
                             str(category_id),
                             list_action,
-                            str(
-                                category.get(
-                                    "category_name",
-                                    category.get("name", "Unknown"),
-                                )
-                            ),
+                            str(category.get("category_name", category.get("name", "Unknown"))),
                         )
                     )
+            self._progress(
+                job_id,
+                phase="categories",
+                categories_delta=len(categories),
+                progress_current=index,
+                progress_total=len(CATALOG_ACTIONS),
+                stale_delta=int(cache_state == "stale"),
+                cache_hits_delta=int(cache_state == "hit"),
+            )
 
-        semaphore = asyncio.Semaphore(CATALOG_REQUEST_CONCURRENCY)
-
-        async def fetch_category_list(
-            kind: str,
-            category_id: str,
-            list_action: str,
-            category_name: str,
-        ) -> None:
-            async with semaphore:
+        for kind, phase in (("vod", "movie_ids"), ("series", "series_ids")):
+            records = category_records[kind]
+            self._progress(
+                job_id,
+                phase=phase,
+                progress_current=0,
+                progress_total=len(records),
+            )
+            for index, (category_id, list_action, category_name) in enumerate(records, 1):
                 rows, cache_state = await self._fetch_action(
                     account,
                     list_action,
                     proxy_url,
                     category_id=category_id,
                 )
-            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-                invalidate_provider_action_cache(
-                    account, list_action, category_id=category_id
+                if not isinstance(rows, list) or any(
+                    not isinstance(row, dict) for row in rows
+                ):
+                    invalidate_provider_action_cache(
+                        account, list_action, category_id=category_id
+                    )
+                    raise ValueError(
+                        f"Provider returned invalid {list_action} data for category {category_id}."
+                    )
+                await asyncio.to_thread(
+                    store_category_items,
+                    provider_url,
+                    kind,
+                    category_id,
+                    category_name,
+                    rows,
                 )
-                raise ValueError(
-                    f"Provider returned invalid {list_action} data for category {category_id}."
+                if kind == "series":
+                    for row in rows:
+                        series_id = row.get("series_id", row.get("id"))
+                        if series_id is not None and str(series_id).strip():
+                            normalized_id = str(series_id)
+                            if normalized_id not in seen_series_ids:
+                                seen_series_ids.add(normalized_id)
+                                series_ids.append(normalized_id)
+                self._progress(
+                    job_id,
+                    phase=phase,
+                    lists_delta=1,
+                    cached_items_delta=len(rows),
+                    progress_current=index,
+                    progress_total=len(records),
+                    stale_delta=int(cache_state == "stale"),
+                    cache_hits_delta=int(cache_state == "hit"),
                 )
-            await asyncio.to_thread(
-                store_category_items,
-                provider_url,
-                kind,
-                category_id,
-                category_name,
-                rows,
-            )
-            if kind == "series":
-                for row in rows:
-                    series_id = row.get("series_id", row.get("id"))
-                    if series_id is not None and str(series_id).strip():
-                        normalized_id = str(series_id)
-                        if normalized_id not in seen_series_ids:
-                            seen_series_ids.add(normalized_id)
-                            series_ids.append(normalized_id)
-            self._progress(
-                job_id,
-                phase=f"{kind}_lists",
-                lists_delta=1,
-                cached_items_delta=len(rows),
-                stale_delta=int(cache_state == "stale"),
-                cache_hits_delta=int(cache_state == "hit"),
-            )
 
-        list_results = await asyncio.gather(
-            *(
-                fetch_category_list(kind, category_id, list_action, category_name)
-                for kind, category_id, list_action, category_name in category_records
-            ),
-            return_exceptions=True,
+        self._progress(
+            job_id,
+            phase="series_details",
+            total_series=len(series_ids),
+            progress_current=0,
+            progress_total=len(series_ids),
         )
-        list_error = next(
-            (result for result in list_results if isinstance(result, BaseException)),
-            None,
-        )
-        if list_error:
-            raise list_error
-
-        if series_ids:
-            self._progress(
-                job_id,
-                phase="series_details",
-                total_series=len(series_ids),
-            )
-        for series_id in series_ids:
+        for index, series_id in enumerate(series_ids, 1):
             invalid_details = False
             cache_state = "refreshed"
+            seasons_count = 0
+            episodes_count = 0
+            episode_ids_count = 0
             try:
                 details, cache_state = await self._fetch_action(
                     account,
@@ -436,7 +433,21 @@ class ProviderCatalogSyncWorker:
                     proxy_url,
                     series_id=series_id,
                 )
-                parse_series_episodes(details)
+                parsed_episodes = parse_series_episodes(details)
+                seasons = details.get("seasons")
+                if isinstance(seasons, (dict, list)):
+                    seasons_count = len(seasons)
+                else:
+                    episodes_by_season = details.get("episodes")
+                    seasons_count = (
+                        len(episodes_by_season)
+                        if isinstance(episodes_by_season, dict)
+                        else 0
+                    )
+                episodes_count = len(parsed_episodes)
+                episode_ids_count = len(
+                    {episode["stream_id"] for episode in parsed_episodes}
+                )
             except asyncio.CancelledError:
                 raise
             except ValueError:
@@ -465,6 +476,11 @@ class ProviderCatalogSyncWorker:
                 phase="series_details",
                 series_details_delta=1,
                 invalid_series_details_delta=int(invalid_details),
+                progress_current=index,
+                progress_total=len(series_ids),
+                seasons_delta=seasons_count,
+                episodes_delta=episodes_count,
+                episode_ids_delta=episode_ids_count,
                 stale_delta=int(cache_state == "stale"),
                 cache_hits_delta=int(cache_state == "hit"),
             )
@@ -474,17 +490,18 @@ class ProviderCatalogSyncWorker:
             if job and job.status == "RUNNING":
                 job.status = "COMPLETED"
                 job.phase = "completed"
+                job.progress_percent = 100
+                job.progress_current = job.progress_total
                 job.error = None
                 job.updated_at = utc_now()
                 db.commit()
         logger.info(
             "Provider catalog sync job %s completed catalog lists for profile %s "
-            "(%s categories, %s series details, up to %s concurrent list requests)",
+            "(%s categories, %s series details)",
             job_id,
             provider_url,
-            len(category_records),
+            sum(len(records) for records in category_records.values()),
             len(series_ids),
-            CATALOG_REQUEST_CONCURRENCY,
         )
 
     @staticmethod
@@ -513,6 +530,11 @@ class ProviderCatalogSyncWorker:
         cached_items_delta: int = 0,
         total_series: int | None = None,
         series_details_delta: int = 0,
+        progress_current: int | None = None,
+        progress_total: int | None = None,
+        seasons_delta: int = 0,
+        episodes_delta: int = 0,
+        episode_ids_delta: int = 0,
         stale_delta: int = 0,
         cache_hits_delta: int = 0,
         invalid_series_details_delta: int = 0,
@@ -526,11 +548,26 @@ class ProviderCatalogSyncWorker:
             job.lists_processed += lists_delta
             job.cached_items += cached_items_delta
             job.series_details_processed += series_details_delta
+            job.seasons_cached += seasons_delta
+            job.episodes_cached += episodes_delta
+            job.episode_ids_cached += episode_ids_delta
             job.stale_responses += stale_delta
             job.cache_hits += cache_hits_delta
             job.invalid_series_details += invalid_series_details_delta
             if total_series is not None:
                 job.total_series_details = total_series
+            if progress_current is not None:
+                job.progress_current = progress_current
+            if progress_total is not None:
+                job.progress_total = progress_total
+            if phase in PROGRESS_RANGES:
+                start, end = PROGRESS_RANGES[phase]
+                fraction = (
+                    min(job.progress_current / job.progress_total, 1)
+                    if job.progress_total
+                    else 1
+                )
+                job.progress_percent = round(start + (end - start) * fraction)
             job.updated_at = utc_now()
             db.commit()
 

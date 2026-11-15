@@ -232,6 +232,12 @@ class ProviderCatalogSyncJob(Base):
     cached_items: Mapped[int] = mapped_column(Integer, default=0)
     series_details_processed: Mapped[int] = mapped_column(Integer, default=0)
     total_series_details: Mapped[int] = mapped_column(Integer, default=0)
+    progress_current: Mapped[int] = mapped_column(Integer, default=0)
+    progress_total: Mapped[int] = mapped_column(Integer, default=0)
+    progress_percent: Mapped[int] = mapped_column(Integer, default=0)
+    seasons_cached: Mapped[int] = mapped_column(Integer, default=0)
+    episodes_cached: Mapped[int] = mapped_column(Integer, default=0)
+    episode_ids_cached: Mapped[int] = mapped_column(Integer, default=0)
     stale_responses: Mapped[int] = mapped_column(Integer, default=0)
     cache_hits: Mapped[int] = mapped_column(Integer, default=0)
     invalid_series_details: Mapped[int] = mapped_column(Integer, default=0)
@@ -586,6 +592,12 @@ def init_db() -> None:
                 "invalid_series_details": "INTEGER NOT NULL DEFAULT 0",
                 "stale_responses": "INTEGER NOT NULL DEFAULT 0",
                 "attempted_account_ids": "TEXT NOT NULL DEFAULT '[]'",
+                "progress_current": "INTEGER NOT NULL DEFAULT 0",
+                "progress_total": "INTEGER NOT NULL DEFAULT 0",
+                "progress_percent": "INTEGER NOT NULL DEFAULT 0",
+                "seasons_cached": "INTEGER NOT NULL DEFAULT 0",
+                "episodes_cached": "INTEGER NOT NULL DEFAULT 0",
+                "episode_ids_cached": "INTEGER NOT NULL DEFAULT 0",
             },
         }
         inspector = inspect(connection)

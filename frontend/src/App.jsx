@@ -760,6 +760,18 @@ function App() {
               const stopping = job?.status === "CANCELLING";
               const syncAccount = profile.accounts.find((account) => account.enabled);
               const syncProxyId = catalogSyncProxyByProfile[profile.provider_url] ?? providerProxyId;
+              const syncPhaseLabels = {
+                queued: "Queued",
+                connecting: "Connecting",
+                categories: "Categories",
+                movie_ids: "Movie titles and IDs",
+                series_ids: "Series titles and IDs",
+                series_details: "Seasons, episodes, and episode IDs",
+                completed: "Complete",
+                failed: "Failed",
+                cancelled: "Cancelled",
+                cancelling: "Stopping",
+              };
               return <div key={profile.provider_url} className="rounded-lg bg-slate-900/70 px-3 py-3">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="min-w-0"><div className="text-sm font-medium text-slate-200">Provider profile</div><div className="truncate text-xs text-slate-500">{profile.provider_url}</div></div>
@@ -799,15 +811,12 @@ function App() {
                 </div>
                 {job && <div className="mt-2 border-t border-slate-800 pt-2 text-[11px]">
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-400">
-                    <span className={job.status === "COMPLETED" ? "text-emerald-300" : job.status === "FAILED" ? "text-rose-300" : job.status === "CANCELLED" ? "text-slate-400" : "text-indigo-300"}>{job.status} · {job.phase}</span>
+                    <span className={job.status === "COMPLETED" ? "text-emerald-300" : job.status === "FAILED" ? "text-rose-300" : job.status === "CANCELLED" ? "text-slate-400" : "text-indigo-300"}>{job.status} · {syncPhaseLabels[job.phase] || job.phase}</span>
                     <span>Account: {accounts.find((account) => account.id === job.account_id)?.username || `#${job.account_id}`}</span>
                     <span>Connection: {job.proxy_id ? `Proxy #${job.proxy_id}` : "Direct"}</span>
                     <span>{job.categories_processed} categories</span>
                     <span>{job.lists_processed} lists · {job.cached_items} titles</span>
-                    <span>
-                      Episodes cached: {job.series_details_processed || 0}
-                      {job.total_series_details ? ` / ${job.total_series_details}` : ""}
-                    </span>
+                    <span>{job.seasons_cached || 0} seasons · {job.episodes_cached || 0} episodes · {job.episode_ids_cached || 0} IDs cached</span>
                     {job.invalid_series_details > 0 && <span className="text-amber-300">
                       {job.invalid_series_details} series detail request(s) failed
                     </span>}
@@ -818,6 +827,30 @@ function App() {
                         : `Active sync #${job.active_job_id}`}
                     </span>}
                     {job.cache_hits > 0 && <span>{job.cache_hits} cached responses reused</span>}
+                  </div>
+                  <div className="mt-2">
+                    <div className="mb-1 flex items-center justify-between text-slate-400">
+                      <span>
+                        Step progress: {job.progress_current || 0}/{job.progress_total || 0}
+                        {job.phase === "series_details" && job.total_series_details
+                          ? ` series · ${job.series_details_processed || 0}/${job.total_series_details} details`
+                          : ""}
+                      </span>
+                      <span>{job.progress_percent || 0}%</span>
+                    </div>
+                    <div
+                      role="progressbar"
+                      aria-label={`${syncPhaseLabels[job.phase] || "Catalog sync"} progress`}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={job.progress_percent || 0}
+                      className="h-2 overflow-hidden rounded-full bg-slate-800"
+                    >
+                      <div
+                        className={`h-full rounded-full transition-[width] duration-300 ${job.status === "FAILED" ? "bg-rose-500" : job.status === "COMPLETED" ? "bg-emerald-500" : "bg-indigo-500"}`}
+                        style={{ width: `${Math.min(100, Math.max(0, job.progress_percent || 0))}%` }}
+                      />
+                    </div>
                   </div>
                   {job.last_worker_error && <p className="mt-1 text-amber-300">Last sync worker error: {job.last_worker_error}. The worker will retry automatically.</p>}
                   {job.stale_responses > 0 && <p className="mt-1 text-amber-300">{job.stale_responses} refresh requests used stale cached data after provider/proxy errors.</p>}
