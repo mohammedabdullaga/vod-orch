@@ -1421,6 +1421,7 @@ class WorkerPool:
             text = text.replace(stream_url_value, "[redacted stream URL]")
         if proxy_url:
             text = text.replace(proxy_url, "[redacted proxy URL]")
+        text = re.sub(r"https?://[^\s\"'<>]+", "[redacted URL]", text)
         return text
 
     @staticmethod

@@ -28,10 +28,15 @@ class DispatchCancelled(Exception):
     pass
 
 
+class RemoteStreamNotFound(Exception):
+    pass
+
+
 _ANSI_ESCAPE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 _FILE_SIZE = re.compile(rb"File size:.*?\(([\d,]+)\s+bytes\)", re.IGNORECASE)
 _WGET_FILE_SIZE = re.compile(rb"Length:\s*([\d,]+)(?:\s|$)", re.IGNORECASE)
-_SAMPLED_SPEED = re.compile(rb"MEDIA_TRANSFER speed_bytes_per_second=(\d+)")
+_DOWNLOADED_SIZE = re.compile(rb"MEDIA_TRANSFER bytes_downloaded=(\d+)")
+_SAMPLED_SPEED = re.compile(rb"speed_bytes_per_second=(\d+)")
 _FINAL_SIZE = re.compile(rb"MEDIA_TRANSFER file_size_bytes=(\d+)")
 _TRANSFER_SPEED = re.compile(
     rb"\[\s*([\d.]+)\s*(B|KB|KiB|MB|MiB|GB|GiB)\/s\s*\]",
@@ -48,6 +53,7 @@ def _parse_transfer_metrics(
     speeds = _TRANSFER_SPEED.findall(clean_output[-4096:])
     file_sizes = _FILE_SIZE.findall(clean_output[-16384:])
     wget_file_sizes = _WGET_FILE_SIZE.findall(clean_output[-16384:])
+    downloaded_sizes = _DOWNLOADED_SIZE.findall(clean_output[-4096:])
     sampled_speeds = _SAMPLED_SPEED.findall(clean_output[-4096:])
     final_sizes = _FINAL_SIZE.findall(clean_output[-4096:])
     progress = min(float(percentages[-1]), 100.0) if percentages else None
@@ -58,7 +64,7 @@ def _parse_transfer_metrics(
         multiplier = 1024 if "i" in unit_name else 1000
         power = 0 if unit_name == "b" else 1 if unit_name.startswith("k") else 2 if unit_name.startswith("m") else 3
         speed = float(value) * multiplier**power
-    size_candidates = final_sizes or file_sizes or wget_file_sizes
+    size_candidates = final_sizes or downloaded_sizes or file_sizes or wget_file_sizes
     file_size = (
         int(size_candidates[-1].replace(b",", b"")) if size_candidates else None
     )
@@ -73,20 +79,36 @@ def _rmdir_if_present(path: str) -> str:
     )
 
 
-def _resolve_stream_url_command(
-    stream_url: str, user_agent: str, proxy_url: str | None
+def build_aria2_download_command(
+    stream_url: str,
+    staging_dir: str,
+    output_name: str,
+    connections: int,
+    user_agent: str,
+    proxy_url: str | None,
 ) -> str:
-    proxy_option = f"--proxy {shlex.quote(proxy_url)} " if proxy_url else ""
-    resolve = (
-        "resolved_url=$(curl --fail --location --proto-redir '=http,https' "
-        "--max-redirs 20 --range 0-0 --max-filesize 1 --silent --show-error "
-        f"--user-agent {shlex.quote(user_agent)} --output /dev/null "
-        f"--write-out '%{{url_effective}}' {proxy_option}{shlex.quote(stream_url)}) "
-        "|| { echo 'Unable to resolve the stream redirect for the parallel downloader.' >&2; exit 1; }; "
-        'case "$resolved_url" in http://*|https://*) ;; '
-        '*) echo "Stream redirect did not resolve to HTTP or HTTPS." >&2; exit 1;; esac; '
+    proxy_option = f"--all-proxy={shlex.quote(proxy_url)} " if proxy_url else ""
+    command = (
+        "aria2c --console-log-level=notice --summary-interval=1 "
+        "--show-console-readout=true --download-result=hide "
+        "--max-tries=99 --retry-wait=5 --connect-timeout=30 --timeout=60 "
+        f"--split={connections} --max-connection-per-server={connections} "
+        "--min-split-size=1M "
+        "--allow-overwrite=true --auto-file-renaming=false --file-allocation=none "
+        f"--user-agent={shlex.quote(user_agent)} {proxy_option}"
+        f"--dir={shlex.quote(staging_dir)} --out={shlex.quote(output_name)} "
+        f"{shlex.quote(stream_url)}"
     )
-    return resolve
+    return (
+        f"{command}; download_status=$?; "
+        'case "$download_status" in '
+        "0) exit 0;; "
+        "3) printf '%s\\n' 'MEDIA_DOWNLOAD_ERROR kind=not_found'; exit 44;; "
+        "6) printf '%s\\n' 'MEDIA_DOWNLOAD_ERROR kind=network'; exit 46;; "
+        "8) printf '%s\\n' 'MEDIA_DOWNLOAD_ERROR kind=server'; exit 48;; "
+        "*) printf 'MEDIA_DOWNLOAD_ERROR kind=aria2_failed exit_code=%s\\n' "
+        '"$download_status"; exit "$download_status";; esac'
+    )
 
 
 class RemoteDispatcher:
@@ -224,6 +246,18 @@ class RemoteDispatcher:
         code = channel.recv_exit_status()
         if code:
             detail = (error_output or output).decode("utf-8", errors="replace")[-4000:]
+            if code == 44 and b"MEDIA_DOWNLOAD_ERROR kind=not_found" in output:
+                raise RemoteStreamNotFound(
+                    "The remote provider reports that this stream resource was not found."
+                )
+            if code == 46 and b"MEDIA_DOWNLOAD_ERROR kind=network" in output:
+                raise ConnectionError("aria2c could not complete the download due to a network error.")
+            if code == 48 and b"MEDIA_DOWNLOAD_ERROR kind=server" in output:
+                raise RuntimeError("The remote provider reported a server error during the download.")
+            if b"MEDIA_DOWNLOAD_ERROR kind=aria2_failed" in output:
+                raise RuntimeError(
+                    f"aria2c failed with exit code {code} while downloading the stream."
+                )
             raise RuntimeError(f"Remote command failed with exit code {code}: {detail.strip()}")
         return output.decode("utf-8", errors="replace")
 
@@ -421,6 +455,8 @@ class RemoteDispatcher:
         legacy_pid_file = f"{legacy_staging_file}.pid"
         state_file = f"{staging_file}.st"
         legacy_state_file = f"{legacy_staging_file}.st"
+        aria2_state_file = f"{staging_file}.aria2"
+        legacy_aria2_state_file = f"{legacy_staging_file}.aria2"
         root = PurePosixPath(destination_root or node.watch_path)
         final_directory = PurePosixPath(root) / relative_path.parent
         if final_directory.parts[:len(root.parts)] != root.parts:
@@ -429,8 +465,10 @@ class RemoteDispatcher:
         self._terminate_remote_process(node, (pid_file, legacy_pid_file))
         cleanup_parts = [
             f"rm -f -- {shlex.quote(staging_file)} {shlex.quote(state_file)} "
+            f"{shlex.quote(aria2_state_file)} "
             f"{shlex.quote(pid_file)} {shlex.quote(legacy_staging_file)} "
-            f"{shlex.quote(legacy_state_file)} {shlex.quote(legacy_pid_file)}",
+            f"{shlex.quote(legacy_state_file)} {shlex.quote(legacy_aria2_state_file)} "
+            f"{shlex.quote(legacy_pid_file)}",
             _rmdir_if_present(staging_job_dir),
         ]
         if prune_empty_final_directories:
@@ -492,7 +530,9 @@ class RemoteDispatcher:
             )
             state_files = (
                 f"{staging_file}.st",
+                f"{staging_file}.aria2",
                 f"{legacy_staging_file}.st",
+                f"{legacy_staging_file}.aria2",
             )
             root = PurePosixPath(destination_root)
             final_directory = root / relative_path.parent
@@ -584,7 +624,7 @@ class RemoteDispatcher:
         on_command: Callable[[str], None] | None = None,
     ) -> DispatchResult:
         if not 1 <= axel_connections <= 12:
-            raise ValueError("Axel connections must be between 1 and 12.")
+            raise ValueError("Parallel connections must be between 1 and 12.")
         if downloader not in ("axel", "wget", "curl"):
             raise ValueError("Downloader must be axel, wget, or curl.")
         stream_target = urlsplit(stream_url)
@@ -598,7 +638,7 @@ class RemoteDispatcher:
         if downloader == "wget":
             if proxy_scheme in ("socks5", "socks5h"):
                 raise RuntimeError(
-                    "Wget does not support SOCKS5 proxies. Choose Curl, Axel/aria2c, or an HTTP(S) proxy."
+                    "Wget does not support SOCKS5 proxies. Choose Curl, aria2c, or an HTTP(S) proxy."
                 )
             if proxy_url and proxy_scheme not in ("http", "https"):
                 raise RuntimeError("Wget proxy URL scheme must be http or https.")
@@ -610,6 +650,14 @@ class RemoteDispatcher:
         ):
             raise RuntimeError(
                 "Curl proxy URL scheme must be http, https, socks5, or socks5h."
+            )
+        elif downloader == "axel" and proxy_url and proxy_scheme not in (
+            "http",
+            "https",
+            "socks5",
+        ):
+            raise RuntimeError(
+                "The parallel downloader proxy URL scheme must be http, https, or socks5."
             )
         relative_path = PurePosixPath(file_name)
         if (
@@ -780,11 +828,14 @@ class RemoteDispatcher:
             q_master_ua = shlex.quote(settings.master_user_agent.strip())
             pid_file = f"{staging_file}.pid"
             state_file = f"{staging_file}.st"
+            aria2_state_file = f"{staging_file}.aria2"
             q_state_file = shlex.quote(state_file)
+            q_aria2_state_file = shlex.quote(aria2_state_file)
             prepare = (
                 f"mkdir -p {shlex.quote(staging_job_dir)} {shlex.quote(final_dir)} "
                 f"&& chmod 0755 {shlex.quote(staging_job_dir)} {shlex.quote(final_dir)} "
-                f"&& rm -f -- {q_stage} {q_state_file} {shlex.quote(pid_file)}"
+                f"&& rm -f -- {q_stage} {q_state_file} {q_aria2_state_file} "
+                f"{shlex.quote(pid_file)}"
             )
             run_remote(
                 prepare,
@@ -815,39 +866,18 @@ class RemoteDispatcher:
                     f"--user-agent {q_master_ua} --output {q_stage} "
                     f"{proxy_option}{q_url}"
                 )
-            elif proxy_scheme == "socks5":
-                resolve_url = _resolve_stream_url_command(
-                    stream_url, user_agent, proxy_url
-                )
-                download = resolve_url + (
-                    f"aria2c --quiet=true --split={axel_connections} "
-                    f"--max-connection-per-server={axel_connections} --allow-overwrite=true "
-                    f"--auto-file-renaming=false --file-allocation=none "
-                    f"--all-proxy={shlex.quote(proxy_url)} --user-agent={q_ua} "
-                    f"--dir={shlex.quote(staging_job_dir)} "
-                    f"--out={shlex.quote(PurePosixPath(staging_file).name)} "
-                    '"$resolved_url"'
-                )
-            elif proxy_url and proxy_scheme in ("http", "https"):
-                safe_proxy = shlex.quote(proxy_url)
-                resolve_url = _resolve_stream_url_command(
-                    stream_url, settings.master_user_agent.strip(), proxy_url
-                )
-                download = resolve_url + (
-                    f"http_proxy={safe_proxy} https_proxy={safe_proxy} "
-                    f"HTTP_PROXY={safe_proxy} HTTPS_PROXY={safe_proxy} "
-                    f"axel -q -n {axel_connections} --max-redirect=20 "
-                    f"--user-agent={q_master_ua} -o {q_stage} \"$resolved_url\""
-                )
-            elif proxy_url:
-                raise RuntimeError("Proxy URL scheme must be http, https, or socks5.")
             else:
-                resolve_url = _resolve_stream_url_command(
-                    stream_url, settings.master_user_agent.strip(), None
-                )
-                download = resolve_url + (
-                    f"axel -q -n {axel_connections} --max-redirect=20 "
-                    f"--user-agent={q_master_ua} -o {q_stage} \"$resolved_url\""
+                download = build_aria2_download_command(
+                    stream_url=stream_url,
+                    staging_dir=staging_job_dir,
+                    output_name=PurePosixPath(staging_file).name,
+                    connections=axel_connections,
+                    user_agent=(
+                        user_agent
+                        if proxy_scheme == "socks5"
+                        else settings.master_user_agent.strip()
+                    ),
+                    proxy_url=proxy_url,
                 )
             remote_download = (
                 "unset http_proxy https_proxy ftp_proxy all_proxy "
@@ -858,10 +888,12 @@ class RemoteDispatcher:
                 f"while kill -0 \"$child\" 2>/dev/null; do "
                 f"current_bytes=$(stat -c %s -- {q_stage} 2>/dev/null || printf '0'); "
                 "delta_bytes=$((current_bytes - previous_bytes)); "
-                "printf 'MEDIA_TRANSFER speed_bytes_per_second=%s\\n' \"$delta_bytes\"; "
+                "printf 'MEDIA_TRANSFER bytes_downloaded=%s speed_bytes_per_second=%s\\n' "
+                "\"$current_bytes\" \"$delta_bytes\"; "
                 "previous_bytes=$current_bytes; sleep 1; done; "
                 "wait \"$child\"; download_status=$?; "
-                f"rm -f -- {q_state_file}; "
+                f"rm -f -- {shlex.quote(pid_file)}; "
+                f"rm -f -- {q_state_file} {q_aria2_state_file}; "
                 f"if [ \"$download_status\" -eq 0 ]; then "
                 f"current_bytes=$(stat -c %s -- {q_stage} 2>/dev/null || printf '0'); "
                 "printf 'MEDIA_TRANSFER file_size_bytes=%s\\n' \"$current_bytes\"; fi; "
@@ -918,8 +950,16 @@ class RemoteDispatcher:
                 )
             except Exception as original_error:
                 try:
+                    self._terminate_remote_process(node, pid_file)
+                except Exception as terminate_error:
+                    raise RuntimeError(
+                        f"{original_error}; remote process cleanup failed "
+                        f"({terminate_error})"
+                    ) from original_error
+                try:
                     run_remote(
-                        f"rm -f -- {q_stage} {q_state_file} {shlex.quote(pid_file)} && "
+                        f"rm -f -- {q_stage} {q_state_file} {q_aria2_state_file} "
+                        f"{shlex.quote(pid_file)} && "
                         f"{_rmdir_if_present(staging_job_dir)}",
                     )
                 except Exception as first_cleanup_error:
@@ -928,7 +968,8 @@ class RemoteDispatcher:
                         cleanup_client = self._connect(node)
                         self._run(
                             cleanup_client,
-                            f"rm -f -- {q_stage} {q_state_file} {shlex.quote(pid_file)} && "
+                            f"rm -f -- {q_stage} {q_state_file} {q_aria2_state_file} "
+                            f"{shlex.quote(pid_file)} && "
                             f"{_rmdir_if_present(staging_job_dir)}",
                         )
                     except Exception as reconnect_cleanup_error:

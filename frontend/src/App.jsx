@@ -945,7 +945,7 @@ function App() {
                   ["name", "Server name"], ["host", "SSH host"], ["port", "Port"], ["username", "SSH username"],
                   ["private_key_path", "Private key path on daemon"], ["staging_path", "Remote staging directory"], ["watch_path", "Storage root on this server"],
                 ].map(([key, placeholder]) => <input key={key} required placeholder={placeholder} type={key === "port" ? "number" : "text"} value={nodeForm[key] ?? ""} onChange={(event) => setNodeForm({ ...nodeForm, [key]: event.target.value })} className="field" />)}
-                <label className="block text-xs text-slate-400">Axel connections (1–12)
+                <label className="block text-xs text-slate-400">Parallel connections (1–12)
                   <input required min="1" max="12" type="number" value={nodeForm.axel_connections || status?.default_axel_connections || 12} onChange={(event) => setNodeForm({ ...nodeForm, axel_connections: event.target.value })} className="field mt-2" />
                 </label>
                 <label className="block text-xs text-slate-400">Worker proxy

@@ -1103,8 +1103,8 @@ export default function ContentBrowser({
               <div className="grid gap-2 sm:grid-cols-2">
                 <label className={`cursor-pointer rounded-lg border px-3 py-3 ${downloader === "axel" ? "border-indigo-500 bg-indigo-950/30" : "border-slate-800 bg-slate-900/50"}`}>
                   <input type="radio" name="queue-downloader" value="axel" checked={downloader === "axel"} onChange={() => setDownloader("axel")} className="mr-2 accent-indigo-500" />
-                  <span className="text-sm text-slate-200">Axel / aria2c · default</span>
-                  <span className="mt-1 block text-xs text-slate-500">Uses configured parallel connections; SOCKS5 uses aria2c.</span>
+                  <span className="text-sm text-slate-200">aria2c · parallel + redirects</span>
+                  <span className="mt-1 block text-xs text-slate-500">Uses configured parallel connections and follows provider redirects.</span>
                 </label>
                 <label className={`cursor-pointer rounded-lg border px-3 py-3 ${downloader === "wget" ? "border-indigo-500 bg-indigo-950/30" : "border-slate-800 bg-slate-900/50"}`}>
                   <input type="radio" name="queue-downloader" value="wget" checked={downloader === "wget"} onChange={() => setDownloader("wget")} className="mr-2 accent-indigo-500" />
@@ -1136,7 +1136,7 @@ export default function ContentBrowser({
                   {availableProxies.map((proxy) => <option key={proxy.id} value={proxy.id}>Proxy #{proxy.id} · {proxy.url}</option>)}
                 </select>
               </label>}
-              {wgetProxyUnsupported && <p className="mt-2 text-xs text-amber-300">Wget cannot use SOCKS5 proxies. Choose Curl, Axel / aria2c, or switch to a direct or HTTP(S) connection.</p>}
+              {wgetProxyUnsupported && <p className="mt-2 text-xs text-amber-300">Wget cannot use SOCKS5 proxies. Choose Curl, aria2c, or switch to a direct or HTTP(S) connection.</p>}
               {!proxyAvailable && <p className="mt-2 text-xs text-slate-500">There are no enabled proxies in the proxy pool.</p>}
             </fieldset>
           </div>
