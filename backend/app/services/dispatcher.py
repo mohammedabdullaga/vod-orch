@@ -569,8 +569,8 @@ class RemoteDispatcher:
     ) -> DispatchResult:
         if not 1 <= axel_connections <= 12:
             raise ValueError("Axel connections must be between 1 and 12.")
-        if downloader not in ("axel", "wget"):
-            raise ValueError("Downloader must be either axel or wget.")
+        if downloader not in ("axel", "wget", "curl"):
+            raise ValueError("Downloader must be axel, wget, or curl.")
         stream_target = urlsplit(stream_url)
         if (
             stream_target.scheme.lower() not in ("http", "https")
@@ -582,10 +582,19 @@ class RemoteDispatcher:
         if downloader == "wget":
             if proxy_scheme in ("socks5", "socks5h"):
                 raise RuntimeError(
-                    "Wget does not support SOCKS5 proxies. Choose Axel/aria2c or an HTTP(S) proxy."
+                    "Wget does not support SOCKS5 proxies. Choose Curl, Axel/aria2c, or an HTTP(S) proxy."
                 )
             if proxy_url and proxy_scheme not in ("http", "https"):
                 raise RuntimeError("Wget proxy URL scheme must be http or https.")
+        elif downloader == "curl" and proxy_url and proxy_scheme not in (
+            "http",
+            "https",
+            "socks5",
+            "socks5h",
+        ):
+            raise RuntimeError(
+                "Curl proxy URL scheme must be http, https, socks5, or socks5h."
+            )
         relative_path = PurePosixPath(file_name)
         if (
             relative_path.is_absolute()
@@ -778,6 +787,17 @@ class RemoteDispatcher:
                     f"{proxy_env}"
                     f"wget -cO {q_stage} --tries=99 --retry-connrefused "
                     f"--user-agent={q_ua} -e use_proxy={use_proxy} {q_url}"
+                )
+            elif downloader == "curl":
+                proxy_option = (
+                    f"--proxy {shlex.quote(proxy_url)} " if proxy_url else ""
+                )
+                download = (
+                    f"curl --fail --location --proto-redir '=http,https' "
+                    f"--max-redirs 20 --silent --show-error "
+                    f"--retry 99 --retry-connrefused --continue-at - "
+                    f"--user-agent {q_master_ua} --output {q_stage} "
+                    f"{proxy_option}{q_url}"
                 )
             elif proxy_scheme == "socks5":
                 download = (

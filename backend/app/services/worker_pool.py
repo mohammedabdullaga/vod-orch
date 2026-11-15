@@ -1218,7 +1218,7 @@ class WorkerPool:
                 axel_connections = (
                     node.axel_connections or settings.default_axel_connections
                 )
-                downloader = item.downloader or "axel"
+                downloader = item.downloader or "curl"
                 if cancel_event.is_set():
                     self._mark_cancelled(item_id)
                     return

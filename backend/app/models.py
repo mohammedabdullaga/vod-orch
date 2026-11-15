@@ -385,7 +385,7 @@ class QueueItem(Base):
     proxy_id: Mapped[int | None] = mapped_column(
         ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True
     )
-    downloader: Mapped[str] = mapped_column(String(16), default="axel")
+    downloader: Mapped[str] = mapped_column(String(16), default="curl")
     series_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     stream_url_encrypted: Mapped[str] = mapped_column(Text)
     file_name: Mapped[str] = mapped_column(String(1024))

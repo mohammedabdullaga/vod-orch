@@ -669,6 +669,11 @@ def retry_item(payload: RetryRequest):
             (account for account in accounts if account.id != item.account_id),
             accounts[0],
         )
+        if (
+            item.provider_stream_id
+            and not (item.source_provider_url or "").startswith("m3u:")
+        ):
+            item.downloader = "curl"
         item.status = "PENDING"
         item.account_id = next_account.id
         item.file_size_bytes = None
